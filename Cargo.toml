@@ -1,0 +1,14 @@
+[package]
+name = "yomi"
+version = "0.1.0"
+edition = "2024"
+description = "Claude Code session-data plane: archive, wipe, and search"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/yaoyorozu-hi/yomi"
+readme = "README.md"
+
+[[bin]]
+name = "yomi"
+path = "src/main.rs"
+
+[dependencies]
