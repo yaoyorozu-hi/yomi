@@ -1,5 +1,4 @@
 use anyhow::{Context, Result, bail};
-use fs2::FileExt;
 use std::fs::File;
 use std::path::Path;
 
@@ -15,7 +14,7 @@ impl WriteLock {
     pub fn acquire(path: &Path) -> Result<Self> {
         let file =
             File::create(path).with_context(|| format!("open lock file {}", path.display()))?;
-        match file.try_lock_exclusive() {
+        match file.try_lock() {
             Ok(()) => Ok(WriteLock { _file: file }),
             Err(_) => bail!(
                 "refuse: another yomi process holds the write lock ({})",

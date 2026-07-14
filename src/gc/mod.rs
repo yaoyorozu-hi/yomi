@@ -361,7 +361,7 @@ fn primary_root(roots: &SourceRoots, target: Target) -> &Path {
 /// a root symlinked at a foreign-owned tree is caught by the target's real owner.
 fn root_owned_by_euid(root: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
-    let euid = unsafe { libc::geteuid() };
+    let euid = rustix::process::geteuid().as_raw();
     match std::fs::metadata(root) {
         Ok(md) => md.uid() == euid,
         Err(e) => e.kind() == std::io::ErrorKind::NotFound,
@@ -667,7 +667,7 @@ mod guard_tests {
         // A nonexistent root is benign (nothing to enumerate).
         assert!(root_owned_by_euid(&base.join("does-not-exist")));
         // A root owned by another uid is refused (skip when running as root).
-        if unsafe { libc::geteuid() } != 0 {
+        if !rustix::process::geteuid().is_root() {
             assert!(
                 !root_owned_by_euid(Path::new("/")),
                 "root-owned / must not be treated as ours"

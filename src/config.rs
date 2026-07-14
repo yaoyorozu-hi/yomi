@@ -289,8 +289,7 @@ impl Env {
     /// `fix_perms` is false.
     pub fn ensure_layout(&self, fix_perms: bool) -> Result<()> {
         // Tighten umask so nested creates never widen beyond owner.
-        // SAFETY: process-global, set once at start of a write command.
-        unsafe { libc::umask(0o077) };
+        rustix::process::umask(rustix::fs::Mode::RWXG | rustix::fs::Mode::RWXO);
 
         if self.home.exists() {
             let mode = std::fs::metadata(&self.home)?.permissions().mode() & 0o777;

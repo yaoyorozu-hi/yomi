@@ -12,10 +12,7 @@ use crate::gc::{PassedChecks, ProtectReason, SkipReason, Verdict, policy};
 use anyhow::Result;
 use serde::Deserialize;
 use std::collections::HashSet;
-use std::ffi::CString;
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use walkdir::WalkDir;
@@ -328,26 +325,17 @@ pub fn safe_unlink(path: &Path, pinned: (u64, u64)) -> Result<bool> {
         Ok(d) => d,
         Err(_) => return Ok(false),
     };
-    let dirfd = dir.as_raw_fd();
-    let cname = CString::new(name.as_bytes())?;
-
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    let rc = unsafe { libc::fstatat(dirfd, cname.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) };
-    if rc != 0 {
-        return Ok(false);
-    }
+    let st = match rustix::fs::statat(&dir, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(st) => st,
+        Err(_) => return Ok(false),
+    };
     if (st.st_dev, st.st_ino) != pinned {
         return Ok(false);
     }
-    let rc = unsafe { libc::unlinkat(dirfd, cname.as_ptr(), 0) };
-    if rc != 0 {
-        return Err(anyhow::anyhow!(
-            "unlinkat {} failed: {}",
-            path.display(),
-            std::io::Error::last_os_error()
-        ));
+    match rustix::fs::unlinkat(&dir, name, rustix::fs::AtFlags::empty()) {
+        Ok(()) => Ok(true),
+        Err(e) => Err(anyhow::anyhow!("unlinkat {} failed: {}", path.display(), e)),
     }
-    Ok(true)
 }
 
 /// Outcome of guarding then removing a scratch tree.

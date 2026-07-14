@@ -1016,17 +1016,16 @@ fn p2_gc_history_never_wiped() {
 
 #[test]
 fn p2_gc_lock_contention_refuses() {
-    use fs2::FileExt;
     let fx = Fixture::new("gclock");
     fx.write_transcript(&[user_line("one")]);
     assert!(fx.run(&["archive", "--all"]).status.success());
 
     let lockf = std::fs::File::create(fx.yomi_home.join(".yomi.lock")).unwrap();
-    lockf.try_lock_exclusive().unwrap();
+    lockf.try_lock().unwrap();
 
     let out = fx.run(&["gc", "--targets", "transcripts", "--commit"]);
     assert_eq!(code(&out), 3, "expected EXIT_REFUSED under lock contention");
-    fs2::FileExt::unlock(&lockf).unwrap();
+    lockf.unlock().unwrap();
 }
 
 #[test]
