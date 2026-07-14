@@ -1,5 +1,8 @@
 pub mod claude;
+pub mod discover;
 pub mod single;
+
+pub use discover::{ShapeKind, ShapeRecord, UserRoots};
 
 use crate::util::home_dir;
 use anyhow::Result;

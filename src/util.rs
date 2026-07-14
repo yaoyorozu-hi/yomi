@@ -19,6 +19,21 @@ pub fn sha8(bytes: &[u8]) -> String {
     sha256_hex(bytes)[..8].to_string()
 }
 
+/// Stream a reader through sha256 without holding the whole content in memory,
+/// so the GC live-source re-hash bounds its footprint regardless of file size.
+pub fn sha256_stream<R: std::io::Read>(reader: &mut R) -> std::io::Result<String> {
+    let mut h = Sha256::new();
+    let mut buf = [0u8; 65536];
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+    }
+    Ok(hex(&h.finalize()))
+}
+
 fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {

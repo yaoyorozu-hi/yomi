@@ -3,6 +3,7 @@ pub mod blacklist;
 pub mod catalog;
 pub mod cli;
 pub mod config;
+pub mod gc;
 pub mod lock;
 pub mod model;
 pub mod scan;

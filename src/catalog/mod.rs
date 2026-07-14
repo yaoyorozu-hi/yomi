@@ -3,7 +3,7 @@ use crate::config::Env;
 use crate::model::{ArtifactRole, Finding, Severity};
 use crate::util::now_iso;
 use anyhow::{Context, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use std::path::Path;
 
 pub struct Catalog {
@@ -32,6 +32,18 @@ pub struct SessionUpsert<'a> {
     pub cwd: Option<&'a str>,
     pub git_branch: Option<&'a str>,
     pub cc_version: Option<&'a str>,
+}
+
+/// One artifact's full identity for the GC delete gate, keyed by canonical
+/// source path — everything the 5 gates need in a single row.
+pub struct GcRow {
+    pub id: i64,
+    pub session_uuid: String,
+    pub source_path: String,
+    pub source_sha256: String,
+    pub stored_path: String,
+    pub stored_sha256: String,
+    pub content_sha256: String,
 }
 
 /// One artifact's identity for `yomi verify`.
@@ -140,6 +152,32 @@ impl Catalog {
             last_src_offset: off as u64,
             stored_bytes: sb as u64,
         }))
+    }
+
+    /// The full GC row for a canonical source path, if archived. Keyed on the
+    /// `UNIQUE` `source_path` column, so at most one row.
+    pub fn gc_row_for_source(&self, source_path: &str) -> Result<Option<GcRow>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT id, session_uuid, source_path, source_sha256, stored_path,
+                        stored_sha256, content_sha256
+                 FROM artifacts WHERE source_path = ?1",
+                [source_path],
+                |r| {
+                    Ok(GcRow {
+                        id: r.get(0)?,
+                        session_uuid: r.get(1)?,
+                        source_path: r.get(2)?,
+                        source_sha256: r.get(3)?,
+                        stored_path: r.get(4)?,
+                        stored_sha256: r.get(5)?,
+                        content_sha256: r.get(6)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
     }
 
     /// Whether the prior capture of this source was ever redacted (sticky).
