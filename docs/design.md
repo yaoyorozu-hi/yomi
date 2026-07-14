@@ -61,6 +61,7 @@ Rejected `~/.zaibatsu/memory/vol/yomi/`. Rationale:
 
 ```
 ~/.yomi/                           # mode 700
+  .yomi-store                      # marker: proves this dir is a yomi store (guards --fix-perms)
   archive/
     <project-slug>/
       <session-uuid>/
@@ -68,22 +69,30 @@ Rejected `~/.zaibatsu/memory/vol/yomi/`. Rationale:
         transcript.jsonl.zst       # main transcript, zstd (concatenated frames for append)
         subagents/
           <agent-uuid>.jsonl.zst
-          <agent-uuid>.meta.json   # {agentType,description,toolUseId} — verbatim
+          <agent-uuid>.meta.json   # {agentType,description,toolUseId} — redacted-if-needed, else verbatim
         tool-results/
-          <hash>.txt.zst           # content-addressed, dedup by hash
-        conversation.md            # derived, human-readable (optional)
-        redactions.json            # per-finding: {kind, span, secret_sha8, action}
-    _history/<date>.jsonl.zst      # history.jsonl slices (single-file source)
-    _mcp/<server>/<date>.jsonl.zst
-    _snapshots/<ts>.sh.zst
-  quarantine/<session-uuid>/       # mode 700 — unredacted secret-bearing originals; NOT indexed
-  index/                           # FTS5 db (or tantivy dir)
+          <name>.txt.zst           # content-addressed, dedup by hash
+        conversation.md            # derived, human-readable (P4)
+        redactions.json            # per-finding: {kind, span, secret_sha8, action} (P2 sidecar; P1 keeps this in manifest.secret_scan + catalog.findings)
+    _history/history.jsonl.zst     # history.jsonl — single incremental store (P1); date-partitioned views come from the index (P4)
+    _mcp/<server>/<name>.jsonl.zst # one store per mcp log file (whole-file, idempotent)
+    _snapshots/<name>.sh.zst
+    _paste/<name>.txt.zst          # paste-cache
+    _scratch/<slug--uuid>/         # scratch: manifest.json (every file) + allow-listed stored files
+  quarantine/<session-uuid>/<rel>  # mode 700 — unredacted originals, keyed by artifact rel-path; NOT indexed
+  index/                           # FTS5 db (or tantivy dir) — P4
   state/
-    catalog.db                     # SQLite (mode 600)
-    gc.log                         # append-only wipe audit (natural-language lines)
+    catalog.db                     # SQLite (mode 600) — sessions, artifacts, findings
+    gc.log                         # append-only wipe audit (P3)
   config.toml                      # mode 600
-  yomi.log
+  .yomi.lock                       # advisory single-writer lock
 ```
+
+**P1 layout notes (reconciled to implementation):**
+- **`_history` is a single incremental store**, not date-sliced: the byte-offset watermark *is* the slice watermark (source is never wiped; §5). Date-partitioned *views* are an index concern (P4).
+- **`_paste/` and `_scratch/`** join the date/name-partitioned single-file stores; `_scratch/<key>/` holds a `manifest.json` of every scratch file plus the allow-listed, under-cap files.
+- **Quarantine is keyed by the artifact's rel-path** (`quarantine/<uuid>/<rel>`), not basename, so same-named originals from different sources cannot clobber each other.
+- **No `.v<n>` rotation in P1.** A prefix-divergence or corruption-triggered recapture overwrites the store in place (atomic temp-write + rename). This avoids untracked orphan versions and eliminates any stale, pre-redaction copy as a leak surface; catalog-tracked versioning is deferred to P3.
 
 **Keyed by `session-uuid`, not date.** Date is derived metadata (manifest + index), not a directory
 level. A session spanning midnight stays one dir; idempotency and cross-refs use the stable UUID.
@@ -187,10 +196,76 @@ Path-exact + glob, non-overridable by config (config may **add**, never remove):
 
 A blacklisted path is never opened for read **or** delete. Test-proven in CI (P1 gate).
 
-### Secret scan pass (on everything archived)
+**Hardlink defense.** The blacklist matches on a normalized absolute path *and* on the inode
+`(dev, ino)` of the credential files, so a hardlink to a credential placed at a non-denied path (e.g.
+inside `projects/`) is still refused. The cardinal credential files (`.credentials.json`,
+`.claude.json`, `mcp-needs-auth-cache.json`) are **re-stat'd live on every check**, so a hardlink
+created *after* the denylist was built is still caught. Rolling `backups/*` use a compile-time inode
+snapshot (lower value; mid-run rotation is a narrow, non-cardinal window). Symlinks are already caught
+by path normalization.
 
-Runs on the **content** of every archived artifact — for JSONL, every string field of every entry
-(user content, tool_result text, assistant text blocks, snapshot env lines).
+**Open is fd-pinned (no check→open race).** The reader `open()`s the source **once** and runs the
+inode check against that open fd's own `fstat`, then reads from the fd — never re-opening the path. A
+path swapped to a credential hardlink between the name check and the read therefore cannot slip
+through: what we scan and store is exactly the inode we vetted.
+
+**Out of scope (P1).** Homoglyph/confusable substitution (e.g. Cyrillic `А` U+0410 for Latin `A`) is
+*not* folded by NFKC and is a known residual: a structured secret spelled with confusables is
+generally rejected by the issuing service, so it is not chased here. A brand-new credential file at an
+unknown path with unknown contents — matching neither a denied path nor a denied inode — is likewise
+outside the compiled-in denylist by construction.
+
+### Secret scan — the scannable-or-quarantine invariant
+
+**An artifact enters the browsable, searchable store only if it is fully scannable in a *canonical
+readable form*.** Anything that is not is **quarantined whole**: the raw bytes go to `quarantine/`,
+and only an opaque marker (`‹QUARANTINED:<reason>:<sha8>›`) is stored in the searchable archive. yomi
+is a secret-aggregation point, so "only what we could fully read is searchable" is the safe default —
+content we cannot fully scan must never sit, unvetted, in the searchable store. Exotic/binary content
+becoming quarantine-not-searchable is the accepted trade-off (user/control-plane ratified).
+
+"Scannable" means: the bytes normalize to UTF-8, and in a **canonical readable form** — NFKC-folded,
+with zero-width/format/combining characters and non-ASCII spaces stripped — the detectors find no
+secret that isn't already visible in the raw text. The gate, in order (any failure ⇒ quarantine whole):
+
+1. **Encoding normalization.** BOMs are honored (UTF-8; UTF-16 LE/BE decoded to UTF-8). BOM-less bytes
+   must be valid UTF-8 **and** free of an interleaved-NUL island: an ASCII secret encoded as UTF-16
+   (`A\0K\0I\0A\0…`) is valid UTF-8 yet hides from a byte-regex. The NUL check is **windowed** (any
+   `NUL_WINDOW`-byte window ≥25 % NUL ⇒ UTF-16-ambiguous), so a small UTF-16 island diluted inside a
+   large ASCII body is still caught (a global ratio would be diluted away). Undecodable ⇒ quarantine.
+2. **Structural gate (conversation JSONL: transcript/subagent/history).** Every non-blank line must
+   parse as JSON. A malformed line ⇒ quarantine whole (a raw multi-line secret — e.g. a PEM block —
+   can only appear in a transcript as non-JSON lines, so this closes multi-line/frame-straddle leaks).
+   MCP debug logs are treated as plain text (LOW-MED; a stray non-JSON line shouldn't quarantine a log).
+3. **Normalization-gap detection.** For JSON, every **key and value** (recursively); for plain content,
+   the whole text. Each is deep-unescaped (`\uXXXX`/`\xXX`, repeatedly) **and** reduced to its canonical
+   readable form, then scanned. A HIGH/MED secret that appears only after this normalization — hidden by
+   escaping, by invisible-separator token-splitting (zero-width space, word-joiner, NBSP, combining
+   marks), or by fullwidth/compatibility forms — ⇒ quarantine whole. Quarantine (not redact): in the raw
+   bytes the secret is entangled with invisible characters, so an in-place redaction span is ambiguous —
+   whole-artifact isolation is the fail-safe.
+4. **Visible secrets** (present literally in the normalized text) are redacted **in place** with
+   `‹REDACTED:kind:sha8›`; the artifact stays searchable. HIGH additionally quarantines the raw original.
+
+Canonicalization is **detection-only** — the stored artifact remains the raw (or in-place-redacted)
+bytes, so clean content (including non-ASCII conversation text — Japanese, emoji, symbols) is stored
+byte-faithfully and is not over-quarantined.
+
+Scanning always runs over the full logical content `[0..end]`, never a single append slice. The store
+stays incremental (append a frame) only when appending reproduces the full redacted content exactly;
+otherwise the artifact is rewritten whole (temp-write + rename), which also self-heals a
+crash-interrupted prior append.
+
+**Cost note (#4).** Because correctness for multi-line/boundary secrets requires the full-content
+scan, each append re-scans the whole logical artifact — O(N·K) over K appends of an N-byte transcript.
+This is intentional (no leak window); a future optimization may re-scan only an overlap window
+(max-secret-length) around the append boundary. The store write itself stays O(delta).
+
+**Threat-model note (#5).** The blacklist gates by path glob and by credential inode (re-stat'd live,
+closing the hardlink TOCTOU for the cardinal credential files). A **fresh** credential file at an
+unknown path with unknown content — matching neither a denied path nor a denied inode — is outside
+both gates by construction; defending against arbitrary future credential locations is out of scope
+for P1's compiled-in denylist.
 
 **Detectors** (config-extensible ruleset, severity-tagged):
 
@@ -218,8 +293,12 @@ Raw secrets **never** reach the index or `conversation.md` — those derive from
 
 ### Permission model
 
-`~/.yomi` + `quarantine/` = 700; `catalog.db` + `config.toml` = 600; restrictive umask on all writes.
-Startup **refuses to run** (exit 3) if `~/.yomi` perms are looser than 700 (`--fix-perms` to correct).
+`~/.yomi` + `quarantine/` = 700; `catalog.db` + `config.toml` + stored files = 600; restrictive umask on all writes.
+A mutating command **refuses to run** (exit 3) if `~/.yomi` perms are looser than 700. `--fix-perms`
+corrects it, but only after confirming the directory is actually a yomi store (marker/`archive`/`state`
+present, or empty) — it will not chmod an unrelated directory the user pointed `--home` at.
+Read-side commands (`status`, `verify`, `archive --dry-run`) never require an initialized store: a
+fresh or missing home reports "nothing archived" rather than erroring, and creates nothing.
 
 ---
 
@@ -229,13 +308,22 @@ Startup **refuses to run** (exit 3) if `~/.yomi` perms are looser than 700 (`--f
 
 No deletion path exists that isn't gated on a verified archive. Per source file:
 
-1. Look up archive artifact by source path + `source_sha256` in catalog.
+1. Look up archive artifact by source path + `source_sha256` in catalog (source path is canonicalized so symlink/`..`/relative forms map to one row).
 2. **Recompute live source `sha256`.**
-3. Require **all**: catalog artifact with `source_sha256 == live_sha` **AND** `stored_sha256` re-verifies (re-hash stored file) **AND** (if `require_indexed`) index status = indexed.
+3. Require **all**: catalog artifact with `source_sha256 == live_sha` **AND** the stored artifact **re-verifies** (below) **AND** (if `require_indexed`) index status = indexed.
 4. **AND** file age ≥ `min_age` **AND** session not live (§below).
 5. Only then delete source. Append to `gc.log`: source, source_sha, archive_id, verified checks, deleted_at.
 
 Any check fails → **skip**, mark `unverified` in status. Never delete on doubt.
+
+**Stored re-verification (`yomi verify`, P1) is two-layer, not one:** the compressed bytes must hash
+to the catalog's `stored_sha256`, **and** the *decompressed* content must hash to `content_sha256`
+(the sha of the intended, post-redaction content, recorded at capture). The content-hash layer is
+what catches frame-duplication corruption — e.g. a crash-replayed append — that a
+compressed-bytes-only check would pass. For an un-redacted artifact `content_sha256 == source_sha256`;
+for a redacted one it is the sha of the redacted stored content (the browsable copy is redacted by
+design, so it cannot equal the raw source). The GC gate above therefore trusts `verify`, and `verify`
+proves the store is byte-exact to what capture intended.
 
 ### Live-session protection
 
