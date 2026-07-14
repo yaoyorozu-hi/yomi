@@ -179,12 +179,15 @@ mod tests {
     }
 
     #[test]
-    fn low_flags_only() {
-        let content = b"Authorization: Bearer abcdefghijklmnopqrstuvwxyz012345";
-        let out = scan_and_redact(content, &Allowlist::compile(&[]));
-        assert!(!out.was_redacted);
-        assert_eq!(out.flagged, 1);
-        assert_eq!(out.redacted, content.to_vec());
+    fn bearer_redacts_med_without_quarantine() {
+        let token = "abcdefghijklmnopqrstuvwxyz012345";
+        let content = format!("Authorization: Bearer {token}").into_bytes();
+        let out = scan_and_redact(&content, &Allowlist::compile(&[]));
+        assert!(out.was_redacted);
+        assert!(!out.needs_quarantine, "MED must not quarantine");
+        let s = String::from_utf8(out.redacted).unwrap();
+        assert!(!s.contains(token), "bearer token leaked: {s}");
+        assert!(s.contains("\u{2039}REDACTED:bearer:"));
     }
 
     #[test]
