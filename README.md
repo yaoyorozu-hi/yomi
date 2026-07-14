@@ -24,9 +24,13 @@ The storage root is `~/.yomi/` (override with `YOMI_HOME`).
 
 ## Status
 
-**pre-P1.** Design is ratified; implementation has not started. See
-[`docs/design.md`](docs/design.md) for the full design — that document is the source of
-truth for what yomi is and how it behaves.
+**P1 implemented.** The archive pillar is built: source discovery across the Claude
+Code data layout, byte-faithful zstd capture with incremental append frames, dual
+`source`/`stored` checksums, a compiled-in credential blacklist, secret scan
+(redact / quarantine / flag with allowlist), a SQLite catalog, and the `archive`,
+`status`, `verify`, and `config` subcommands. Wipe/GC (P3) and index/search (P4) are
+not yet built. See [`docs/design.md`](docs/design.md) for the full design — that
+document is the source of truth for what yomi is and how it behaves.
 
 ## License
 

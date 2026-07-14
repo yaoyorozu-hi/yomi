@@ -11,4 +11,27 @@ readme = "README.md"
 name = "yomi"
 path = "src/main.rs"
 
+[lib]
+name = "yomi"
+path = "src/lib.rs"
+
 [dependencies]
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+zstd = "0.13"
+rusqlite = { version = "0.32", features = ["bundled"] }
+sha2 = "0.10"
+regex = "1"
+unicode-normalization = "0.1"
+unicode-properties = { version = "0.1", features = ["general-category"] }
+walkdir = "2"
+globset = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+fs2 = "0.4"
+libc = "0.2"
