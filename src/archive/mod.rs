@@ -2,7 +2,7 @@ pub mod compress;
 pub mod incremental;
 pub mod manifest;
 
-use crate::blacklist::Blacklist;
+use crate::blacklist::{Blacklist, GuardOutcome};
 use crate::catalog::{ArtifactUpsert, Catalog, SessionUpsert};
 use crate::config::Env;
 use crate::model::{ArtifactRecord, ArtifactRole, Finding, Frame, Manifest, SecretScanSummary};
@@ -306,6 +306,7 @@ impl<'a> Archiver<'a> {
         candidates.extend(sc.task_outputs.iter().cloned());
         candidates.sort();
 
+        let mut kept: Vec<PathBuf> = Vec::new();
         for path in &candidates {
             if self.blacklist.is_blacklisted(path) {
                 report.blacklisted_skipped += 1;
@@ -325,14 +326,17 @@ impl<'a> Archiver<'a> {
                 path: rel,
                 bytes: size,
                 stored: store,
+                source_sha256: None,
+                content_sha256: None,
             });
+            kept.push(path.clone());
         }
 
         let over_total = total > cfg.total_cap.0;
         if !self.dry_run {
             std::fs::create_dir_all(&store_dir)?;
             set_700(&store_dir)?;
-            for (entry, path) in entries.iter().zip(candidates.iter()) {
+            for (entry, path) in entries.iter_mut().zip(kept.iter()) {
                 if entry.stored
                     && !over_total
                     && let Some(bytes) = self.read_source(path, report)?
@@ -350,6 +354,8 @@ impl<'a> Archiver<'a> {
                     atomic_write(&dest, &compress_frame(&scan.redacted)?)?;
                     set_600(&dest)?;
                     report.bytes_stored += std::fs::metadata(&dest)?.len();
+                    entry.source_sha256 = Some(sha256_hex(&bytes));
+                    entry.content_sha256 = Some(sha256_hex(&scan.redacted));
                 }
             }
             let mf = ScratchManifest {
@@ -372,43 +378,33 @@ impl<'a> Archiver<'a> {
     /// and open cannot slip through (S3). Returns None if denied or oversized.
     fn read_source(&self, path: &Path, report: &mut Report) -> Result<Option<Vec<u8>>> {
         use std::io::Read;
-        use std::os::unix::fs::MetadataExt;
 
-        // Path-name glob can be checked up front (cheap, and covers globbed dirs).
-        if self.blacklist.path_denied(path) {
-            report.blacklisted_skipped += 1;
-            tracing::warn!(path = %path.display(), "blacklisted source refused (path)");
-            return Ok(None);
-        }
-        let mut file = match std::fs::File::open(path) {
-            Ok(f) => f,
-            Err(e) => {
-                tracing::warn!(path = %path.display(), error = %e, "skip unreadable source");
-                return Ok(None);
+        match self.blacklist.open_guarded(path)? {
+            GuardOutcome::Denied => {
+                report.blacklisted_skipped += 1;
+                tracing::warn!(path = %path.display(), "blacklisted source refused");
+                Ok(None)
             }
-        };
-        let md = file
-            .metadata()
-            .with_context(|| format!("fstat source {}", path.display()))?;
-        // Gate on the fd's actual inode — pins what we opened.
-        if self.blacklist.inode_denied((md.dev(), md.ino())) {
-            report.blacklisted_skipped += 1;
-            tracing::warn!(path = %path.display(), "blacklisted source refused (inode)");
-            return Ok(None);
+            GuardOutcome::Unreadable => {
+                tracing::warn!(path = %path.display(), "skip unreadable source");
+                Ok(None)
+            }
+            GuardOutcome::Opened(mut file, md) => {
+                if md.len() > MAX_SOURCE_BYTES {
+                    report.oversize_skipped += 1;
+                    tracing::warn!(
+                        path = %path.display(),
+                        bytes = md.len(),
+                        "source exceeds size cap; skipped (flagged)"
+                    );
+                    return Ok(None);
+                }
+                let mut bytes = Vec::with_capacity(md.len() as usize);
+                file.read_to_end(&mut bytes)
+                    .with_context(|| format!("read source {}", path.display()))?;
+                Ok(Some(bytes))
+            }
         }
-        if md.len() > MAX_SOURCE_BYTES {
-            report.oversize_skipped += 1;
-            tracing::warn!(
-                path = %path.display(),
-                bytes = md.len(),
-                "source exceeds size cap; skipped (flagged)"
-            );
-            return Ok(None);
-        }
-        let mut bytes = Vec::with_capacity(md.len() as usize);
-        file.read_to_end(&mut bytes)
-            .with_context(|| format!("read source {}", path.display()))?;
-        Ok(Some(bytes))
     }
 
     /// Scan artifact content decode-first, honoring `--no-scan` and
@@ -746,6 +742,17 @@ struct ScratchEntry {
     path: String,
     bytes: u64,
     stored: bool,
+    /// sha256 of the live source bytes at archive time. Present only for stored
+    /// entries; GC re-hashes the live file against this to prove it is unchanged
+    /// before deleting the tree. Absent for non-stored (deny-listed) junk, which
+    /// GC verifies by presence + size only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_sha256: Option<String>,
+    /// sha256 of the stored (post-scan, possibly-redacted) bytes. GC decompresses
+    /// the stored `.zst` and checks its content hash against this, so a valid-zstd
+    /// frame of the *wrong* content can never pass the scratch delete gate (D2).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content_sha256: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -776,7 +783,7 @@ fn role_is_jsonl(role: ArtifactRole) -> bool {
 /// Canonical catalog key for a source path, so symlink/`..`/relative forms all
 /// map to one row (R6). Falls back to a lexical normalization if the path is
 /// gone by the time we key it.
-fn canonical_key(source: &Path) -> String {
+pub fn canonical_key(source: &Path) -> String {
     source
         .canonicalize()
         .unwrap_or_else(|_| crate::util::abs_normalize(source))

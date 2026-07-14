@@ -1,4 +1,5 @@
 mod archive;
+mod gc;
 mod status;
 
 use crate::config::Env;
@@ -35,6 +36,8 @@ pub struct Cli {
 pub enum Command {
     /// Capture session data into the archive store.
     Archive(archive::ArchiveArgs),
+    /// Wipe verified+aged+non-live ephemeral output (dry-run by default).
+    Gc(gc::GcArgs),
     /// Report archive state, secrets, and storage.
     Status(status::StatusArgs),
     /// Re-hash stored artifacts against the catalog.
@@ -66,6 +69,7 @@ pub fn run() -> Result<i32> {
 
     match &cli.command {
         Command::Archive(args) => archive::run(&env, args, cli.json),
+        Command::Gc(args) => gc::run(&env, args, cli.json),
         Command::Status(args) => status::run_status(&env, args, cli.json),
         Command::Verify(args) => status::run_verify(&env, args, cli.json),
         Command::Config(args) => run_config(&env, args, cli.json),

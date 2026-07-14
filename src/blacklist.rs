@@ -2,8 +2,21 @@ use crate::util::{abs_normalize, home_dir};
 use anyhow::Result;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use std::collections::HashSet;
+use std::fs::{File, Metadata};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
+
+/// Result of a blacklist-gated open. The one open in the codebase: both
+/// archive-read and gc-delete route through [`Blacklist::open_guarded`], so
+/// no path can be read or unlinked without passing the same denylist.
+pub enum GuardOutcome {
+    /// Path-glob or opened-inode matched the denylist. Never touch.
+    Denied,
+    /// The path could not be opened or stat'd (missing, permission, race).
+    Unreadable,
+    /// Opened; the caller holds the fd and its metadata (pinned inode).
+    Opened(File, Metadata),
+}
 
 /// Compiled-in, non-overridable path denylist. Config may *add* patterns,
 /// never remove these. Every source open is checked against it before any
@@ -113,6 +126,30 @@ impl Blacklist {
 
     pub fn patterns(&self) -> &[String] {
         &self.patterns
+    }
+
+    /// Open `path` under the hard denylist, pinning the opened fd's inode. The
+    /// path-name glob is checked first (cheap, covers globbed dirs); the file is
+    /// then opened **once** and its own fstat'd `(dev,ino)` is checked against the
+    /// live credential inodes, so a path swapped to a credential hardlink between
+    /// check and open cannot slip through (S3/B4). Every read and every unlink in
+    /// yomi goes through this — there is exactly one blacklist-gated open.
+    pub fn open_guarded(&self, path: &Path) -> Result<GuardOutcome> {
+        if self.path_denied(path) {
+            return Ok(GuardOutcome::Denied);
+        }
+        let file = match File::open(path) {
+            Ok(f) => f,
+            Err(_) => return Ok(GuardOutcome::Unreadable),
+        };
+        let md = match file.metadata() {
+            Ok(m) => m,
+            Err(_) => return Ok(GuardOutcome::Unreadable),
+        };
+        if self.inode_denied((md.dev(), md.ino())) {
+            return Ok(GuardOutcome::Denied);
+        }
+        Ok(GuardOutcome::Opened(file, md))
     }
 }
 

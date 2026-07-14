@@ -1,5 +1,5 @@
 [package]
-name = "yomi"
+name = "yhi-yomi"
 version = "0.1.0"
 edition = "2024"
 description = "Claude Code session-data plane: archive, wipe, and search"
@@ -35,3 +35,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 fs2 = "0.4"
 libc = "0.2"
+
+[dev-dependencies]
+filetime = "0.2"
+rusqlite = { version = "0.32", features = ["bundled"] }

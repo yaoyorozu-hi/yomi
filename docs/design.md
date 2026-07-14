@@ -304,13 +304,19 @@ fresh or missing home reports "nothing archived" rather than erroring, and creat
 
 ## 5. Wipe / GC
 
+> **Phase:** built as **P2** (the build sequence merges Archive=P1, Wipe/GC=P2). The
+> §9 table historically labeled this P3 behind a separate "Secret scan" P2; the secret
+> scanner shipped inside P1 (canonical-form scanner, quarantine, 55 tests), so wipe moves
+> up to P2. `require_indexed` defaults **false** until the index layer (P3) exists; set
+> `true` and, with no index present, GC skips every candidate rather than delete unindexed.
+
 ### Absolute law: archive-verify-then-delete
 
 No deletion path exists that isn't gated on a verified archive. Per source file:
 
 1. Look up archive artifact by source path + `source_sha256` in catalog (source path is canonicalized so symlink/`..`/relative forms map to one row).
 2. **Recompute live source `sha256`.**
-3. Require **all**: catalog artifact with `source_sha256 == live_sha` **AND** the stored artifact **re-verifies** (below) **AND** (if `require_indexed`) index status = indexed.
+3. Require **all**: catalog artifact with `source_sha256 == live_sha` **AND** the stored artifact **re-verifies** (below) **AND** (if `require_indexed`) index status = indexed. In P2 no index layer exists, so `require_indexed=true` is *unsatisfiable* and GC skips every candidate (never deletes) — the flag becomes meaningful in P3.
 4. **AND** file age ≥ `min_age` **AND** session not live (§below).
 5. Only then delete source. Append to `gc.log`: source, source_sha, archive_id, verified checks, deleted_at.
 
@@ -343,7 +349,7 @@ mcp_log_retain   = "14d"
 paste_retain     = "14d"
 snapshot_retain  = "30d"
 history_compact  = false   # default: archive history slices, NEVER wipe live file
-require_indexed  = true
+require_indexed  = false   # P2: no index layer yet; true ⇒ GC refuses all (unsatisfiable, safe)
 ```
 
 ### Special targets
@@ -494,17 +500,20 @@ Load-bearing fixtures: secret-scan **must** catch AKIA/PRIVATE KEY; double-archi
 
 ### Phases (each with a hard done-when)
 
-- **P1 — Archive + blacklist + fidelity** (foundational). Source(claude) + manifest/checksum + zstd store + hard blacklist + incremental(offset/sha) + catalog.
-  *Done:* `yomi archive --all` captures transcripts+subagents+tool-results byte-faithfully; re-run no-op; blacklisted paths provably never opened; `yomi verify` passes.
-- **P2 — Secret scan + quarantine** (security gate, precedes any wipe). Detectors, redact, quarantine, severity/allowlist, `status --secrets`.
-  *Done:* fixture secrets caught+redacted; raw secret never in stored artifact or index (test); FP allowlist works; the 2 known recon-flagged transcripts handled.
-- **P3 — Wipe / GC** (gated on P1+P2). archive-verify-then-delete, live detection, age policy, dry-run default, /tmp + empty-dir janitor, `gc.log`.
-  *Done:* deletes only verified+aged+non-live; refuses on any mismatch (test); dry-run shows plan; reclaims the 134M scratch clone + 65 empty dirs.
-- **P4 — Index + search.** FTS5, per-entry docs, filters, incremental index, `search`/`read`.
+- **P1 — Archive + blacklist + fidelity + secret scan** (foundational; secret scan/quarantine
+  shipped inside P1: canonical-form scanner, quarantine, severity/allowlist, `status --secrets`).
+  *Done:* transcripts captured byte-faithfully; re-run no-op; blacklisted paths provably never opened;
+  fixture secrets caught+redacted; raw secret never in store/index; `yomi verify` passes. **(merged, #1)**
+- **P2 — Wipe / GC** (gated on P1). archive-verify-then-delete, live detection, age policy,
+  dry-run default, /tmp + empty-dir janitor, `gc.log`, cross-user READ-ONLY shape discovery.
+  *Done:* deletes only verified+aged+non-live; refuses on any mismatch/live/lock (test);
+  dry-run shows plan; reclaims the 134M scratch clone + 65 empty dirs; `--discover-all-users`
+  inventories all ephemeral shapes without touching foreign data.
+- **P3 — Index + search.** FTS5, per-entry docs, filters, incremental index, `search`/`read`.
   *Done:* ranked filtered results; incremental index no dup; redacted-only content.
-- **P5 — Codex absorption + cutover.** importer, freeze codex writes, hook/shutdown rewire. **No mx changes** — codex left as frozen read-only vestige (decided §5).
+- **P4 — Codex absorption + cutover.** importer, freeze codex writes, hook/shutdown rewire. **No mx changes** — codex left as frozen read-only vestige (decided §5).
   *Done:* `import --from-codex` idempotent; `mx codex archive` no longer invoked by hooks; hooks call `yomi archive`; `mx codex read/list/search` still function untouched.
-- **P6 — Ops.** `run --profile daily`, `status --storage`, senri JSON hook, documented tantivy upgrade trigger.
+- **P5 — Ops.** `run --profile daily`, `status --storage`, senri JSON hook, documented tantivy upgrade trigger.
 
 ---
 
