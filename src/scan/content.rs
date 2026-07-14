@@ -40,6 +40,12 @@ pub struct ContentScan {
 const MARKER_OPEN: &str = "\u{2039}QUARANTINED:"; // ‹
 const MARKER_CLOSE: &str = "\u{203a}"; // ›
 
+/// Defanged rewrites of a source-forged audit token: the opening guillemet is
+/// swapped for an ASCII `<` so the stored/indexed text no longer contains a
+/// string that a reader or tool would mistake for a genuine redaction tag.
+const DEFANGED_PLACEHOLDER: &str = "<REDACTED:";
+const DEFANGED_MARKER: &str = "<QUARANTINED:";
+
 /// Result of normalizing raw bytes toward a scannable UTF-8 string.
 enum Norm {
     Text(String),
@@ -72,16 +78,25 @@ fn quarantine_whole(bytes: &[u8], reason: &'static str) -> ContentScan {
 
 /// Scan artifact content under the scannable-or-quarantine invariant.
 pub fn scan_content(bytes: &[u8], is_jsonl: bool, allow: &Allowlist) -> ContentScan {
-    let text = match normalize_utf8(bytes) {
+    let mut text = match normalize_utf8(bytes) {
         Norm::Text(t) => t,
         Norm::Unscannable(reason) => return quarantine_whole(bytes, reason),
     };
 
     // A source that pre-injects our own token is trying to forge an audit tag.
+    // Flag it AND defang it: the opening guillemet is rewritten to ASCII `<` so
+    // the stored/indexed text carries no counterfeit `‹REDACTED:…›` /
+    // `‹QUARANTINED:…›` that would spoof a real redaction. Genuine placeholders
+    // are inserted downstream by the redactor and are never touched.
     let mut findings = Vec::new();
     let mut flagged = 0u32;
+    let mut forged_tag = false;
     if text.contains(PLACEHOLDER_OPEN) || text.contains(MARKER_OPEN) {
         flagged += 1;
+        forged_tag = true;
+        text = text
+            .replace(PLACEHOLDER_OPEN, DEFANGED_PLACEHOLDER)
+            .replace(MARKER_OPEN, DEFANGED_MARKER);
         findings.push(Finding {
             kind: "preinjected-placeholder".to_string(),
             severity: Severity::Low,
@@ -130,7 +145,7 @@ pub fn scan_content(bytes: &[u8], is_jsonl: bool, allow: &Allowlist) -> ContentS
     }
     findings.extend(lex.findings);
 
-    let was_redacted = lex.redacted != text.as_bytes();
+    let was_redacted = forged_tag || lex.redacted != text.as_bytes();
     ContentScan {
         scanned: true,
         redacted: lex.redacted,
@@ -571,6 +586,27 @@ mod tests {
     }
 
     // ---- Non-regression: clean, legitimately non-ASCII content stays searchable ----
+
+    #[test]
+    fn preinjected_placeholder_is_flagged_and_defanged() {
+        // A source forging a redaction tag: it must be flagged AND the counterfeit
+        // token defanged so the stored text carries no spoofed `‹REDACTED:…›`.
+        let line = "{\"message\":\"audit \u{2039}REDACTED:aws-key:deadbeef\u{203a} and \u{2039}QUARANTINED:x:00\u{203a}\"}\n";
+        let out = scan_content(line.as_bytes(), true, &allow());
+        assert!(
+            out.scanned,
+            "clean-but-forged content should stay searchable"
+        );
+        assert_eq!(out.flagged, 1, "forged tag not flagged");
+        let s = String::from_utf8(out.redacted).unwrap();
+        assert!(
+            !s.contains(PLACEHOLDER_OPEN),
+            "spoofed redaction tag survived"
+        );
+        assert!(!s.contains(MARKER_OPEN), "spoofed quarantine tag survived");
+        assert!(s.contains("<REDACTED:aws-key"), "defanged form missing");
+        assert!(s.contains("<QUARANTINED:x"), "defanged marker missing");
+    }
 
     #[test]
     fn clean_japanese_and_emoji_stay_searchable() {

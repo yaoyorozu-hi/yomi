@@ -13,6 +13,46 @@ pub struct Config {
     pub scratch: ScratchConfig,
     pub scan: ScanConfig,
     pub gc: GcConfig,
+    pub index: IndexConfig,
+}
+
+/// `[index]` policy. `#[serde(default)]` keeps existing configs (with no
+/// `[index]` block) parsing unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct IndexConfig {
+    /// FTS5 tokenizer: `"unicode61"` (default, best for English/code, supports
+    /// prefix/AND/OR/NEAR operators) or `"trigram"` (substring match across all
+    /// scripts including CJK, opt-in for Japanese-heavy corpora). Changing this
+    /// requires `yomi index --reindex` (a destructive FTS rebuild).
+    pub tokenizer: String,
+}
+
+impl Default for IndexConfig {
+    fn default() -> Self {
+        IndexConfig {
+            tokenizer: "unicode61".to_string(),
+        }
+    }
+}
+
+impl IndexConfig {
+    /// The full FTS5 `tokenize=` clause for the configured tokenizer.
+    pub fn tokenize_clause(&self) -> &'static str {
+        match self.tokenizer.as_str() {
+            "trigram" => "trigram",
+            _ => "unicode61 remove_diacritics 2",
+        }
+    }
+
+    /// The stable identity recorded in `index_meta` and compared for reindex
+    /// detection (normalized so an unknown value falls back to the default).
+    pub fn effective_tokenizer(&self) -> &'static str {
+        match self.tokenizer.as_str() {
+            "trigram" => "trigram",
+            _ => "unicode61",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -151,8 +191,9 @@ pub struct GcConfig {
     pub active_window: DurationSetting,
     /// Inert in P2 (history is not a GC target); a `true` value warns and is ignored.
     pub history_compact: bool,
-    /// P2 default false: no index layer exists yet. `true` is unsatisfiable and
-    /// makes GC skip every candidate rather than delete unindexed.
+    /// Default false. When `true` the GC delete gate (P3) consults per-source
+    /// `index_state`: a source is deletable only if indexed at its current source
+    /// sha; un-indexed or stale-indexed sources are skipped (fail-closed).
     pub require_indexed: bool,
 }
 

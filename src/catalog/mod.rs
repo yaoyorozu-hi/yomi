@@ -3,7 +3,7 @@ use crate::config::Env;
 use crate::model::{ArtifactRole, Finding, Severity};
 use crate::util::now_iso;
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, ToSql};
 use std::path::Path;
 
 pub struct Catalog {
@@ -75,6 +75,41 @@ pub struct SecretRow {
     pub action: String,
     pub secret_sha8: String,
 }
+
+/// One artifact to index: identity + session facets (via `sessions` LEFT JOIN).
+pub struct IndexCandidate {
+    pub artifact_id: i64,
+    pub session_uuid: String,
+    pub role: String,
+    pub source_path: String,
+    pub source_sha256: String,
+    pub source_bytes: u64,
+    pub stored_path: String,
+    pub redacted: bool,
+    pub project_slug: Option<String>,
+    pub cwd: Option<String>,
+    pub git_branch: Option<String>,
+    pub cc_version: Option<String>,
+}
+
+/// The recorded index watermark for one source, consulted by the GC gate.
+pub struct IndexStatus {
+    pub indexed_source_sha256: String,
+    pub indexed_through_offset: u64,
+    pub doc_count: u64,
+}
+
+/// Roles whose artifacts are index candidates (excludes subagent-meta / scratch).
+/// The `quarantined` flag is deliberately NOT a filter here: it is set both for
+/// whole-quarantine artifacts (stored = opaque marker) AND for scannable content
+/// carrying a HIGH finding that was redacted in place (stored = fully-redacted
+/// browsable text — e.g. a transcript with a visible AWS key). Redaction
+/// non-exposure is guaranteed structurally by indexing only the decompressed
+/// stored bytes (always post-redaction or a marker), never the raw source, so
+/// gating on `quarantined` would only make redacted content unsearchable and
+/// deny `require_indexed` a watermark for those sources.
+const INDEX_ROLES: &str =
+    "'transcript','subagent','tool-result','mcp','snapshot','paste','history'";
 
 impl Catalog {
     pub fn open(path: &Path) -> Result<Self> {
@@ -376,6 +411,328 @@ impl Catalog {
             .query_map([], |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    // ── Index / search (P3) ──────────────────────────────────────────────────
+
+    /// Every index candidate: artifacts of an indexable role (see `INDEX_ROLES`),
+    /// with their session facets. `quarantined` is deliberately not a filter —
+    /// stored bytes are always post-redaction or an opaque marker, so indexing
+    /// them never exposes raw secrets, and gating on it would deny
+    /// `require_indexed` a watermark for in-place-redacted sources. Ordered by id
+    /// for stable, resumable runs.
+    pub fn index_candidates(&self) -> Result<Vec<IndexCandidate>> {
+        let sql = format!(
+            "SELECT a.id, a.session_uuid, a.role, a.source_path, a.source_sha256, a.source_bytes,
+                    a.stored_path, a.redacted, s.project_slug, s.cwd, s.git_branch, s.cc_version
+             FROM artifacts a LEFT JOIN sessions s ON s.uuid = a.session_uuid
+             WHERE a.role IN ({INDEX_ROLES})
+             ORDER BY a.id"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map([], Self::map_candidate)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn index_candidates_for_session(&self, uuid: &str) -> Result<Vec<IndexCandidate>> {
+        let sql = format!(
+            "SELECT a.id, a.session_uuid, a.role, a.source_path, a.source_sha256, a.source_bytes,
+                    a.stored_path, a.redacted, s.project_slug, s.cwd, s.git_branch, s.cc_version
+             FROM artifacts a LEFT JOIN sessions s ON s.uuid = a.session_uuid
+             WHERE a.role IN ({INDEX_ROLES}) AND a.session_uuid = ?1
+             ORDER BY a.id"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map([uuid], Self::map_candidate)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    fn map_candidate(r: &rusqlite::Row) -> rusqlite::Result<IndexCandidate> {
+        Ok(IndexCandidate {
+            artifact_id: r.get(0)?,
+            session_uuid: r.get(1)?,
+            role: r.get(2)?,
+            source_path: r.get(3)?,
+            source_sha256: r.get(4)?,
+            source_bytes: r.get::<_, i64>(5)? as u64,
+            stored_path: r.get(6)?,
+            redacted: r.get::<_, i64>(7)? != 0,
+            project_slug: r.get(8)?,
+            cwd: r.get(9)?,
+            git_branch: r.get(10)?,
+            cc_version: r.get(11)?,
+        })
+    }
+
+    pub fn insert_entry(&self, d: &crate::index::IndexDoc) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO entries
+                (entry_uuid, parent_uuid, session_uuid, artifact_id, source_path, role, agent,
+                 tool_name, project_slug, cwd, git_branch, cc_version, timestamp, has_redaction,
+                 seq, text)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+            rusqlite::params![
+                d.entry_uuid,
+                d.parent_uuid,
+                d.session_uuid,
+                d.artifact_id,
+                d.source_path,
+                d.role,
+                d.agent,
+                d.tool_name,
+                d.project_slug,
+                d.cwd,
+                d.git_branch,
+                d.cc_version,
+                d.timestamp,
+                d.has_redaction as i64,
+                d.seq as i64,
+                d.text,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_entries_for_artifact(&self, artifact_id: i64) -> Result<usize> {
+        Ok(self
+            .conn
+            .execute("DELETE FROM entries WHERE artifact_id = ?1", [artifact_id])?)
+    }
+
+    pub fn delete_entries_for_session(&self, session_uuid: &str) -> Result<usize> {
+        Ok(self.conn.execute(
+            "DELETE FROM entries WHERE session_uuid = ?1",
+            [session_uuid],
+        )?)
+    }
+
+    pub fn delete_all_entries(&self) -> Result<()> {
+        self.conn.execute("DELETE FROM entries", [])?;
+        Ok(())
+    }
+
+    pub fn upsert_index_state(
+        &self,
+        source_path: &str,
+        session_uuid: &str,
+        artifact_id: i64,
+        indexed_source_sha256: &str,
+        through_offset: u64,
+        doc_count: u64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO index_state
+                (source_path, session_uuid, artifact_id, indexed_source_sha256,
+                 indexed_through_offset, doc_count, indexed_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7)
+             ON CONFLICT(source_path) DO UPDATE SET
+                session_uuid = excluded.session_uuid,
+                artifact_id = excluded.artifact_id,
+                indexed_source_sha256 = excluded.indexed_source_sha256,
+                indexed_through_offset = excluded.indexed_through_offset,
+                doc_count = excluded.doc_count,
+                indexed_at = excluded.indexed_at",
+            rusqlite::params![
+                source_path,
+                session_uuid,
+                artifact_id,
+                indexed_source_sha256,
+                through_offset as i64,
+                doc_count as i64,
+                now_iso(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn index_status_for_source(&self, source_path: &str) -> Result<Option<IndexStatus>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT indexed_source_sha256, indexed_through_offset, doc_count
+                 FROM index_state WHERE source_path = ?1",
+                [source_path],
+                |r| {
+                    Ok(IndexStatus {
+                        indexed_source_sha256: r.get(0)?,
+                        indexed_through_offset: r.get::<_, i64>(1)? as u64,
+                        doc_count: r.get::<_, i64>(2)? as u64,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    pub fn delete_index_state_for_session(&self, session_uuid: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM index_state WHERE session_uuid = ?1",
+            [session_uuid],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_all_index_state(&self) -> Result<()> {
+        self.conn.execute("DELETE FROM index_state", [])?;
+        Ok(())
+    }
+
+    /// Run a search. With a non-empty MATCH string, ranks by BM25 and returns a
+    /// highlighted snippet; with an empty MATCH (filters only), lists the newest
+    /// matching entries. Every facet predicate and the MATCH string are bound
+    /// parameters — no query fragment is ever concatenated from user input.
+    pub fn query_entries(&self, q: &crate::index::Query) -> Result<Vec<crate::index::Hit>> {
+        let f = &q.filters;
+        let limit = q.limit as i64;
+        let mut params: Vec<(&str, &dyn ToSql)> = vec![
+            (":project", &f.project),
+            (":session", &f.session),
+            (":agent", &f.agent),
+            (":role", &f.role),
+            (":tool", &f.tool),
+            (":branch", &f.branch),
+            (":cwd", &f.cwd),
+            (":since", &f.since),
+            (":until", &f.until),
+            (":limit", &limit),
+        ];
+        const FACETS: &str = "
+              AND (:project IS NULL OR e.project_slug = :project)
+              AND (:session IS NULL OR e.session_uuid = :session)
+              AND (:agent   IS NULL OR e.agent        = :agent)
+              AND (:role    IS NULL OR e.role         = :role)
+              AND (:tool    IS NULL OR e.tool_name    = :tool)
+              AND (:branch  IS NULL OR e.git_branch   = :branch)
+              AND (:cwd     IS NULL OR e.cwd          = :cwd)
+              AND (:since   IS NULL OR e.timestamp   >= :since)
+              AND (:until   IS NULL OR e.timestamp   <  :until)";
+        let sql = if q.fts.is_empty() {
+            format!(
+                "SELECT e.entry_uuid, e.session_uuid, e.project_slug, e.role, e.agent, e.tool_name,
+                        e.timestamp, e.has_redaction, substr(e.text, 1, 200), 0.0
+                 FROM entries e WHERE 1=1 {FACETS}
+                 ORDER BY e.timestamp DESC LIMIT :limit"
+            )
+        } else {
+            params.push((":fts", &q.fts));
+            let ctx = q.context_tokens.clamp(1, 64);
+            format!(
+                "SELECT e.entry_uuid, e.session_uuid, e.project_slug, e.role, e.agent, e.tool_name,
+                        e.timestamp, e.has_redaction,
+                        snippet(entries_fts, 0, '[', ']', ' … ', {ctx}), bm25(entries_fts)
+                 FROM entries_fts JOIN entries e ON e.id = entries_fts.rowid
+                 WHERE entries_fts MATCH :fts {FACETS}
+                 ORDER BY bm25(entries_fts) LIMIT :limit"
+            )
+        };
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params.as_slice(), Self::map_hit)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    fn map_hit(r: &rusqlite::Row) -> rusqlite::Result<crate::index::Hit> {
+        Ok(crate::index::Hit {
+            entry_uuid: r.get(0)?,
+            session_uuid: r.get(1)?,
+            project_slug: r.get(2)?,
+            role: r.get(3)?,
+            agent: r.get(4)?,
+            tool_name: r.get(5)?,
+            timestamp: r.get(6)?,
+            has_redaction: r.get::<_, i64>(7)? != 0,
+            snippet: r.get(8)?,
+            rank: r.get(9)?,
+        })
+    }
+
+    /// Restore a session's conversational entries in reading order. `agents=false`
+    /// keeps only the main transcript; `true` includes subagent transcripts.
+    pub fn entries_for_session(
+        &self,
+        uuid: &str,
+        agents: bool,
+    ) -> Result<Vec<crate::index::EntryRow>> {
+        let agent_clause = if agents { "" } else { "AND agent = 'main'" };
+        let sql = format!(
+            "SELECT entry_uuid, parent_uuid, role, agent, tool_name, timestamp, has_redaction, text
+             FROM entries
+             WHERE session_uuid = ?1
+               AND role IN ('user','assistant','tool_result','system','summary') {agent_clause}
+             ORDER BY COALESCE(timestamp, ''), seq, id"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map([uuid], Self::map_entry_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn entry_by_uuid(
+        &self,
+        session_uuid: &str,
+        entry_uuid: &str,
+    ) -> Result<Option<crate::index::EntryRow>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT entry_uuid, parent_uuid, role, agent, tool_name, timestamp, has_redaction, text
+                 FROM entries WHERE session_uuid = ?1 AND entry_uuid = ?2 LIMIT 1",
+                [session_uuid, entry_uuid],
+                Self::map_entry_row,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    fn map_entry_row(r: &rusqlite::Row) -> rusqlite::Result<crate::index::EntryRow> {
+        Ok(crate::index::EntryRow {
+            entry_uuid: r.get(0)?,
+            parent_uuid: r.get(1)?,
+            role: r.get(2)?,
+            agent: r.get(3)?,
+            tool_name: r.get(4)?,
+            timestamp: r.get(5)?,
+            has_redaction: r.get::<_, i64>(6)? != 0,
+            text: r.get(7)?,
+        })
+    }
+
+    pub fn index_meta_get(&self, key: &str) -> Result<Option<String>> {
+        let v = self
+            .conn
+            .query_row("SELECT value FROM index_meta WHERE key = ?1", [key], |r| {
+                r.get::<_, String>(0)
+            })
+            .optional()?;
+        Ok(v)
+    }
+
+    pub fn index_meta_set(&self, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO index_meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            rusqlite::params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// Drop and recreate the FTS vtable with a new tokenizer, then repopulate it
+    /// from the current `entries`. Used only on the `--reindex` path. The clause
+    /// is a fixed internal string (never user input).
+    pub fn rebuild_fts_with_tokenizer(&self, tokenize_clause: &str) -> Result<()> {
+        self.conn.execute_batch(&format!(
+            "DROP TABLE IF EXISTS entries_fts;
+             CREATE VIRTUAL TABLE entries_fts USING fts5(
+                 text, content='entries', content_rowid='id', tokenize='{tokenize_clause}');
+             INSERT INTO entries_fts(entries_fts) VALUES('rebuild');"
+        ))?;
+        Ok(())
     }
 }
 

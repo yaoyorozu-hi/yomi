@@ -943,7 +943,7 @@ fn set_600(path: &Path) -> Result<()> {
 /// to `expected_stored_sha`, and — critically — the *decompressed* content must
 /// hash to `expected_content_sha`. The content check catches frame-duplication
 /// corruption (e.g. a crash-replayed append) that a compressed-bytes check alone
-/// would pass, since P3's wipe gate trusts a verified archive (B3b).
+/// would pass, since P2's wipe gate trusts a verified archive (B3b).
 pub fn verify_stored(
     archive_dir: &Path,
     stored_rel: &str,

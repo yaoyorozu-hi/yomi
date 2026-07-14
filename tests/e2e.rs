@@ -12,7 +12,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_yomi");
 /// A fabricated AWS example key (public docs value, not a live credential).
 const FIXTURE_AKIA: &str = "AKIAIOSFODNN7EXAMPLE";
 /// Fabricated OAuth-looking token for the credentials-never-opened test.
-const FIXTURE_CRED_SECRET: &str = "sk-cred-DEADBEEFdeadbeef0123456789abcdef";
+const FIXTURE_CRED_SECRET: &str = "sk-cred-EXAMPLEFAKECREDENTIALNOTREAL0000";
 
 struct Fixture {
     home: PathBuf,
@@ -193,6 +193,20 @@ impl Fixture {
     fn quarantine_dir(&self) -> PathBuf {
         self.yomi_home.join("quarantine").join(&self.uuid)
     }
+
+    fn catalog_path(&self) -> PathBuf {
+        self.yomi_home.join("state").join("catalog.db")
+    }
+
+    /// All `entries.text` values in the catalog (for redaction-exposure checks).
+    fn entries_text(&self) -> Vec<String> {
+        let conn = rusqlite::Connection::open(self.catalog_path()).unwrap();
+        let mut stmt = conn.prepare("SELECT text FROM entries").unwrap();
+        stmt.query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
 }
 
 fn unique() -> u64 {
@@ -237,6 +251,24 @@ fn user_line(text: &str) -> String {
         "version": "2.1.207",
         "sessionId": "11111111-2222-3333-4444-555555555555",
         "message": {"role": "user", "content": text}
+    })
+    .to_string()
+}
+
+fn assistant_line(text: &str, tool: Option<(&str, &str, &str)>) -> String {
+    let mut content = vec![serde_json::json!({"type": "text", "text": text})];
+    if let Some((id, name, command)) = tool {
+        content.push(serde_json::json!({
+            "type": "tool_use", "id": id, "name": name, "input": {"command": command}
+        }));
+    }
+    serde_json::json!({
+        "type": "assistant",
+        "uuid": format!("a-{}", unique()),
+        "parentUuid": null,
+        "timestamp": "2026-07-12T11:00:00.000Z",
+        "sessionId": "11111111-2222-3333-4444-555555555555",
+        "message": {"role": "assistant", "content": content}
     })
     .to_string()
 }
@@ -336,8 +368,8 @@ fn secret_high_redacts_and_quarantines() {
         "no quarantine: {v}"
     );
     assert!(
-        v["flagged"].as_u64().unwrap() >= 1,
-        "bearer not flagged: {v}"
+        v["redacted"].as_u64().unwrap() >= 2,
+        "bearer + aws not both redacted: {v}"
     );
 
     // Stored copy must not contain the raw secret.
@@ -348,6 +380,11 @@ fn secret_high_redacts_and_quarantines() {
         "raw HIGH secret leaked into store"
     );
     assert!(stored_str.contains("REDACTED:aws-key"));
+    assert!(
+        !stored_str.contains("abcdefghijklmnopqrstuvwxyz012345"),
+        "raw bearer token leaked into store"
+    );
+    assert!(stored_str.contains("REDACTED:bearer"));
 
     // Quarantine holds the unredacted original.
     let qdir = fx.yomi_home.join("quarantine").join(&fx.uuid);
@@ -1057,23 +1094,365 @@ fn p2_gc_min_age_only_raises() {
 }
 
 #[test]
-fn p2_gc_require_indexed_unsatisfiable() {
-    let fx = Fixture::new("gcidx");
+fn p3_gc_require_indexed_gate() {
+    // (a) archived-but-not-indexed → require_indexed skips the delete (NotIndexed).
+    let fx = Fixture::new("gcidxa");
     fx.write_transcript(&[user_line("one")]);
     assert!(fx.run(&["archive", "--all"]).status.success());
     set_mtime_days(&fx.transcript_path(), 200);
-    // Configure require_indexed after the store exists (700-mode dir).
     fx.write_config("[gc]\nrequire_indexed = true\n");
-
     let out = fx.run(&["gc", "--targets", "transcripts", "--commit"]);
-    assert_eq!(code(&out), 2, "require_indexed did not refuse");
+    assert_eq!(code(&out), 2, "unindexed source was not skipped");
+    assert!(fx.transcript_path().exists(), "deleted despite no index");
+    assert!(gc_log_has(&fx, "skip", "NotIndexed"));
+
+    // (b) archived AND indexed → require_indexed permits the delete.
+    let fx = Fixture::new("gcidxb");
+    fx.write_transcript(&[user_line("one")]);
+    assert!(fx.run(&["archive", "--all"]).status.success());
+    assert!(fx.run(&["index"]).status.success());
+    set_mtime_days(&fx.transcript_path(), 200);
+    fx.write_config("[gc]\nrequire_indexed = true\n");
+    let out = fx.run(&["gc", "--targets", "transcripts", "--commit"]);
+    assert_eq!(code(&out), 0, "indexed source was not deleted: {out:?}");
+    assert!(!fx.transcript_path().exists(), "indexed source not deleted");
+    assert!(gc_log_has(&fx, "delete", ""));
+
+    // (c) indexed, then source changed (re-archived) but NOT reindexed → the
+    // stale watermark (sha mismatch) fails the gate closed.
+    let fx = Fixture::new("gcidxc");
+    fx.write_transcript(&[user_line("one")]);
+    assert!(fx.run(&["archive", "--all"]).status.success());
+    assert!(fx.run(&["index"]).status.success());
+    fx.append_transcript(&[user_line("two")]);
+    assert!(fx.run(&["archive", "--all"]).status.success());
+    set_mtime_days(&fx.transcript_path(), 200);
+    fx.write_config("[gc]\nrequire_indexed = true\n");
+    let out = fx.run(&["gc", "--targets", "transcripts", "--commit"]);
+    assert_eq!(code(&out), 2, "stale-indexed source was not skipped");
+    assert!(fx.transcript_path().exists(), "deleted on stale index");
+    assert!(gc_log_has(&fx, "skip", "NotIndexed"));
+}
+
+#[test]
+fn p3_index_and_search_roundtrip() {
+    let fx = Fixture::new("idxroundtrip");
+    fx.write_transcript(&[
+        user_line("cargo build fails on the linker step"),
+        assistant_line("Let me run the build.", Some(("t1", "Bash", "cargo build"))),
+    ]);
+    assert!(fx.run(&["archive", "--all"]).status.success());
+    let iout = fx.run(&["index", "--json"]);
+    assert!(iout.status.success(), "index failed: {iout:?}");
+
+    let out = fx.run(&["search", "cargo", "--json"]);
+    assert_eq!(code(&out), 0);
+    let v = json_last(&out);
+    assert!(v["count"].as_u64().unwrap() >= 1, "no hits: {v}");
+    let hits = v["hits"].as_array().unwrap();
+    assert!(hits.iter().any(|h| h["role"] == "user"));
     assert!(
-        fx.transcript_path().exists(),
-        "deleted despite unsatisfiable index"
+        hits.iter()
+            .any(|h| h["snippet"].as_str().unwrap().contains("[cargo]")),
+        "snippet not highlighted: {v}"
     );
-    assert!(gc_log_has(&fx, "skip", "IndexUnsatisfiable"));
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("require_indexed"), "no warning emitted");
+}
+
+#[test]
+fn p3_search_facet_filters() {
+    let fx = Fixture::new("idxfacet");
+    fx.write_transcript(&[
+        user_line("please investigate the widget"),
+        assistant_line(
+            "investigating the widget now",
+            Some(("t9", "Bash", "grep widget")),
+        ),
+    ]);
+    assert!(fx.run(&["archive", "--all"]).status.success());
+    assert!(fx.run(&["index"]).status.success());
+
+    // Role filter keeps only assistant hits.
+    let out = fx.run(&["search", "widget", "--role", "assistant", "--json"]);
+    let v = json_last(&out);
+    let hits = v["hits"].as_array().unwrap();
+    assert!(!hits.is_empty(), "no assistant hits");
+    assert!(hits.iter().all(|h| h["role"] == "assistant"));
+
+    // Tool filter (inline field:value) keeps the Bash tool_use-bearing entry.
+    let out = fx.run(&["search", "tool:Bash widget", "--json"]);
+    let v = json_last(&out);
+    let hits = v["hits"].as_array().unwrap();
+    assert!(hits.iter().all(|h| h["tool"] == "Bash"));
+    assert!(!hits.is_empty(), "tool filter dropped everything");
+
+    // Metadata-only (no free text) with a role filter still returns rows.
+    let out = fx.run(&["search", "role:user", "--json"]);
+    let v = json_last(&out);
+    assert!(
+        v["count"].as_u64().unwrap() >= 1,
+        "metadata-only path empty"
+    );
+}
+
+#[test]
+fn p3_index_no_raw_secret_exposure() {
+    let fx = Fixture::new("idxsecret");
+    // A visible AWS key in the transcript is redacted in place; a bare
+    // segmented OpenAI key (no PEM wrapper — it must be caught on its own, not by
+    // the private-key block detector) is redacted too; a whole-file quarantined
+    // tool-result stores only a marker.
+    let bare_sk = "sk-proj-EXAMPLEFAKEBAREPROJKEYNOTREAL0000";
+    fx.write_transcript(&[
+        user_line(&format!("deploy {FIXTURE_AKIA} to prod")),
+        user_line(&format!("also my key is {bare_sk} do not share")),
+    ]);
+    fx.write_tool_result(
+        "toolu_secret.txt",
+        format!("-----BEGIN RSA PRIVATE KEY-----\n{FIXTURE_CRED_SECRET}\n-----END RSA PRIVATE KEY-----\n").as_bytes(),
+    );
+    assert!(
+        fx.run(&["archive", "--all", "--include", "all"])
+            .status
+            .success()
+    );
+    assert!(fx.run(&["index"]).status.success());
+
+    // (b) No entry text anywhere contains the raw secret material.
+    for t in fx.entries_text() {
+        assert!(!t.contains(FIXTURE_AKIA), "raw AWS key leaked into index");
+        assert!(
+            !t.contains(bare_sk),
+            "raw bare sk-proj key leaked into index"
+        );
+        assert!(
+            !t.contains(FIXTURE_CRED_SECRET),
+            "raw quarantined secret leaked into index"
+        );
+    }
+
+    // (a) Searching either raw secret returns nothing.
+    for key in [FIXTURE_AKIA, bare_sk] {
+        let out = fx.run(&["search", key, "--json"]);
+        assert_eq!(
+            json_last(&out)["count"].as_u64().unwrap(),
+            0,
+            "raw secret {key} searchable"
+        );
+    }
+
+    // (c) The redaction placeholder is indexed and searchable.
+    let out = fx.run(&["search", "REDACTED", "--json"]);
+    assert!(
+        json_last(&out)["count"].as_u64().unwrap() >= 1,
+        "placeholder not searchable"
+    );
+}
+
+#[test]
+fn p3_index_reads_stored_not_source() {
+    let fx = Fixture::new("idxstored");
+    fx.write_transcript(&[user_line("original clean content about penguins")]);
+    assert!(fx.run(&["archive", "--all"]).status.success());
+    // Tamper the LIVE source after archiving, WITHOUT re-archiving: inject a secret.
+    fx.append_transcript(&[user_line(&format!("smuggled {FIXTURE_AKIA} in later"))]);
+    assert!(fx.run(&["index"]).status.success());
+
+    // The tampered second line was never archived → never indexed; the store
+    // (old redacted content) is the only thing indexed.
+    for t in fx.entries_text() {
+        assert!(
+            !t.contains(FIXTURE_AKIA),
+            "index read the tampered live source"
+        );
+    }
+    let out = fx.run(&["search", "smuggled", "--json"]);
+    assert_eq!(
+        json_last(&out)["count"].as_u64().unwrap(),
+        0,
+        "tampered text indexed"
+    );
+    let out = fx.run(&["search", "penguins", "--json"]);
+    assert!(
+        json_last(&out)["count"].as_u64().unwrap() >= 1,
+        "stored content missing"
+    );
+}
+
+#[test]
+fn p3_incremental_no_dup() {
+    let fx = Fixture::new("idxincr");
+    fx.write_transcript(&[user_line("first turn about apples")]);
+    assert!(fx.run(&["archive", "--all"]).status.success());
+    assert!(fx.run(&["index"]).status.success());
+    let before = fx.entries_text().len();
+
+    // Re-index with no change → nothing new, no duplicates.
+    let out = fx.run(&["index", "--json"]);
+    let v = json_last(&out);
+    assert_eq!(
+        v["artifacts_indexed"].as_u64().unwrap(),
+        0,
+        "reindexed unchanged"
+    );
+    assert!(v["artifacts_up_to_date"].as_u64().unwrap() >= 1);
+    assert_eq!(
+        fx.entries_text().len(),
+        before,
+        "duplicate entries appeared"
+    );
+
+    // Append a turn, re-archive, re-index → the appended turn is added, the old
+    // ones are not duplicated.
+    fx.append_transcript(&[user_line("second turn about bananas")]);
+    assert!(fx.run(&["archive", "--all"]).status.success());
+    assert!(fx.run(&["index"]).status.success());
+    let after = fx.entries_text().len();
+    assert_eq!(after, before + 1, "append did not add exactly one entry");
+    let out = fx.run(&["search", "apples", "--json"]);
+    assert_eq!(
+        json_last(&out)["count"].as_u64().unwrap(),
+        1,
+        "apples duplicated or lost"
+    );
+}
+
+#[test]
+fn p3_reindex_rebuilds() {
+    let fx = Fixture::new("idxreidx");
+    fx.write_transcript(&[user_line("reindex me about oranges")]);
+    assert!(fx.run(&["archive", "--all"]).status.success());
+    assert!(fx.run(&["index"]).status.success());
+    let before = fx.entries_text().len();
+
+    let out = fx.run(&["index", "--reindex", "--json"]);
+    assert!(out.status.success(), "reindex failed: {out:?}");
+    assert_eq!(
+        fx.entries_text().len(),
+        before,
+        "reindex changed entry count"
+    );
+    let out = fx.run(&["search", "oranges", "--json"]);
+    assert!(
+        json_last(&out)["count"].as_u64().unwrap() >= 1,
+        "reindex lost content"
+    );
+}
+
+/// WARN-1 regression: a fresh catalog under `[index].tokenizer = "trigram"` must
+/// NOT silently record `trigram` against the unicode61 vtable that schema.sql
+/// creates. The first plain `yomi index` detects the mismatch and refuses; only
+/// `--reindex` rebuilds the FTS with the trigram tokenizer — after which a CJK
+/// substring (which a bare unicode61 MATCH cannot find) is searchable.
+#[test]
+fn p3_trigram_reindex_enables_cjk_substring() {
+    let fx = Fixture::new("idxtri");
+    fx.write_transcript(&[user_line("設計レビュー 思兼課長の索引方針について")]);
+    // Establish the 700 store layout first; writing config.toml into the existing
+    // dir keeps its mode (archive would refuse a too-loose root created earlier).
+    assert!(fx.run(&["archive", "--all"]).status.success());
+    fx.write_config("[index]\ntokenizer = \"trigram\"\n");
+
+    // First plain index: bootstrap records the real (unicode61) vtable tokenizer,
+    // so the trigram config is a mismatch → refuse, do not index.
+    let out = fx.run(&["index"]);
+    assert_eq!(
+        code(&out),
+        3,
+        "trigram config against a unicode61 vtable should refuse: {out:?}"
+    );
+    assert_eq!(
+        fx.entries_text().len(),
+        0,
+        "refused index still wrote entries"
+    );
+
+    // --reindex rebuilds the FTS vtable with trigram and indexes.
+    let out = fx.run(&["index", "--reindex", "--json"]);
+    assert!(out.status.success(), "trigram reindex failed: {out:?}");
+    assert!(!fx.entries_text().is_empty(), "reindex wrote no entries");
+
+    // A 3-char CJK substring in the middle of a whitespace-free run — only a
+    // trigram tokenizer resolves this.
+    let out = fx.run(&["search", "思兼課", "--json"]);
+    assert!(
+        json_last(&out)["count"].as_u64().unwrap() >= 1,
+        "trigram CJK substring search returned nothing"
+    );
+
+    // A subsequent plain index now agrees with the recorded tokenizer.
+    let out = fx.run(&["index"]);
+    assert_eq!(
+        code(&out),
+        0,
+        "plain index after trigram reindex refused: {out:?}"
+    );
+}
+
+#[test]
+fn p3_search_fresh_home_zero_hits() {
+    let fx = Fixture::new("idxfresh");
+    let out = fx.run(&["search", "anything", "--json"]);
+    assert_eq!(code(&out), 0, "fresh-home search errored");
+    assert_eq!(json_last(&out)["count"].as_u64().unwrap(), 0);
+}
+
+#[test]
+fn p3_read_jump_ref() {
+    let fx = Fixture::new("idxread");
+    fx.write_transcript(&[user_line("readable turn about turtles")]);
+    assert!(fx.run(&["archive", "--all"]).status.success());
+    assert!(fx.run(&["index"]).status.success());
+
+    let out = fx.run(&["search", "turtles", "--json"]);
+    let v = json_last(&out);
+    let hit = &v["hits"].as_array().unwrap()[0];
+    let entry_uuid = hit["entry_uuid"].as_str().unwrap();
+    let session = hit["session"].as_str().unwrap();
+
+    let rout = fx.run(&["read", session, "--entry", entry_uuid, "--json"]);
+    assert_eq!(code(&rout), 0, "read jump failed: {rout:?}");
+    assert!(stdout(&rout).contains("turtles"), "entry not shown");
+
+    // --raw works without any index dependency.
+    let raw = fx.run(&["read", session, "--raw"]);
+    assert_eq!(code(&raw), 0);
+    assert!(stdout(&raw).contains("turtles"));
+}
+
+#[test]
+fn p3_index_lock_refused() {
+    let fx = Fixture::new("idxlock");
+    fx.write_transcript(&[user_line("locked")]);
+    assert!(fx.run(&["archive", "--all"]).status.success());
+
+    let lockf = std::fs::File::create(fx.yomi_home.join(".yomi.lock")).unwrap();
+    lockf.try_lock().unwrap();
+    let out = fx.run(&["index"]);
+    assert_eq!(code(&out), 3, "index did not refuse under lock contention");
+    lockf.unlock().unwrap();
+}
+
+#[test]
+fn p3_index_malformed_jsonl_no_crash() {
+    let fx = Fixture::new("idxmalformed");
+    // A transcript with a well-formed line, a non-JSON line, and another good
+    // line. The scanner holds conversation JSONL to a strict gate, so a stray
+    // non-JSON line quarantines the whole artifact — the indexer must still not
+    // crash, and no raw content leaks.
+    fx.write_transcript(&[
+        user_line("well formed line about robots"),
+        "this is not valid json at all".to_string(),
+        user_line("another good line about robots"),
+    ]);
+    assert!(fx.run(&["archive", "--all"]).status.success());
+    let out = fx.run(&["index", "--json"]);
+    assert!(
+        out.status.success(),
+        "index crashed on malformed input: {out:?}"
+    );
+    // Never panics; the search path stays healthy.
+    let s = fx.run(&["search", "robots", "--json"]);
+    assert_eq!(code(&s), 0);
 }
 
 #[test]
@@ -1518,4 +1897,420 @@ fn p2_gc_empty_content_sha_refuses() {
         "source deleted despite an unverifiable (empty) content hash"
     );
     assert!(gc_log_has(&fx, "skip", "EmptyContentSha"));
+}
+
+// ============================================================================
+// 須佐之男 (Susanoo) — P3 adversarial break tests. Appended (test-only). These
+// probe the "raw secret must never enter the search index" invariant, the
+// quarantined=1 deviation, FTS/SQL injection, and parser robustness.
+// ============================================================================
+
+/// Modern OpenAI-style keys whose prefix segment ends in a hyphen. The old
+/// `openai-key` detector `sk-[A-Za-z0-9]{20,}` could not match them (the class
+/// terminated at the `-` after `proj`/`cred`); the segmented-body detector now
+/// does.
+const SK_PROJ_KEY: &str = "sk-proj-EXAMPLEFAKEKEYNOTAREALSECRET000000";
+const SK_CRED_BARE: &str = "sk-cred-EXAMPLEFAKECREDENTIALNOTREAL0000";
+
+/// Regression (was CRITICAL leak): a real-shaped `sk-proj-` / `sk-cred-` API key
+/// is now detected by the scanner, redacted before storage, and therefore absent
+/// from the index and unsearchable — the "raw secret never in index" invariant
+/// holds for the modern segmented OpenAI key shapes.
+#[test]
+fn p3_index_sk_prefixed_key_is_redacted() {
+    let fx = Fixture::new("brk-sk");
+    // Plant in a transcript (PerEntry index mode) and a tool-result (SingleDoc).
+    fx.write_transcript(&[
+        user_line(&format!("here is my openai key {SK_PROJ_KEY} keep it safe")),
+        assistant_line(&format!("stored {SK_CRED_BARE} for you"), None),
+    ]);
+    fx.write_tool_result(
+        "toolu_leak.txt",
+        format!("export OPENAI_API_KEY={SK_PROJ_KEY}\n").as_bytes(),
+    );
+    assert!(
+        fx.run(&["archive", "--all", "--include", "all"])
+            .status
+            .success()
+    );
+    assert!(fx.run(&["index"]).status.success());
+
+    for t in fx.entries_text() {
+        assert!(!t.contains(SK_PROJ_KEY), "sk-proj key leaked into index");
+        assert!(!t.contains(SK_CRED_BARE), "sk-cred key leaked into index");
+    }
+
+    // Neither raw key is searchable.
+    for key in [SK_PROJ_KEY, SK_CRED_BARE] {
+        let out = fx.run(&["search", key, "--json"]);
+        assert_eq!(
+            json_last(&out)["count"].as_u64().unwrap(),
+            0,
+            "raw key {key} still searchable"
+        );
+    }
+    // The redaction placeholder is indexed in its place.
+    let out = fx.run(&["search", "REDACTED", "--json"]);
+    assert!(
+        json_last(&out)["count"].as_u64().unwrap() >= 1,
+        "redacted openai-key entries not indexed"
+    );
+}
+
+/// Regression (was leak): a keyword-anchored high-entropy hex token and a
+/// connection-string password are now detected and redacted, so neither reaches
+/// the index. The connection-string host is intentionally preserved.
+#[test]
+fn p3_index_hex_and_connstring_secrets_are_redacted() {
+    let fx = Fixture::new("brk-cls");
+    let hex_secret = "deadbeefcafebabe0123456789abcdeffedcba9876543210"; // 48 hex, keyword'd
+    let db_url = "postgres://admin:S3cr3tP@ssw0rd@db.internal:5432/prod";
+    fx.write_transcript(&[
+        user_line(&format!("token {hex_secret} here")),
+        user_line(&format!("connect {db_url} now")),
+    ]);
+    assert!(fx.run(&["archive", "--all"]).status.success());
+    assert!(fx.run(&["index"]).status.success());
+    let texts = fx.entries_text();
+    assert!(
+        !texts.iter().any(|t| t.contains(hex_secret)),
+        "keyword'd hex secret leaked into index"
+    );
+    assert!(
+        !texts.iter().any(|t| t.contains("S3cr3tP@ssw0rd")),
+        "db password leaked into index"
+    );
+    // Host after the credential delimiter stays searchable.
+    let out = fx.run(&["search", "db.internal", "--json"]);
+    assert!(
+        json_last(&out)["count"].as_u64().unwrap() >= 1,
+        "connection-string host over-redacted"
+    );
+    for key in [hex_secret, "S3cr3tP@ssw0rd"] {
+        let out = fx.run(&["search", key, "--json"]);
+        assert_eq!(
+            json_last(&out)["count"].as_u64().unwrap(),
+            0,
+            "raw secret {key} searchable"
+        );
+    }
+}
+
+/// Resolve the quarantined=1 fact conflict with a real archive+index:
+/// a VISIBLE HIGH secret (AWS key) → quarantined=1, but stored content is
+/// fully-redacted BROWSABLE text (placeholder), it IS indexed, and the raw key
+/// is absent from both store and index. Confirms 金山's deviation is safe *for
+/// detected secrets*.
+#[test]
+fn p3_quarantined_high_visible_is_redacted_browsable_and_indexed() {
+    let fx = Fixture::new("q1-vis");
+    fx.write_transcript(&[user_line(&format!("deploy {FIXTURE_AKIA} to prod now"))]);
+    assert!(fx.run(&["archive", "--all"]).status.success());
+    assert!(fx.run(&["index"]).status.success());
+
+    // Catalog: the artifact is quarantined=1 yet redacted=1 (in-place redaction).
+    let conn = rusqlite::Connection::open(fx.catalog_path()).unwrap();
+    let (q, red): (i64, i64) = conn
+        .query_row(
+            "SELECT quarantined, redacted FROM artifacts WHERE role='transcript'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(q, 1, "visible HIGH secret should quarantine the original");
+    assert_eq!(red, 1, "stored content should be redacted-in-place");
+
+    // Stored bytes are browsable redacted text, NOT an opaque marker.
+    let stored = read_store(&fx.transcript_store());
+    let s = String::from_utf8_lossy(&stored);
+    assert!(!s.contains(FIXTURE_AKIA), "raw key in store");
+    assert!(
+        s.contains("REDACTED:aws-key"),
+        "not browsable redacted text"
+    );
+    assert!(!s.contains("QUARANTINED:"), "unexpected opaque marker");
+
+    // Indexed and searchable by placeholder; raw key absent + unsearchable.
+    for t in fx.entries_text() {
+        assert!(!t.contains(FIXTURE_AKIA), "raw key leaked to index");
+    }
+    let out = fx.run(&["search", FIXTURE_AKIA, "--json"]);
+    assert_eq!(
+        json_last(&out)["count"].as_u64().unwrap(),
+        0,
+        "raw key searchable"
+    );
+    let out = fx.run(&["search", "deploy", "--json"]);
+    assert!(
+        json_last(&out)["count"].as_u64().unwrap() >= 1,
+        "redacted entry not indexed"
+    );
+}
+
+/// FTS5 / SQL injection surface: malicious query strings must never panic, error
+/// the process, or act as injection. Every one should exit 0 with a valid JSON
+/// envelope.
+#[test]
+fn p3_break_fts_and_sql_injection_is_inert() {
+    let fx = Fixture::new("brk-inj");
+    fx.write_transcript(&[user_line("harmless indexed content about turbines")]);
+    assert!(fx.run(&["archive", "--all"]).status.success());
+    assert!(fx.run(&["index"]).status.success());
+
+    let payloads = [
+        "\"",                                  // lone double quote
+        "turbines\" OR \"1\"=\"1",             // FTS injection attempt
+        "NEAR(a b)",                           // FTS operator syntax
+        "a AND b OR c*",                       // operators
+        "^turbines",                           // column/anchor op
+        "turbines : NEAR",                     // stray colon
+        "'; DROP TABLE entries;--",            // classic SQLi
+        "role:user'); DELETE FROM entries;--", // facet SQLi
+        "*",                                   // bare star
+        "()))(((",                             // unbalanced parens
+    ];
+    for p in payloads {
+        let out = fx.run(&["search", p, "--json"]);
+        assert_eq!(
+            code(&out),
+            0,
+            "query {p:?} did not exit cleanly: stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // Envelope must still parse and entries table must survive injection.
+        let _ = json_last(&out);
+    }
+    // The index survived every payload.
+    assert_eq!(
+        fx.entries_text().len(),
+        1,
+        "entries table mutated by a query"
+    );
+    let out = fx.run(&["search", "turbines", "--json"]);
+    assert!(
+        json_last(&out)["count"].as_u64().unwrap() >= 1,
+        "index destroyed"
+    );
+}
+
+/// Parser fuzz part A: a VALID but pathological transcript (2 MB single line,
+/// circular parentUuid, empty-type noise, deeply-nested-but-balanced value) must
+/// archive + index without crashing, and the conversational lines stay
+/// searchable. Everything here is well-formed JSONL so it survives the archive
+/// scan gate and actually reaches the index parser.
+#[test]
+fn p3_break_parser_fuzz_valid_pathological_never_crashes() {
+    let fx = Fixture::new("brk-fuzzA");
+    let circular = serde_json::json!({
+        "type":"user","uuid":"c1","parentUuid":"c1",
+        "message":{"role":"user","content":"self parent marmot"}
+    })
+    .to_string();
+    let giant = serde_json::json!({
+        "type":"user","uuid":"g1",
+        "message":{"role":"user","content":"X".repeat(2_000_000)}
+    })
+    .to_string();
+    // 60-deep balanced array (under serde's ~128 recursion limit) as an
+    // assistant content block list-of-lists; parser tolerates unknown shape.
+    let deep = format!(
+        "{{\"type\":\"assistant\",\"uuid\":\"d1\",\"message\":{{\"role\":\"assistant\",\"content\":{}{}}}}}",
+        "[".repeat(60),
+        "]".repeat(60)
+    );
+    let empty_type = serde_json::json!({"uuid":"e1","message":{"content":"no type"}}).to_string();
+    let good = user_line("valid searchable capybara line");
+
+    fx.write_transcript(&[circular, giant, deep, empty_type, good]);
+    let out = fx.run(&["archive", "--all"]);
+    assert!(out.status.success(), "archive crashed: {out:?}");
+    let iout = fx.run(&["index", "--json"]);
+    assert!(
+        iout.status.success(),
+        "index crashed on pathological input: {iout:?}"
+    );
+
+    let out = fx.run(&["search", "capybara", "--json"]);
+    assert!(
+        json_last(&out)["count"].as_u64().unwrap() >= 1,
+        "good line lost among pathological-but-valid input"
+    );
+}
+
+/// Parser fuzz part B: a transcript containing a malformed/truncated line. The
+/// archive scan gate classifies the WHOLE artifact as `malformed-jsonl` and
+/// stores only an opaque marker (fail-closed). Neither archive nor index crash;
+/// the index carries the marker (searchable), and NONE of the sibling clean
+/// content becomes searchable — a whole-artifact availability trade documented,
+/// not an exposure.
+#[test]
+fn p3_break_malformed_line_quarantines_whole_no_crash() {
+    let fx = Fixture::new("brk-fuzzB");
+    let good = user_line("secret-free clean wolverine content");
+    let truncated =
+        "{\"type\":\"user\",\"uuid\":\"t1\",\"message\":{\"role\":\"user\",\"content\":\"cut"
+            .to_string();
+    fx.write_transcript(&[good, truncated]);
+    let out = fx.run(&["archive", "--all"]);
+    assert!(
+        out.status.success(),
+        "archive crashed on malformed line: {out:?}"
+    );
+    let iout = fx.run(&["index", "--json"]);
+    assert!(
+        iout.status.success(),
+        "index crashed on quarantined marker: {iout:?}"
+    );
+
+    // Stored artifact is a whole-quarantine marker, not the clean sibling text.
+    let stored = read_store(&fx.transcript_store());
+    let s = String::from_utf8_lossy(&stored);
+    assert!(
+        s.contains("QUARANTINED:"),
+        "malformed line not whole-quarantined: {s}"
+    );
+
+    // The clean sibling line is NOT independently searchable (whole-quarantine).
+    let out = fx.run(&["search", "wolverine", "--json"]);
+    assert_eq!(
+        json_last(&out)["count"].as_u64().unwrap(),
+        0,
+        "clean content leaked past whole-quarantine"
+    );
+}
+
+// ============================================================================
+// SUSANOO re-break battery: does 金山's scan-layer fix actually hold end-to-end?
+// Each test plants a secret in a transcript, runs archive→index, and asserts on
+// the catalog's entries.text + `search`. A raw secret reaching entries.text is a
+// CRITICAL residual leak.
+// ============================================================================
+
+/// The `/`-in-password bypass is closed: the connection-string password class
+/// admits `/` and backtracks to the host `@`, so `aB3/xY9z` is redacted and the
+/// raw password never reaches entries.text or the index. The host stays
+/// searchable (only user+password+`@` is redacted). `/` in DB passwords is
+/// common (base64/random-generated creds, e.g. RDS).
+#[test]
+fn p3_rebreak_connstring_slash_password_is_redacted() {
+    let fx = Fixture::new("rb-cs-slash");
+    let leak_url = "postgres://admin:aB3/xY9z@db.internal:5432/prod";
+    let pw = "aB3/xY9z";
+    fx.write_transcript(&[user_line(&format!("connect {leak_url} now"))]);
+    assert!(fx.run(&["archive", "--all"]).status.success());
+    assert!(fx.run(&["index"]).status.success());
+
+    let leaked_in_entries = fx.entries_text().iter().any(|t| t.contains(pw));
+    let out = fx.run(&["search", pw, "--json"]);
+    let searchable = json_last(&out)["count"].as_u64().unwrap();
+
+    assert!(
+        !leaked_in_entries,
+        "CRITICAL: connection-string password with '/' leaked into entries.text"
+    );
+    assert_eq!(
+        searchable, 0,
+        "CRITICAL: connection-string password with '/' is searchable in the index"
+    );
+
+    // The host survives redaction and stays searchable.
+    let host = fx.run(&["search", "internal", "--json"]);
+    assert!(
+        json_last(&host)["count"].as_u64().unwrap() >= 1,
+        "host over-redacted: not searchable"
+    );
+}
+
+/// Companion: the pct-encoded form (`%2F`) and embedded-`@` form ARE caught, to
+/// prove the leak is specifically the raw-`/` bypass, not a total connstring miss.
+#[test]
+fn p3_rebreak_connstring_encoded_and_at_forms_are_caught() {
+    let fx = Fixture::new("rb-cs-ok");
+    let pct = "postgres://u:pa%2Fss@host.internal/db";
+    let atpw = "postgres://admin:S3cr3tP@ssw0rd@db.internal:5432/prod";
+    fx.write_transcript(&[
+        user_line(&format!("a {pct} b")),
+        user_line(&format!("c {atpw} d")),
+    ]);
+    assert!(fx.run(&["archive", "--all"]).status.success());
+    assert!(fx.run(&["index"]).status.success());
+    let texts = fx.entries_text();
+    assert!(
+        !texts.iter().any(|t| t.contains("pa%2Fss")),
+        "pct-encoded password leaked"
+    );
+    assert!(
+        !texts.iter().any(|t| t.contains("S3cr3tP@ssw0rd")),
+        "embedded-@ password leaked"
+    );
+}
+
+/// bearer tokens are now Severity::Med → redacted. The raw token no longer
+/// reaches stored content or the searchable index.
+#[test]
+fn p3_rebreak_bearer_token_is_redacted() {
+    let fx = Fixture::new("rb-bearer");
+    let token = "abcdefghijklmnopqrstuvwxyz012345";
+    fx.write_transcript(&[user_line(&format!("Authorization: Bearer {token}"))]);
+    assert!(fx.run(&["archive", "--all"]).status.success());
+    assert!(fx.run(&["index"]).status.success());
+
+    let in_entries = fx.entries_text().iter().any(|t| t.contains(token));
+    let out = fx.run(&["search", token, "--json"]);
+    let searchable = json_last(&out)["count"].as_u64().unwrap();
+    assert!(!in_entries, "bearer token leaked into entries.text");
+    assert_eq!(searchable, 0, "bearer token is searchable in the index");
+}
+
+/// High-prevalence secret classes newly covered this round (bearer/password=/
+/// Basic/npm/pypi/SendGrid): each is planted in its real-world form and must be
+/// redacted — none reaches entries.text. The deferred classes (Twilio `SK`,
+/// Azure SAS `sig=`, keyword-less hi-entropy) are documented as known residual
+/// in docs/design.md and are intentionally not asserted here.
+#[test]
+fn p3_rebreak_covered_secret_classes_are_redacted() {
+    let fx = Fixture::new("rb-sweep");
+    // (label, line, planted secret) — all fabricated, none live.
+    let cases = [
+        (
+            "npm",
+            "npm token npm_EXAMPLEFAKENPMTOKENNOTREAL0000000000 trailing",
+            "npm_EXAMPLEFAKENPMTOKENNOTREAL0000000000",
+        ),
+        (
+            "pypi",
+            "pypi token pypi-EXAMPLEFAKEPYPITOKENNOTREAL00 trailing",
+            "pypi-EXAMPLEFAKEPYPITOKENNOTREAL00",
+        ),
+        (
+            "sendgrid",
+            "sendgrid SG.EXAMPLEFAKE00000000000.EXAMPLEFAKESENDGRIDKEY000000000000000000000 trailing",
+            "SG.EXAMPLEFAKE00000000000.EXAMPLEFAKESENDGRIDKEY000000000000000000000",
+        ),
+        (
+            "basic-auth",
+            "Authorization: Basic dXNlcjpzdXBlcnNlY3JldHBhc3N3b3Jk",
+            "dXNlcjpzdXBlcnNlY3JldHBhc3N3b3Jk",
+        ),
+        (
+            "password-eq",
+            "config password=SuperSecretDbPass123 trailing",
+            "SuperSecretDbPass123",
+        ),
+    ];
+    let lines: Vec<String> = cases.iter().map(|(_, line, _)| user_line(line)).collect();
+    fx.write_transcript(&lines);
+    assert!(fx.run(&["archive", "--all"]).status.success());
+    assert!(fx.run(&["index"]).status.success());
+
+    let texts = fx.entries_text();
+    let leaked: Vec<&str> = cases
+        .iter()
+        .filter(|(_, _, secret)| texts.iter().any(|t| t.contains(secret)))
+        .map(|(label, _, _)| *label)
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "covered secret classes leaked into entries.text: {leaked:?}"
+    );
 }

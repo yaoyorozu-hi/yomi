@@ -105,7 +105,9 @@ pub enum SkipReason {
     ShaMismatch,
     StoreReverifyFailed,
     EmptyContentSha,
-    IndexUnsatisfiable,
+    /// `require_indexed` is set and this source is not indexed at its current
+    /// source sha (never indexed, or indexed at a stale version). Fail-closed.
+    NotIndexed,
     Blacklisted,
     OpenFailed,
 }
@@ -117,7 +119,7 @@ impl SkipReason {
             SkipReason::ShaMismatch => "ShaMismatch",
             SkipReason::StoreReverifyFailed => "StoreReverifyFailed",
             SkipReason::EmptyContentSha => "EmptyContentSha",
-            SkipReason::IndexUnsatisfiable => "IndexUnsatisfiable",
+            SkipReason::NotIndexed => "NotIndexed",
             SkipReason::Blacklisted => "Blacklisted",
             SkipReason::OpenFailed => "OpenFailed",
         }

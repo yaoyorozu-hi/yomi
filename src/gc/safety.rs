@@ -108,15 +108,23 @@ pub fn evaluate_file(
         ));
     }
 
-    // Gate 3b: index status. In P2 no index layer exists, so require_indexed is
-    // unsatisfiable — skip with warning, never delete.
+    // Gate 3b: index status (P3). When require_indexed is set, this source's
+    // stored content must be indexed at exactly the version we are about to
+    // delete — i.e. index_state.indexed_source_sha256 == row.source_sha256.
+    // Anything else — never indexed, indexed at a stale sha, or (via `?`) an SQL
+    // error — refuses the delete. Fail-closed: never delete on an unproven index.
     if require_indexed {
-        return Ok((
-            Verdict::Unverified {
-                reason: SkipReason::IndexUnsatisfiable,
-            },
-            bytes,
-        ));
+        match cat.index_status_for_source(&key)? {
+            Some(st) if st.indexed_source_sha256 == row.source_sha256 => {}
+            _ => {
+                return Ok((
+                    Verdict::Unverified {
+                        reason: SkipReason::NotIndexed,
+                    },
+                    bytes,
+                ));
+            }
+        }
     }
 
     // Gate 4: age AND not-live.

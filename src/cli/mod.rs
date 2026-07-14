@@ -1,5 +1,8 @@
 mod archive;
 mod gc;
+mod index;
+mod read;
+mod search;
 mod status;
 
 use crate::config::Env;
@@ -38,6 +41,12 @@ pub enum Command {
     Archive(archive::ArchiveArgs),
     /// Wipe verified+aged+non-live ephemeral output (dry-run by default).
     Gc(gc::GcArgs),
+    /// Build/update the full-text search index from the redacted store.
+    Index(index::IndexArgs),
+    /// Full-text search the indexed session entries.
+    Search(search::SearchArgs),
+    /// Read a session's entries (or one entry) from the index or raw store.
+    Read(read::ReadArgs),
     /// Report archive state, secrets, and storage.
     Status(status::StatusArgs),
     /// Re-hash stored artifacts against the catalog.
@@ -70,6 +79,9 @@ pub fn run() -> Result<i32> {
     match &cli.command {
         Command::Archive(args) => archive::run(&env, args, cli.json),
         Command::Gc(args) => gc::run(&env, args, cli.json),
+        Command::Index(args) => index::run(&env, args, cli.json),
+        Command::Search(args) => search::run(&env, args, cli.json),
+        Command::Read(args) => read::run(&env, args, cli.json),
         Command::Status(args) => status::run_status(&env, args, cli.json),
         Command::Verify(args) => status::run_verify(&env, args, cli.json),
         Command::Config(args) => run_config(&env, args, cli.json),

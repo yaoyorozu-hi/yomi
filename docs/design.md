@@ -83,7 +83,7 @@ Rejected `~/.zaibatsu/memory/vol/yomi/`. Rationale:
   index/                           # FTS5 db (or tantivy dir) — P4
   state/
     catalog.db                     # SQLite (mode 600) — sessions, artifacts, findings
-    gc.log                         # append-only wipe audit (P3)
+    gc.log                         # append-only wipe audit (P2)
   config.toml                      # mode 600
   .yomi.lock                       # advisory single-writer lock
 ```
@@ -237,6 +237,12 @@ secret that isn't already visible in the raw text. The gate, in order (any failu
    parse as JSON. A malformed line ⇒ quarantine whole (a raw multi-line secret — e.g. a PEM block —
    can only appear in a transcript as non-JSON lines, so this closes multi-line/frame-straddle leaks).
    MCP debug logs are treated as plain text (LOW-MED; a stray non-JSON line shouldn't quarantine a log).
+   > **Operational note (accepted trade-off).** The quarantine is *whole-artifact*: one malformed or
+   > truncated line quarantines the entire transcript, so every clean sibling line becomes
+   > quarantine-not-searchable (raw preserved in `quarantine/`, only an opaque marker stored/indexed).
+   > This is an availability trade for a fail-closed leak boundary, not an exposure. A transcript that
+   > lost searchability this way is recoverable from `quarantine/`; if a source routinely emits
+   > malformed lines, fix the producer rather than loosening the gate.
 3. **Normalization-gap detection.** For JSON, every **key and value** (recursively); for plain content,
    the whole text. Each is deep-unescaped (`\uXXXX`/`\xXX`, repeatedly) **and** reduced to its canonical
    readable form, then scanned. A HIGH/MED secret that appears only after this normalization — hidden by
@@ -277,10 +283,23 @@ for P1's compiled-in denylist.
 | Slack | `xox[baprs]-…` | HIGH |
 | OpenAI/Anthropic | `sk-[A-Za-z0-9]{20,}`, `sk-ant-…` | HIGH |
 | Google API | `AIza[0-9A-Za-z_-]{35}` | HIGH |
+| npm / PyPI / SendGrid | `npm_[A-Za-z0-9]{36,}`, `pypi-[A-Za-z0-9_-]{16,}`, `SG\.…{22}\.…{43}` | HIGH |
+| Connection string | `scheme://user:PASSWORD@host` (password admits `/` and `@`, backtracks to last `@`) | HIGH |
 | JWT | `eyJ[A-Za-z0-9_-]+\.eyJ…\.…` | MED |
-| Bearer / generic entropy | `(?i)bearer\s+…`, ≥40-char base64 in key-ish context | LOW |
+| Bearer | `(?i)bearer\s+<20+ token>` | MED |
+| HTTP Basic | `(?i)authorization:\s*basic\s+<base64>` | MED |
+| password= assignment | `(?i)\b(password\|passwd\|pwd)=<value>` | MED |
+| Generic entropy | ≥40-char base64 in key-ish context (`secret`/`token`/`api_key`/`password`) | MED |
 
 Recon flagged **2 transcripts** hitting PRIVATE KEY / AKIA patterns — these are the HIGH cases the scan must catch.
+
+**Known residual (uncovered secret classes, deferred to a future "ruleset completeness" pass).**
+Each needs false-positive design that the current keyword/prefix-anchored rules do not provide, so
+they are documented rather than shipped half-built:
+
+- **Twilio `SK…`** — collides with the `sk`/`rk` key space (Stripe/OpenAI); disambiguation needs a FP-safe design.
+- **Azure SAS `sig=…`** — a bare `sig=` query parameter is a high false-positive surface.
+- **Keyword-less high-entropy blobs** (bare 64-hex / base64 / SHA-256) — no anchoring keyword or prefix; a regex cannot bound the false-positive rate. Accepted limit of the lexical scanner.
 
 **Action model — scan → decide → act → record:**
 
@@ -307,8 +326,9 @@ fresh or missing home reports "nothing archived" rather than erroring, and creat
 > **Phase:** built as **P2** (the build sequence merges Archive=P1, Wipe/GC=P2). The
 > §9 table historically labeled this P3 behind a separate "Secret scan" P2; the secret
 > scanner shipped inside P1 (canonical-form scanner, quarantine, 55 tests), so wipe moves
-> up to P2. `require_indexed` defaults **false** until the index layer (P3) exists; set
-> `true` and, with no index present, GC skips every candidate rather than delete unindexed.
+> up to P2. The index layer (P3) now exists; `require_indexed` still defaults **false**, and set
+> `true` it consults per-source `index_state` and skips only sources not indexed at their current
+> source sha (fail-closed), deleting the rest.
 
 ### Absolute law: archive-verify-then-delete
 
@@ -316,7 +336,8 @@ No deletion path exists that isn't gated on a verified archive. Per source file:
 
 1. Look up archive artifact by source path + `source_sha256` in catalog (source path is canonicalized so symlink/`..`/relative forms map to one row).
 2. **Recompute live source `sha256`.**
-3. Require **all**: catalog artifact with `source_sha256 == live_sha` **AND** the stored artifact **re-verifies** (below) **AND** (if `require_indexed`) index status = indexed. In P2 no index layer exists, so `require_indexed=true` is *unsatisfiable* and GC skips every candidate (never deletes) — the flag becomes meaningful in P3.
+3. Require **all**: catalog artifact with `source_sha256 == live_sha` **AND** the stored artifact **re-verifies** (below) **AND** (if `require_indexed`) index status = indexed. In P3 the gate consults per-source `index_state`: a source is index-current only when `index_state.indexed_source_sha256 == source_sha256`. Un-indexed or stale-indexed (or an SQL error) → skip, never delete (fail-closed).
+   > **`require_indexed` guarantee scope.** The gate proves *"the current source sha was processed by the indexer"* — **not** *"this source contributed searchable content"*. A source that produced zero index docs (e.g. a whole-quarantined transcript, whose stored bytes are an opaque marker, or an empty/noise-only file) still satisfies the gate at its current sha: it was seen, its raw is preserved in `quarantine/` (mode 700), and deleting the redundant live copy is safe. `require_indexed` is a *"we have processed this version"* guarantee, not a *"it is findable via search"* guarantee.
 4. **AND** file age ≥ `min_age` **AND** session not live (§below).
 5. Only then delete source. Append to `gc.log`: source, source_sha, archive_id, verified checks, deleted_at.
 
@@ -349,7 +370,7 @@ mcp_log_retain   = "14d"
 paste_retain     = "14d"
 snapshot_retain  = "30d"
 history_compact  = false   # default: archive history slices, NEVER wipe live file
-require_indexed  = false   # P2: no index layer yet; true ⇒ GC refuses all (unsatisfiable, safe)
+require_indexed  = false   # P3: true ⇒ GC consults index_state; skips only un-indexed sources
 ```
 
 ### Special targets
@@ -371,12 +392,24 @@ would-delete / why-safe (checks passed) / bytes reclaimed, and protected items w
 ### Engine: SQLite FTS5 (v1), behind an `Index` trait; tantivy = measured-need upgrade
 
 Justification in §9. Catalog is already SQLite → one dependency, one file, no server; FTS5/BM25 is
-ample for a 25M→low-GB corpus. `trait Index { fn upsert(docs); fn query(q,filters)->hits; fn delete(session); }`
+ample for a 25M→low-GB corpus. `trait Index { fn upsert(docs); fn query(q); fn delete_session(session); }`
 lets tantivy slot in later without touching callers.
+
+**Shipped shape:** external-content FTS5 (`entries` metadata table + `entries_fts` vtable + 3 sync
+triggers) inside the same `catalog.db`; per-source `index_state` watermark; `index_meta` records the
+tokenizer/epoch. Tokenizer default `unicode61 remove_diacritics 2` (best for English/code, supports
+prefix/AND/OR/NEAR), with `[index].tokenizer = "trigram"` opt-in for CJK-heavy corpora (substring
+match; requires `yomi index --reindex`, a destructive FTS rebuild). All SQL lives on `Catalog`; the
+index reads **only** the redacted stored bytes, never `source_path`.
 
 ### Document granularity: per-entry (per JSONL message)
 
-One index doc per user/assistant/tool-result entry → precise hits + jump-back. Fields:
+One index doc per user/assistant/tool-result entry → precise hits + jump-back. Single-text roles
+(mcp / paste / snapshot / history / tool-result) index as one whole-text doc (`entry_uuid =
+art:<id>`); subagent-meta and scratch are not indexed. `agent` is `main` for the session transcript
+and the subagent `agentType` (read from the sibling `.meta.json`) for a subagent transcript;
+`role=tool_result` derives from the `tool_result` blocks of a `type:"user"` line, inheriting the
+tool name from the answered `tool_use`. Fields:
 
 | Field | Type | Use |
 |---|---|---|
@@ -389,24 +422,36 @@ One index doc per user/assistant/tool-result entry → precise hits + jump-back.
 | `text` | **FTS** | user prompt / assistant text / tool_result text |
 | `has_redaction` | filter | bool |
 
-Redacted spans index as the placeholder token — raw secrets never indexed.
+Redacted spans index as the placeholder token — raw secrets never indexed. This holds regardless of
+the artifact's `quarantined` flag: the flag is set both for whole-quarantine artifacts (stored =
+opaque marker) and for scannable content with a redacted-in-place HIGH finding (stored = fully
+redacted browsable text), so the indexer does **not** gate on it — non-exposure is guaranteed
+structurally by indexing only the decompressed stored bytes.
 
 ### Query CLI
 
 ```
+yomi index [--reindex] [--session U]                       # mutation, WriteLock hard-required
 yomi search <query> [--project P] [--session U] [--agent A] [--role R] [--tool T]
                     [--branch B] [--cwd C] [--since D] [--until D] [--on D]
-                    [--limit N] [--context N] [--json]
+                    [--limit N] [--context N] [--json]      # read-only
+yomi read <session> [--entry U] [--agents] [--grep S] [--raw] [--json]   # read-only
 ```
 
-Inline `field:value` in the query also parses to filters: `project:zaibatsu tool:Bash "cargo build"`.
-Output: ranked highlighted snippet + header (`session · timestamp · project · agent`) + jump ref
-(`yomi read <uuid> --entry <entry_uuid>`).
+Inline `field:value` in the query also parses to filters: `project:zaibatsu tool:Bash "cargo build"`
+(a CLI flag wins over an inline token; free-text terms are quoted into a safe FTS5 AND-of-terms, so
+operators/`"` cannot inject). Output: ranked (BM25) highlighted snippet + header (`session ·
+timestamp · project · agent`) + jump ref (`yomi read <session> --entry <entry_uuid>`). Empty free
+text with filters → metadata-only listing (newest first). `read --raw` decompresses the stored
+transcript and works without an index.
 
 ### Incremental index
 
-Catalog tracks `indexed_through_offset` per session; `yomi index` (auto post-archive) indexes only
-new entries. `--reindex` rebuilds on schema change. Built from the **redacted stored artifact**.
+Per-source watermark: `yomi index` reindexes only artifacts whose `source_sha256` moved off the
+recorded `indexed_source_sha256` (sha match, not offset arithmetic — redaction changes byte length),
+replacing that artifact's entries. `--reindex` drops and rebuilds all entries (and the FTS vtable on
+a tokenizer change). Built from the **redacted stored artifact**. Auto post-archive chaining is
+deferred to P5 `run --profile daily`.
 
 ---
 
