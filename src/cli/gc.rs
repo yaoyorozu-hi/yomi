@@ -44,11 +44,6 @@ pub fn run(env: &Env, args: &GcArgs, json: bool) -> Result<i32> {
             "warning: history_compact=true is inert in P2 (history is not a GC target); ignored"
         );
     }
-    if cfg.require_indexed {
-        eprintln!(
-            "warning: require_indexed=true but no index layer exists in P2; every candidate is unsatisfiable and skipped"
-        );
-    }
 
     let bl = Blacklist::compile(&env.config.blacklist_add)?;
     let roots = SourceRoots::resolve()?;
