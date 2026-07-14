@@ -2,6 +2,7 @@
 name = "yhi-yomi"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.89"
 description = "Claude Code session-data plane: archive, wipe, and search"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/yaoyorozu-hi/yomi"
@@ -33,7 +34,7 @@ anyhow = "1"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-fs2 = "0.4"
+rustix = { version = "1", features = ["fs", "process"] }
 libc = "0.2"
 
 [dev-dependencies]
