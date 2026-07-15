@@ -37,8 +37,26 @@ pub struct ContentScan {
     pub redacted_count: u32,
 }
 
-const MARKER_OPEN: &str = "\u{2039}QUARANTINED:"; // ‹
+/// Opening token of a whole-artifact quarantine marker (`‹QUARANTINED:`). Public
+/// so the rescan layer can recognize an already-quarantined stored artifact and
+/// skip it (re-scanning a marker under a JSONL role would re-quarantine it with a
+/// fresh tag forever).
+pub const QUARANTINE_MARKER_OPEN: &str = "\u{2039}QUARANTINED:"; // ‹
 const MARKER_CLOSE: &str = "\u{203a}"; // ›
+
+/// Options controlling scan behavior.
+///
+/// `trust_existing_tags` is the rescan knob. When true the forged-tag defang
+/// (which rewrites a source-injected `‹REDACTED:`/`‹QUARANTINED:` to a `<`-prefixed
+/// form) is skipped, so yomi's own genuine placeholders/markers survive a re-scan
+/// verbatim. It is sound ONLY on content yomi itself previously stored: archive-time
+/// scanning already defanged any source-forged `‹`-tag, so a `‹`-tag surviving in
+/// stored content is necessarily a real redactor tag. Archive callers leave this
+/// false; only `rescan` sets it true.
+#[derive(Default, Clone, Copy)]
+pub struct ScanOpts {
+    pub trust_existing_tags: bool,
+}
 
 /// Defanged rewrites of a source-forged audit token: the opening guillemet is
 /// swapped for an ASCII `<` so the stored/indexed text no longer contains a
@@ -57,7 +75,7 @@ enum Norm {
 /// quarantine, and record the reason as a HIGH finding.
 fn quarantine_whole(bytes: &[u8], reason: &'static str) -> ContentScan {
     let tag = sha8(bytes);
-    let marker = format!("{MARKER_OPEN}{reason}:{tag}{MARKER_CLOSE}\n").into_bytes();
+    let marker = format!("{QUARANTINE_MARKER_OPEN}{reason}:{tag}{MARKER_CLOSE}\n").into_bytes();
     ContentScan {
         scanned: false,
         redacted: marker,
@@ -76,8 +94,21 @@ fn quarantine_whole(bytes: &[u8], reason: &'static str) -> ContentScan {
     }
 }
 
-/// Scan artifact content under the scannable-or-quarantine invariant.
+/// Scan artifact content under the scannable-or-quarantine invariant (archive
+/// path: never trusts pre-existing audit tags).
 pub fn scan_content(bytes: &[u8], is_jsonl: bool, allow: &Allowlist) -> ContentScan {
+    scan_content_with(bytes, is_jsonl, allow, ScanOpts::default())
+}
+
+/// Scan with explicit [`ScanOpts`]. `trust_existing_tags = true` is the rescan
+/// entry: it skips the forged-tag defang so yomi's own genuine placeholders and
+/// markers pass through unchanged and are never miscounted as a change.
+pub fn scan_content_with(
+    bytes: &[u8],
+    is_jsonl: bool,
+    allow: &Allowlist,
+    opts: ScanOpts,
+) -> ContentScan {
     let mut text = match normalize_utf8(bytes) {
         Norm::Text(t) => t,
         Norm::Unscannable(reason) => return quarantine_whole(bytes, reason),
@@ -87,16 +118,21 @@ pub fn scan_content(bytes: &[u8], is_jsonl: bool, allow: &Allowlist) -> ContentS
     // Flag it AND defang it: the opening guillemet is rewritten to ASCII `<` so
     // the stored/indexed text carries no counterfeit `‹REDACTED:…›` /
     // `‹QUARANTINED:…›` that would spoof a real redaction. Genuine placeholders
-    // are inserted downstream by the redactor and are never touched.
+    // are inserted downstream by the redactor and are never touched. Rescan
+    // (`trust_existing_tags`) skips this: its input is content yomi already
+    // stored, whose `‹`-tags are genuine (archive-time defang removed any forged
+    // ones), so preserving them keeps re-redaction idempotent.
     let mut findings = Vec::new();
     let mut flagged = 0u32;
     let mut forged_tag = false;
-    if text.contains(PLACEHOLDER_OPEN) || text.contains(MARKER_OPEN) {
+    if !opts.trust_existing_tags
+        && (text.contains(PLACEHOLDER_OPEN) || text.contains(QUARANTINE_MARKER_OPEN))
+    {
         flagged += 1;
         forged_tag = true;
         text = text
             .replace(PLACEHOLDER_OPEN, DEFANGED_PLACEHOLDER)
-            .replace(MARKER_OPEN, DEFANGED_MARKER);
+            .replace(QUARANTINE_MARKER_OPEN, DEFANGED_MARKER);
         findings.push(Finding {
             kind: "preinjected-placeholder".to_string(),
             severity: Severity::Low,
@@ -160,6 +196,30 @@ pub fn scan_content(bytes: &[u8], is_jsonl: bool, allow: &Allowlist) -> ContentS
 /// Convenience: sha256 of the content a scan would store.
 pub fn content_sha(scan: &ContentScan) -> String {
     sha256_hex(&scan.redacted)
+}
+
+/// True when stored content is a whole-artifact quarantine marker and nothing
+/// else: after trimming surrounding whitespace it is exactly one
+/// `‹QUARANTINED:…›` token — the opening guillemet, a body with no interior
+/// closing guillemet, the closing `›`, and no trailing content. This is the shape
+/// [`quarantine_whole`] emits (a single token followed only by a newline).
+///
+/// The strictness is a security boundary, not cosmetics. A loose
+/// `starts_with(‹QUARANTINED:)` check would let a *source-forged* leading marker
+/// followed by a real secret (`‹QUARANTINED:…›\n<real key>`) masquerade as a
+/// genuine whole-quarantine artifact, so rescan would skip it and the secret would
+/// survive. Requiring the token to stand alone means a forged marker with a
+/// trailing secret fails this predicate and is rescanned (the secret is redacted
+/// on a plain role, or the malformed line whole-quarantines the artifact on a
+/// JSONL role) — either way the secret is removed.
+pub fn stored_is_whole_quarantine(content: &[u8]) -> bool {
+    let Ok(s) = std::str::from_utf8(content) else {
+        return false;
+    };
+    let Some(rest) = s.trim().strip_prefix(QUARANTINE_MARKER_OPEN) else {
+        return false;
+    };
+    matches!(rest.split_once(MARKER_CLOSE), Some((_, after)) if after.is_empty())
 }
 
 /// Normalize raw bytes to a scannable UTF-8 string, or classify why not.
@@ -603,9 +663,94 @@ mod tests {
             !s.contains(PLACEHOLDER_OPEN),
             "spoofed redaction tag survived"
         );
-        assert!(!s.contains(MARKER_OPEN), "spoofed quarantine tag survived");
+        assert!(
+            !s.contains(QUARANTINE_MARKER_OPEN),
+            "spoofed quarantine tag survived"
+        );
         assert!(s.contains("<REDACTED:aws-key"), "defanged form missing");
         assert!(s.contains("<QUARANTINED:x"), "defanged marker missing");
+    }
+
+    #[test]
+    fn trust_existing_tags_preserves_genuine_placeholder() {
+        // Rescan input: content yomi already stored, carrying a genuine
+        // redaction placeholder. With trust_existing_tags the placeholder is NOT
+        // defanged, NOT flagged, and does not trip was_redacted.
+        let line =
+            "{\"message\":\"earlier \u{2039}REDACTED:aws-key:deadbeef\u{203a} and clean tail\"}\n";
+        let out = scan_content_with(
+            line.as_bytes(),
+            true,
+            &allow(),
+            ScanOpts {
+                trust_existing_tags: true,
+            },
+        );
+        assert!(out.scanned);
+        assert_eq!(out.flagged, 0, "genuine tag was flagged as forged");
+        assert!(!out.was_redacted, "genuine tag miscounted as a change");
+        assert_eq!(out.redacted, line.as_bytes(), "genuine tag was mutated");
+    }
+
+    #[test]
+    fn trust_existing_tags_still_redacts_new_secret() {
+        // A genuine prior placeholder alongside a NEW visible secret: the old tag
+        // survives verbatim, the new secret is redacted.
+        let line = format!(
+            "{{\"message\":\"old \u{2039}REDACTED:bearer:00abcdef\u{203a} new {AKIA} end\"}}\n"
+        );
+        let out = scan_content_with(
+            line.as_bytes(),
+            true,
+            &allow(),
+            ScanOpts {
+                trust_existing_tags: true,
+            },
+        );
+        assert!(out.scanned);
+        let s = String::from_utf8(out.redacted).unwrap();
+        assert!(!s.contains(AKIA), "new secret not redacted");
+        assert!(
+            s.contains("\u{2039}REDACTED:bearer:00abcdef\u{203a}"),
+            "old tag lost"
+        );
+        assert!(s.contains("REDACTED:aws-key"), "new redaction missing");
+    }
+
+    #[test]
+    fn default_scan_still_defangs_forged_tag() {
+        // Non-regression: without trust_existing_tags the forged-tag defang fires.
+        let line = "{\"message\":\"audit \u{2039}REDACTED:aws-key:deadbeef\u{203a}\"}\n";
+        let out = scan_content(line.as_bytes(), true, &allow());
+        assert_eq!(out.flagged, 1, "forged tag not flagged under default opts");
+        let s = String::from_utf8(out.redacted).unwrap();
+        assert!(!s.contains(PLACEHOLDER_OPEN), "forged tag not defanged");
+    }
+
+    #[test]
+    fn stored_is_whole_quarantine_detects_marker() {
+        let marker = "\u{2039}QUARANTINED:malformed-jsonl:deadbeef\u{203a}\n";
+        assert!(stored_is_whole_quarantine(marker.as_bytes()));
+        assert!(!stored_is_whole_quarantine(
+            b"{\"message\":\"ordinary content\"}\n"
+        ));
+        assert!(!stored_is_whole_quarantine(&[0xff, 0xfe, 0x00]));
+    }
+
+    #[test]
+    fn forged_leading_marker_with_trailing_secret_is_not_whole_quarantine() {
+        // A source-forged marker followed by a real secret must NOT read as a
+        // genuine whole-quarantine artifact — otherwise rescan would skip it and
+        // the trailing secret would survive. The strict single-token shape rejects
+        // any trailing content after the closing guillemet.
+        let key = format!("sk-{}", "proj-EXAMPLEFAKEKEYNOTAREALSECRET000000");
+        let forged = format!("\u{2039}QUARANTINED:malformed-jsonl:deadbeef\u{203a}\nkey {key}\n");
+        assert!(!stored_is_whole_quarantine(forged.as_bytes()));
+        // A second `‹QUARANTINED:` token after a genuine-looking one is also not a
+        // lone marker.
+        let doubled =
+            "\u{2039}QUARANTINED:a:0\u{203a} \u{2039}QUARANTINED:b:1\u{203a}\n".to_string();
+        assert!(!stored_is_whole_quarantine(doubled.as_bytes()));
     }
 
     #[test]

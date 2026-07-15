@@ -95,9 +95,9 @@ impl Fixture {
         }
     }
 
-    fn run(&self, args: &[&str]) -> std::process::Output {
-        Command::new(BIN)
-            .args(args)
+    fn command(&self, args: &[&str]) -> Command {
+        let mut c = Command::new(BIN);
+        c.args(args)
             .arg("--home")
             .arg(&self.yomi_home)
             .env("HOME", &self.home)
@@ -108,6 +108,19 @@ impl Fixture {
             .env("YOMI_TMP_BASE", &self.tmp_base)
             .env_remove("YOMI_HOME")
             .env_remove("YOMI_CLAUDE_HOME")
+            .env_remove("YOMI_RESCAN_FAULT");
+        c
+    }
+
+    fn run(&self, args: &[&str]) -> std::process::Output {
+        self.command(args).output().expect("run yomi")
+    }
+
+    /// Run with the rescan fault seam armed: `commit` skips the stored rename of
+    /// the first targeted artifact right after its DB transaction commits.
+    fn run_faulted(&self, args: &[&str]) -> std::process::Output {
+        self.command(args)
+            .env("YOMI_RESCAN_FAULT", "1")
             .output()
             .expect("run yomi")
     }
@@ -2312,5 +2325,678 @@ fn p3_rebreak_covered_secret_classes_are_redacted() {
     assert!(
         leaked.is_empty(),
         "covered secret classes leaked into entries.text: {leaked:?}"
+    );
+}
+
+// ============================================================================
+// 金山 (Kanayama) — `rescan`: retroactive re-redaction of the existing store
+// against the hardened scanner. The "old scanner gap" is simulated faithfully by
+// archiving with `--no-scan` (raw stored + indexed, redacted=0) — exactly the
+// state a pre-hardening scanner left behind. Every test asserts the raw secret is
+// removed from BOTH the stored copy and the search index, and that the operation
+// is idempotent, crash-safe, and never exposes secret material in its report.
+// ============================================================================
+
+fn artifact_redacted_flag(fx: &Fixture, role: &str) -> i64 {
+    let conn = rusqlite::Connection::open(fx.catalog_path()).unwrap();
+    conn.query_row(
+        "SELECT redacted FROM artifacts WHERE role = ?1",
+        [role],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+/// [most important] Gap-era artifact → `rescan --commit` removes the raw secret
+/// from the stored `.zst` AND the search index (entries.text + FTS MATCH), marks
+/// the catalog redacted with the right finding, and leaves verify passing. A
+/// second commit is a no-op (idempotent).
+#[test]
+fn rescan_removes_gap_secret_from_store_and_index() {
+    let fx = Fixture::new("rescan-gap");
+    fx.write_transcript(&[
+        user_line(&format!("here is my key {SK_PROJ_KEY} keep it safe")),
+        user_line("a clean second turn about penguins"),
+    ]);
+    // --no-scan stores + indexes the modern key RAW: the pre-hardening gap.
+    assert!(fx.run(&["archive", "--all", "--no-scan"]).status.success());
+    assert!(fx.run(&["index"]).status.success());
+
+    assert!(
+        String::from_utf8_lossy(&read_store(&fx.transcript_store())).contains(SK_PROJ_KEY),
+        "fixture did not store the raw key"
+    );
+    assert!(
+        fx.entries_text().iter().any(|t| t.contains(SK_PROJ_KEY)),
+        "fixture did not index the raw key"
+    );
+
+    // Dry-run: reports exactly one target, exposes no secret, mutates nothing.
+    let plan = fx.run(&["rescan", "--json"]);
+    assert_eq!(code(&plan), 0);
+    assert_eq!(json_last(&plan)["targeted"].as_u64().unwrap(), 1);
+    assert!(
+        !stdout(&plan).contains(SK_PROJ_KEY),
+        "dry-run leaked the raw secret into its report"
+    );
+
+    let out = fx.run(&["rescan", "--commit", "--json"]);
+    assert_eq!(code(&out), 0, "rescan commit not clean: {out:?}");
+    let v = json_last(&out);
+    assert_eq!(v["reredacted"].as_u64().unwrap(), 1);
+    assert!(v["secrets_removed"].as_u64().unwrap() >= 1);
+    assert_eq!(v["verify_failures"].as_u64().unwrap(), 0);
+    assert_eq!(v["visible_quarantine_transitions"].as_u64().unwrap(), 1);
+
+    // (a) stored copy: raw gone, placeholder present.
+    let s = String::from_utf8_lossy(&read_store(&fx.transcript_store())).to_string();
+    assert!(!s.contains(SK_PROJ_KEY), "raw key survived in the store");
+    assert!(
+        s.contains("\u{2039}REDACTED:openai-key:"),
+        "no redaction placeholder in the store"
+    );
+
+    // (b) index: raw gone from entries.text and unsearchable.
+    for t in fx.entries_text() {
+        assert!(!t.contains(SK_PROJ_KEY), "raw key survived in the index");
+    }
+    assert_eq!(
+        json_last(&fx.run(&["search", SK_PROJ_KEY, "--json"]))["count"]
+            .as_u64()
+            .unwrap(),
+        0,
+        "raw key still searchable"
+    );
+
+    // (c) catalog: redacted, with an openai-key finding.
+    assert_eq!(artifact_redacted_flag(&fx, "transcript"), 1);
+    let conn = rusqlite::Connection::open(fx.catalog_path()).unwrap();
+    let n: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM findings f JOIN artifacts a ON a.id = f.artifact_id
+             WHERE a.role = 'transcript' AND f.kind = 'openai-key'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(n >= 1, "openai-key finding not recorded");
+
+    // (d,e) verify passes; raw original recoverable from quarantine.
+    assert!(fx.run(&["verify", "--all"]).status.success());
+    assert!(
+        walk_contains(&fx.quarantine_dir(), SK_PROJ_KEY),
+        "raw original not quarantined"
+    );
+
+    // Idempotent: a second commit re-targets nothing and mutates no bytes.
+    let before = std::fs::read(fx.transcript_store()).unwrap();
+    let again = fx.run(&["rescan", "--commit", "--json"]);
+    assert_eq!(code(&again), 0);
+    assert_eq!(
+        json_last(&again)["targeted"].as_u64().unwrap(),
+        0,
+        "second rescan re-targeted a clean store"
+    );
+    assert_eq!(
+        std::fs::read(fx.transcript_store()).unwrap(),
+        before,
+        "idempotent rescan mutated the store"
+    );
+}
+
+/// Dry-run mutates nothing: store bytes, index rows, and the catalog redacted flag
+/// are all unchanged, and no secret appears in the plan output.
+#[test]
+fn rescan_dry_run_mutates_nothing() {
+    let fx = Fixture::new("rescan-dry");
+    fx.write_transcript(&[user_line(&format!("key {SK_PROJ_KEY} here"))]);
+    assert!(fx.run(&["archive", "--all", "--no-scan"]).status.success());
+    assert!(fx.run(&["index"]).status.success());
+
+    let store_before = std::fs::read(fx.transcript_store()).unwrap();
+    let entries_before = fx.entries_text();
+
+    let out = fx.run(&["rescan", "--json"]);
+    assert_eq!(code(&out), 0);
+    assert_eq!(json_last(&out)["targeted"].as_u64().unwrap(), 1);
+    assert!(
+        !stdout(&out).contains(SK_PROJ_KEY),
+        "dry-run leaked the secret"
+    );
+
+    assert_eq!(
+        std::fs::read(fx.transcript_store()).unwrap(),
+        store_before,
+        "dry-run mutated the store"
+    );
+    assert_eq!(
+        fx.entries_text(),
+        entries_before,
+        "dry-run mutated the index"
+    );
+    assert_eq!(
+        artifact_redacted_flag(&fx, "transcript"),
+        0,
+        "dry-run flipped the redacted flag"
+    );
+}
+
+/// An escape-hidden secret (only present in `\uXXXX` form) is whole-quarantined:
+/// stored becomes an opaque marker, the raw original goes to quarantine, and the
+/// index is purged of the (previously index-decoded) secret. A second rescan skips
+/// the marker (the infinite-re-quarantine guard) rather than re-processing it.
+#[test]
+fn rescan_whole_quarantines_escape_hidden_and_skips_marker() {
+    let fx = Fixture::new("rescan-wholeq");
+    let escaped: String = FIXTURE_AKIA
+        .chars()
+        .map(|c| format!("\\u{:04x}", c as u32))
+        .collect();
+    let line = format!(
+        "{{\"type\":\"user\",\"timestamp\":\"2026-07-12T10:00:00.000Z\",\"message\":{{\"role\":\"user\",\"content\":\"key {escaped} end\"}}}}"
+    );
+    fx.write_transcript(&[line]);
+    assert!(fx.run(&["archive", "--all", "--no-scan"]).status.success());
+    assert!(fx.run(&["index"]).status.success());
+    // --no-scan stored the escaped form; the index parser DECODED it → raw in index.
+    assert!(
+        fx.entries_text().iter().any(|t| t.contains(FIXTURE_AKIA)),
+        "escape-hidden gap not present in the index"
+    );
+
+    let out = fx.run(&["rescan", "--commit", "--json"]);
+    assert_eq!(code(&out), 0, "{out:?}");
+    assert_eq!(
+        json_last(&out)["whole_quarantine_transitions"]
+            .as_u64()
+            .unwrap(),
+        1
+    );
+
+    let s = String::from_utf8_lossy(&read_store(&fx.transcript_store())).to_string();
+    assert!(
+        s.contains("QUARANTINED:escape-hidden-secret"),
+        "not whole-quarantined: {s}"
+    );
+    assert!(
+        !s.contains(FIXTURE_AKIA),
+        "decoded secret survived in the store"
+    );
+    for t in fx.entries_text() {
+        assert!(
+            !t.contains(FIXTURE_AKIA),
+            "raw secret survived in the index"
+        );
+    }
+    assert!(
+        walk_contains(&fx.quarantine_dir(), "u0041"),
+        "escaped original not quarantined"
+    );
+    assert!(fx.run(&["verify", "--all"]).status.success());
+
+    // Marker skip: no re-targeting, no infinite re-quarantine.
+    let again = fx.run(&["rescan", "--commit", "--json"]);
+    assert_eq!(code(&again), 0);
+    let av = json_last(&again);
+    assert_eq!(
+        av["targeted"].as_u64().unwrap(),
+        0,
+        "quarantine marker was re-targeted"
+    );
+    assert!(
+        av["skipped_markers"].as_u64().unwrap() >= 1,
+        "marker not skipped"
+    );
+}
+
+/// Atomicity: a crash injected between the DB commit and the stored rename leaves
+/// the index already clean (rebuilt from in-memory redacted bytes) while the
+/// stored copy is still stale raw — verify flags the mismatch, and re-running
+/// converges to a fully clean, verifying state. Proves index-no-leak at the one
+/// crash point the ordering invariant guards.
+#[test]
+fn rescan_fault_between_commit_and_rename_keeps_index_clean() {
+    let fx = Fixture::new("rescan-fault");
+    fx.write_transcript(&[user_line(&format!("key {SK_PROJ_KEY} here"))]);
+    assert!(fx.run(&["archive", "--all", "--no-scan"]).status.success());
+    assert!(fx.run(&["index"]).status.success());
+
+    let out = fx.run_faulted(&["rescan", "--commit", "--json"]);
+    assert_eq!(code(&out), 2, "faulted run should report partial");
+    let v = json_last(&out);
+    assert_eq!(
+        v["reredacted"].as_u64().unwrap(),
+        0,
+        "rename-faulted artifact counted as done"
+    );
+    assert_eq!(v["failed"].as_array().unwrap().len(), 1);
+
+    // Index already clean at the crash point.
+    for t in fx.entries_text() {
+        assert!(
+            !t.contains(SK_PROJ_KEY),
+            "index leaked the raw secret at the crash point"
+        );
+    }
+    assert_eq!(
+        json_last(&fx.run(&["search", SK_PROJ_KEY, "--json"]))["count"]
+            .as_u64()
+            .unwrap(),
+        0
+    );
+
+    // Stored copy still stale raw → verify must fail.
+    assert!(
+        String::from_utf8_lossy(&read_store(&fx.transcript_store())).contains(SK_PROJ_KEY),
+        "stored should still be raw after a rename fault"
+    );
+    assert_ne!(
+        code(&fx.run(&["verify", "--all"])),
+        0,
+        "verify should fail on a stale-raw store"
+    );
+
+    // Convergence: re-run cleans the store and verify passes.
+    let conv = fx.run(&["rescan", "--commit", "--json"]);
+    assert_eq!(code(&conv), 0, "convergence run not clean: {conv:?}");
+    assert_eq!(json_last(&conv)["reredacted"].as_u64().unwrap(), 1);
+    assert!(
+        !String::from_utf8_lossy(&read_store(&fx.transcript_store())).contains(SK_PROJ_KEY),
+        "store not healed on the convergence run"
+    );
+    assert!(fx.run(&["verify", "--all"]).status.success());
+}
+
+/// `rescan` keeps `index_state.indexed_source_sha256 == source_sha256` (source sha
+/// is a historical constant), so the `require_indexed` GC gate still permits the
+/// delete after re-redaction — it does not strand the source as NotIndexed.
+#[test]
+fn rescan_preserves_require_indexed_gate() {
+    let fx = Fixture::new("rescan-reqidx");
+    fx.write_transcript(&[user_line(&format!("key {SK_PROJ_KEY} here"))]);
+    assert!(fx.run(&["archive", "--all", "--no-scan"]).status.success());
+    assert!(fx.run(&["index"]).status.success());
+    assert_eq!(code(&fx.run(&["rescan", "--commit"])), 0);
+
+    set_mtime_days(&fx.transcript_path(), 200);
+    fx.write_config("[gc]\nrequire_indexed = true\n");
+    let out = fx.run(&["gc", "--targets", "transcripts", "--commit"]);
+    assert_eq!(
+        code(&out),
+        0,
+        "rescan broke the require_indexed gate: {out:?}"
+    );
+    assert!(
+        !fx.transcript_path().exists(),
+        "indexed + rescanned source was not deletable"
+    );
+}
+
+/// trust_existing_tags soundness end-to-end: an artifact already carrying a
+/// genuine `‹REDACTED:…›` placeholder (archived with the hardened scanner) is not
+/// a target — the placeholder is neither defanged nor miscounted as a change, so
+/// rescan is a strict no-op.
+#[test]
+fn rescan_does_not_corrupt_existing_redactions() {
+    let fx = Fixture::new("rescan-trust");
+    fx.write_transcript(&[user_line(&format!("deploy {FIXTURE_AKIA} to prod"))]);
+    assert!(fx.run(&["archive", "--all"]).status.success());
+    assert!(fx.run(&["index"]).status.success());
+
+    let store_before = std::fs::read(fx.transcript_store()).unwrap();
+    let entries_before = fx.entries_text();
+    assert!(
+        String::from_utf8_lossy(&read_store(&fx.transcript_store())).contains("REDACTED:aws-key"),
+        "fixture lacks a genuine placeholder"
+    );
+
+    let out = fx.run(&["rescan", "--commit", "--json"]);
+    assert_eq!(code(&out), 0);
+    assert_eq!(
+        json_last(&out)["targeted"].as_u64().unwrap(),
+        0,
+        "already-redacted content was re-targeted (defang regression)"
+    );
+    assert_eq!(
+        std::fs::read(fx.transcript_store()).unwrap(),
+        store_before,
+        "rescan mutated a clean redacted store"
+    );
+    assert_eq!(
+        fx.entries_text(),
+        entries_before,
+        "rescan mutated a clean index"
+    );
+
+    let s = String::from_utf8_lossy(&read_store(&fx.transcript_store())).to_string();
+    assert!(
+        s.contains("\u{2039}REDACTED:aws-key"),
+        "genuine placeholder was corrupted"
+    );
+    assert!(!s.contains("<REDACTED:aws-key"), "placeholder was defanged");
+}
+
+/// A single-file role (mcp) has no session manifest — rescan updates only the
+/// catalog + index and still verifies, exercising the manifest-skip path.
+#[test]
+fn rescan_single_file_role_without_manifest() {
+    let fx = Fixture::new("rescan-mcp");
+    fx.write_transcript(&[user_line("ok")]);
+    let src = fx
+        .cache_home
+        .join("proj/mcp-logs-srv/00000000-0000-0000-0000-000000000abc.jsonl");
+    std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+    std::fs::write(&src, format!("connect key {SK_PROJ_KEY} now\n").as_bytes()).unwrap();
+    assert!(
+        fx.run(&["archive", "--all", "--include", "mcp", "--no-scan"])
+            .status
+            .success()
+    );
+    assert!(fx.run(&["index"]).status.success());
+    assert!(
+        fx.entries_text().iter().any(|t| t.contains(SK_PROJ_KEY)),
+        "mcp gap not indexed"
+    );
+
+    let out = fx.run(&["rescan", "--commit", "--json"]);
+    assert_eq!(code(&out), 0, "{out:?}");
+    assert!(json_last(&out)["reredacted"].as_u64().unwrap() >= 1);
+    for t in fx.entries_text() {
+        assert!(
+            !t.contains(SK_PROJ_KEY),
+            "mcp raw secret survived in the index"
+        );
+    }
+    assert!(fx.run(&["verify", "--all"]).status.success());
+}
+
+// ============================================================================
+// 須佐之男 (Susanoo) — adversarial `rescan_break_*`. Each asserts the SAFE
+// outcome (no raw secret survives on either face). A FAILING test here is a
+// CONFIRMED break: the raw secret leaked through rescan. Gap-era stores are
+// simulated with `archive --no-scan` (verbatim store + raw index, redacted=0),
+// the same fidelity 金山's tests rely on. All secret bodies are obviously-fake.
+// ============================================================================
+
+/// The browsable archive root (excludes the `quarantine/` sibling, where a raw
+/// original legitimately lives after a visible/whole quarantine transition).
+fn archive_root(fx: &Fixture) -> PathBuf {
+    fx.yomi_home.join("archive")
+}
+
+fn search_count(fx: &Fixture, needle: &str) -> u64 {
+    json_last(&fx.run(&["search", needle, "--json"]))["count"]
+        .as_u64()
+        .unwrap()
+}
+
+/// [CRITICAL probe] trust-premise abuse. `trust_existing_tags` + the
+/// `stored_is_whole_quarantine` marker-skip guard both rest on the premise that
+/// archive-time defang already neutralised any source-forged `‹`-tag, so a
+/// `‹QUARANTINED:…›` surviving in stored content must be yomi's own genuine
+/// marker. That premise is FALSE for gap-era stores: the pre-P3 (P1) scanner only
+/// *flagged* a forged tag, it never defanged it. So a gap-era plain-role artifact
+/// whose stored content merely *begins* with a source-supplied `‹QUARANTINED:…›`
+/// string (with a real secret after it) is verbatim-stored, verbatim-indexed, and
+/// then SKIPPED by rescan as if already-quarantined — leaving the real secret in
+/// both the store and the index. rescan must not treat a stored marker as
+/// authoritative without provenance; the raw secret must be purged.
+#[test]
+fn rescan_break_forged_quarantine_marker_shields_secret() {
+    let fx = Fixture::new("rescan-break-forged-marker");
+    fx.write_transcript(&[user_line("ok")]);
+    // A plain (non-JSONL) mcp artifact: content leads with a *source-forged*
+    // whole-quarantine marker, followed by a real gap-class key. In the gap era
+    // this was stored verbatim (P1 flagged, never defanged).
+    let forged = "\u{2039}QUARANTINED:malformed-jsonl:deadbeef\u{203a}";
+    let body = format!("{forged}\nconnect key {SK_PROJ_KEY} now\n");
+    let src = fx
+        .cache_home
+        .join("proj/mcp-logs-srv/00000000-0000-0000-0000-0000000ffake.jsonl");
+    std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+    std::fs::write(&src, body.as_bytes()).unwrap();
+    assert!(
+        fx.run(&["archive", "--all", "--include", "mcp", "--no-scan"])
+            .status
+            .success()
+    );
+    assert!(fx.run(&["index"]).status.success());
+
+    // Precondition: the gap left the raw key in BOTH faces.
+    assert!(
+        walk_contains(&archive_root(&fx), SK_PROJ_KEY),
+        "fixture did not store the raw key"
+    );
+    assert!(
+        fx.entries_text().iter().any(|t| t.contains(SK_PROJ_KEY)),
+        "fixture did not index the raw key"
+    );
+
+    let out = fx.run(&["rescan", "--commit", "--json"]);
+    assert_eq!(code(&out), 0, "rescan errored: {out:?}");
+    // Confirmed break signature: report shows skipped_markers=1, targeted=0,
+    // reredacted=0 — the forged leading marker made rescan treat the artifact as
+    // already-quarantined and skip it, so the real secret is never purged.
+    assert!(
+        !stdout(&out).contains(SK_PROJ_KEY),
+        "rescan report leaked the raw secret"
+    );
+
+    // The one invariant: no raw secret on either face after rescan.
+    assert!(
+        !walk_contains(&archive_root(&fx), SK_PROJ_KEY),
+        "CRITICAL: raw secret survives in the store — a forged leading marker made rescan skip it"
+    );
+    for t in fx.entries_text() {
+        assert!(
+            !t.contains(SK_PROJ_KEY),
+            "CRITICAL: raw secret survives in entries.text — forged marker shielded it from rescan"
+        );
+    }
+    assert_eq!(
+        search_count(&fx, SK_PROJ_KEY),
+        0,
+        "CRITICAL: raw secret still searchable after rescan (forged-marker skip)"
+    );
+}
+
+/// [double-face, all gap classes] Every gap-class secret planted raw (sk-proj,
+/// sk-cred, connection-string password, bearer, password=, HTTP Basic) must be
+/// gone from the stored `.zst`, from entries.text, AND from the FTS index after a
+/// single `rescan --commit`. One survivor on any face is CRITICAL.
+#[test]
+fn rescan_break_all_gap_classes_double_face() {
+    let fx = Fixture::new("rescan-break-classes");
+    // (label, full raw secret that must vanish, an FTS search token).
+    let db_pw = "S3cr3tP@ssw0rd";
+    let db_url = "postgres://admin:S3cr3tP@ssw0rd@db.internal:5432/prod";
+    let bearer = "abcdefghijklmnopqrstuvwxyz012345";
+    let passwd = "SuperSecretDbPass123";
+    let basic = "dXNlcjpzdXBlcnNlY3JldHBhc3N3b3Jk";
+    let cases: [(&str, &str, &str); 6] = [
+        ("sk-proj", SK_PROJ_KEY, "EXAMPLEFAKEKEYNOTAREALSECRET000000"),
+        ("sk-cred", SK_CRED_BARE, "EXAMPLEFAKECREDENTIALNOTREAL0000"),
+        ("conn-string", db_pw, "S3cr3tP"),
+        ("bearer", bearer, bearer),
+        ("password-eq", passwd, passwd),
+        ("http-basic", basic, basic),
+    ];
+    fx.write_transcript(&[
+        user_line(&format!("my openai key {SK_PROJ_KEY} keep safe")),
+        user_line(&format!("service creds {SK_CRED_BARE} stored")),
+        user_line(&format!("connect {db_url} now")),
+        user_line(&format!("Authorization: Bearer {bearer}")),
+        user_line(&format!("config password={passwd} trailing")),
+        user_line(&format!("Authorization: Basic {basic}")),
+    ]);
+    assert!(fx.run(&["archive", "--all", "--no-scan"]).status.success());
+    assert!(fx.run(&["index"]).status.success());
+
+    // Precondition: gap left every class raw in the index.
+    for (label, secret, _) in &cases {
+        assert!(
+            fx.entries_text().iter().any(|t| t.contains(secret)),
+            "fixture did not index gap-class {label}"
+        );
+    }
+
+    let out = fx.run(&["rescan", "--commit", "--json"]);
+    assert_eq!(code(&out), 0, "rescan not clean: {out:?}");
+    assert_eq!(
+        json_last(&out)["verify_failures"].as_u64().unwrap(),
+        0,
+        "post-rescan verify reported a residual"
+    );
+
+    let texts = fx.entries_text();
+    for (label, secret, token) in &cases {
+        assert!(
+            !walk_contains(&archive_root(&fx), secret),
+            "CRITICAL: gap-class {label} survives in the store"
+        );
+        assert!(
+            !texts.iter().any(|t| t.contains(secret)),
+            "CRITICAL: gap-class {label} survives in entries.text"
+        );
+        assert_eq!(
+            search_count(&fx, token),
+            0,
+            "CRITICAL: gap-class {label} still searchable after rescan"
+        );
+    }
+    assert!(fx.run(&["verify", "--all"]).status.success());
+}
+
+/// [whole-quarantine FTS shadow] After a whole-quarantine transition the old raw
+/// index rows must be purged from the FTS shadow too, not merely from
+/// entries.text. Asserts an FTS MATCH for the raw secret returns nothing (the
+/// external-content delete trigger must have fired), closing the "entries.text
+/// clean but FTS still matches" leak.
+#[test]
+fn rescan_break_whole_quarantine_purges_fts_shadow() {
+    let fx = Fixture::new("rescan-break-wq-fts");
+    let escaped: String = FIXTURE_AKIA
+        .chars()
+        .map(|c| format!("\\u{:04x}", c as u32))
+        .collect();
+    let line = format!(
+        "{{\"type\":\"user\",\"timestamp\":\"2026-07-12T10:00:00.000Z\",\"message\":{{\"role\":\"user\",\"content\":\"key {escaped} end\"}}}}"
+    );
+    fx.write_transcript(&[line]);
+    assert!(fx.run(&["archive", "--all", "--no-scan"]).status.success());
+    assert!(fx.run(&["index"]).status.success());
+    // Gap: index decoded the \u form → raw AKIA is FTS-searchable pre-rescan.
+    assert!(
+        search_count(&fx, FIXTURE_AKIA) >= 1,
+        "fixture: raw secret not searchable before rescan"
+    );
+
+    let out = fx.run(&["rescan", "--commit", "--json"]);
+    assert_eq!(code(&out), 0, "{out:?}");
+    assert_eq!(
+        json_last(&out)["whole_quarantine_transitions"]
+            .as_u64()
+            .unwrap(),
+        1,
+        "expected a whole-quarantine transition"
+    );
+
+    // entries.text clean AND the FTS shadow purged.
+    for t in fx.entries_text() {
+        assert!(
+            !t.contains(FIXTURE_AKIA),
+            "raw secret survives in entries.text"
+        );
+    }
+    assert_eq!(
+        search_count(&fx, FIXTURE_AKIA),
+        0,
+        "CRITICAL: raw secret still FTS-searchable after whole-quarantine (shadow not purged)"
+    );
+}
+
+/// [multi-frame] A gap-era artifact grown across multiple stored frames (append
+/// under --no-scan) with the secret in an early frame. rescan collapses to a
+/// single re-redacted frame; the raw must vanish from store, index, and search,
+/// and verify must pass over the collapsed frame.
+#[test]
+fn rescan_break_multi_frame_secret_is_purged() {
+    let fx = Fixture::new("rescan-break-frames");
+    fx.write_transcript(&[user_line(&format!("early frame key {SK_PROJ_KEY} here"))]);
+    assert!(fx.run(&["archive", "--all", "--no-scan"]).status.success());
+    // Append → a second stored frame under the same artifact.
+    fx.append_transcript(&[user_line("a clean later turn about penguins")]);
+    assert!(fx.run(&["archive", "--all", "--no-scan"]).status.success());
+    assert!(fx.run(&["index"]).status.success());
+    assert!(
+        String::from_utf8_lossy(&read_store(&fx.transcript_store())).contains(SK_PROJ_KEY),
+        "fixture: multi-frame store lacks the raw key"
+    );
+
+    let out = fx.run(&["rescan", "--commit", "--json"]);
+    assert_eq!(code(&out), 0, "{out:?}");
+    let s = String::from_utf8_lossy(&read_store(&fx.transcript_store())).to_string();
+    assert!(
+        !s.contains(SK_PROJ_KEY),
+        "CRITICAL: raw key survives across frames in store"
+    );
+    for t in fx.entries_text() {
+        assert!(
+            !t.contains(SK_PROJ_KEY),
+            "CRITICAL: raw key survives in index (multi-frame)"
+        );
+    }
+    assert_eq!(
+        search_count(&fx, SK_PROJ_KEY),
+        0,
+        "CRITICAL: raw key searchable (multi-frame)"
+    );
+    assert!(
+        fx.run(&["verify", "--all"]).status.success(),
+        "verify failed on collapsed frame"
+    );
+}
+
+/// [bound] An *inline* (non-leading) source-forged `‹REDACTED:…›` tag sitting
+/// next to a real gap-class secret does NOT shield it: `trust_existing_tags` only
+/// skips the forged-tag defang, the lexical redactor still runs over the full
+/// text, so the adjacent raw secret is redacted. This passes — it bounds the
+/// vulnerability to the *leading whole-quarantine marker skip* path
+/// (rescan_break_forged_quarantine_marker_shields_secret), not to trusted tags in
+/// general.
+#[test]
+fn rescan_break_inline_forged_tag_does_not_shield_adjacent_secret() {
+    let fx = Fixture::new("rescan-break-inline-forged");
+    let forged = "\u{2039}REDACTED:openai-key:deadbeef\u{203a}";
+    fx.write_transcript(&[user_line(&format!(
+        "audit {forged} but real key {SK_PROJ_KEY} follows"
+    ))]);
+    assert!(fx.run(&["archive", "--all", "--no-scan"]).status.success());
+    assert!(fx.run(&["index"]).status.success());
+    assert!(
+        fx.entries_text().iter().any(|t| t.contains(SK_PROJ_KEY)),
+        "fixture: real key not indexed"
+    );
+
+    let out = fx.run(&["rescan", "--commit", "--json"]);
+    assert_eq!(code(&out), 0, "{out:?}");
+    assert!(
+        json_last(&out)["reredacted"].as_u64().unwrap() >= 1,
+        "inline-forged artifact was not re-redacted (unexpectedly skipped)"
+    );
+    assert!(
+        !walk_contains(&archive_root(&fx), SK_PROJ_KEY),
+        "real secret adjacent to an inline forged tag survived in the store"
+    );
+    for t in fx.entries_text() {
+        assert!(
+            !t.contains(SK_PROJ_KEY),
+            "real secret survived in the index"
+        );
+    }
+    assert_eq!(
+        search_count(&fx, SK_PROJ_KEY),
+        0,
+        "real secret still searchable"
     );
 }

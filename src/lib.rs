@@ -7,6 +7,7 @@ pub mod gc;
 pub mod index;
 pub mod lock;
 pub mod model;
+pub mod rescan;
 pub mod scan;
 pub mod source;
 pub mod util;

@@ -177,16 +177,11 @@ fn index_artifact(
     let stored = decompress_all(&raw)
         .with_context(|| format!("decompress stored artifact {}", c.stored_path))?;
 
-    let docs = match index_mode_for_role(&c.role) {
-        IndexMode::PerEntry => {
-            let agent = agent_for_role(&archive_dir, c);
-            let (parsed, skipped) = parse::parse_transcript(&stored);
-            report.parse_skipped += skipped;
-            build_entry_docs(parsed, c, &agent)
-        }
-        IndexMode::SingleDoc => single_doc(&stored, c).into_iter().collect(),
-        IndexMode::Skip => return Ok(()),
-    };
+    if matches!(index_mode_for_role(&c.role), IndexMode::Skip) {
+        return Ok(());
+    }
+    let (docs, skipped) = docs_for_stored(&archive_dir, c, &stored);
+    report.parse_skipped += skipped;
 
     let doc_count = docs.len() as u64;
     cat.transaction(|| {
@@ -207,6 +202,28 @@ fn index_artifact(
     report.artifacts_indexed += 1;
     report.docs_written += doc_count;
     Ok(())
+}
+
+/// Build index docs from already-in-memory stored bytes, with no disk read of the
+/// stored artifact itself (the sibling subagent meta sidecar is still read for the
+/// `agent` facet). Extracted from [`index_artifact`] so `rescan` can index the
+/// in-memory re-redacted bytes *before* the stored file is swapped on disk — the
+/// ordering invariant that keeps every crash point free of an indexed raw secret.
+/// Returns the docs and the count of JSONL lines skipped as unparseable.
+pub fn docs_for_stored(
+    archive_dir: &Path,
+    c: &IndexCandidate,
+    stored: &[u8],
+) -> (Vec<IndexDoc>, u64) {
+    match index_mode_for_role(&c.role) {
+        IndexMode::PerEntry => {
+            let agent = agent_for_role(archive_dir, c);
+            let (parsed, skipped) = parse::parse_transcript(stored);
+            (build_entry_docs(parsed, c, &agent), skipped)
+        }
+        IndexMode::SingleDoc => (single_doc(stored, c).into_iter().collect(), 0),
+        IndexMode::Skip => (Vec::new(), 0),
+    }
 }
 
 fn build_entry_docs(

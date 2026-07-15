@@ -84,8 +84,10 @@ pub struct IndexCandidate {
     pub source_path: String,
     pub source_sha256: String,
     pub source_bytes: u64,
+    pub last_src_offset: u64,
     pub stored_path: String,
     pub redacted: bool,
+    pub quarantined: bool,
     pub project_slug: Option<String>,
     pub cwd: Option<String>,
     pub git_branch: Option<String>,
@@ -424,7 +426,8 @@ impl Catalog {
     pub fn index_candidates(&self) -> Result<Vec<IndexCandidate>> {
         let sql = format!(
             "SELECT a.id, a.session_uuid, a.role, a.source_path, a.source_sha256, a.source_bytes,
-                    a.stored_path, a.redacted, s.project_slug, s.cwd, s.git_branch, s.cc_version
+                    a.last_src_offset, a.stored_path, a.redacted, a.quarantined,
+                    s.project_slug, s.cwd, s.git_branch, s.cc_version
              FROM artifacts a LEFT JOIN sessions s ON s.uuid = a.session_uuid
              WHERE a.role IN ({INDEX_ROLES})
              ORDER BY a.id"
@@ -439,7 +442,8 @@ impl Catalog {
     pub fn index_candidates_for_session(&self, uuid: &str) -> Result<Vec<IndexCandidate>> {
         let sql = format!(
             "SELECT a.id, a.session_uuid, a.role, a.source_path, a.source_sha256, a.source_bytes,
-                    a.stored_path, a.redacted, s.project_slug, s.cwd, s.git_branch, s.cc_version
+                    a.last_src_offset, a.stored_path, a.redacted, a.quarantined,
+                    s.project_slug, s.cwd, s.git_branch, s.cc_version
              FROM artifacts a LEFT JOIN sessions s ON s.uuid = a.session_uuid
              WHERE a.role IN ({INDEX_ROLES}) AND a.session_uuid = ?1
              ORDER BY a.id"
@@ -459,12 +463,14 @@ impl Catalog {
             source_path: r.get(3)?,
             source_sha256: r.get(4)?,
             source_bytes: r.get::<_, i64>(5)? as u64,
-            stored_path: r.get(6)?,
-            redacted: r.get::<_, i64>(7)? != 0,
-            project_slug: r.get(8)?,
-            cwd: r.get(9)?,
-            git_branch: r.get(10)?,
-            cc_version: r.get(11)?,
+            last_src_offset: r.get::<_, i64>(6)? as u64,
+            stored_path: r.get(7)?,
+            redacted: r.get::<_, i64>(8)? != 0,
+            quarantined: r.get::<_, i64>(9)? != 0,
+            project_slug: r.get(10)?,
+            cwd: r.get(11)?,
+            git_branch: r.get(12)?,
+            cc_version: r.get(13)?,
         })
     }
 
@@ -501,6 +507,63 @@ impl Catalog {
         Ok(self
             .conn
             .execute("DELETE FROM entries WHERE artifact_id = ?1", [artifact_id])?)
+    }
+
+    /// Rescan-specific artifact update. Unlike [`upsert_artifact`] this LEAVES
+    /// `source_sha256` / `source_bytes` / `last_src_offset` / `stored_path` /
+    /// `session_uuid` / `role` intact (the source identity is a historical fact and
+    /// the store position never moves), and SETS `verified_at = now` because rescan
+    /// verifies the new stored copy inline. Keyed by primary id, not source_path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rescan_update_artifact(
+        &self,
+        id: i64,
+        stored_sha256: &str,
+        stored_bytes: u64,
+        content_sha256: &str,
+        redacted: bool,
+        quarantined: bool,
+    ) -> Result<()> {
+        let now = now_iso();
+        self.conn.execute(
+            "UPDATE artifacts SET
+                stored_sha256 = ?2, stored_bytes = ?3, content_sha256 = ?4,
+                redacted = ?5, quarantined = ?6, verified_at = ?7, updated_at = ?7
+             WHERE id = ?1",
+            rusqlite::params![
+                id,
+                stored_sha256,
+                stored_bytes as i64,
+                content_sha256,
+                redacted as i64,
+                quarantined as i64,
+                now,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Every indexed doc's text for one artifact — the residual-scan input for the
+    /// post-write verification that no raw secret survived re-redaction.
+    pub fn entries_text_for_artifact(&self, artifact_id: i64) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT text FROM entries WHERE artifact_id = ?1")?;
+        let rows = stmt
+            .query_map([artifact_id], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Count of index rows for one artifact, for the dry-run "rows affected"
+    /// preview without loading any text.
+    pub fn entries_count_for_artifact(&self, artifact_id: i64) -> Result<u64> {
+        let n = self.conn.query_row(
+            "SELECT COUNT(*) FROM entries WHERE artifact_id = ?1",
+            [artifact_id],
+            |r| r.get::<_, i64>(0),
+        )?;
+        Ok(n as u64)
     }
 
     pub fn delete_entries_for_session(&self, session_uuid: &str) -> Result<usize> {
