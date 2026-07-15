@@ -798,7 +798,7 @@ fn quarantine_rel(rel: &str) -> String {
 }
 
 /// Per-artifact scan tally for the manifest, so a merged summary folds cleanly.
-fn artifact_scan(scan: &crate::scan::ContentScan) -> crate::model::ArtifactScan {
+pub fn artifact_scan(scan: &crate::scan::ContentScan) -> crate::model::ArtifactScan {
     crate::model::ArtifactScan {
         findings: scan
             .findings
@@ -813,7 +813,7 @@ fn artifact_scan(scan: &crate::scan::ContentScan) -> crate::model::ArtifactScan 
 
 /// Fold every artifact's retained scan tally into the manifest summary, so an
 /// incremental run reflects the whole session, not just what it touched.
-fn summarize_records(records: &[ArtifactRecord]) -> SecretScanSummary {
+pub fn summarize_records(records: &[ArtifactRecord]) -> SecretScanSummary {
     let mut s = SecretScanSummary {
         scanned: true,
         ..Default::default()

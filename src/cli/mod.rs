@@ -2,6 +2,7 @@ mod archive;
 mod gc;
 mod index;
 mod read;
+mod rescan;
 mod search;
 mod status;
 
@@ -43,6 +44,8 @@ pub enum Command {
     Gc(gc::GcArgs),
     /// Build/update the full-text search index from the redacted store.
     Index(index::IndexArgs),
+    /// Retroactively re-redact stored artifacts against the hardened scanner (dry-run by default).
+    Rescan(rescan::RescanArgs),
     /// Full-text search the indexed session entries.
     Search(search::SearchArgs),
     /// Read a session's entries (or one entry) from the index or raw store.
@@ -80,6 +83,7 @@ pub fn run() -> Result<i32> {
         Command::Archive(args) => archive::run(&env, args, cli.json),
         Command::Gc(args) => gc::run(&env, args, cli.json),
         Command::Index(args) => index::run(&env, args, cli.json),
+        Command::Rescan(args) => rescan::run(&env, args, cli.json),
         Command::Search(args) => search::run(&env, args, cli.json),
         Command::Read(args) => read::run(&env, args, cli.json),
         Command::Status(args) => status::run_status(&env, args, cli.json),
