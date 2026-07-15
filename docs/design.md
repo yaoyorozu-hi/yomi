@@ -453,6 +453,74 @@ replacing that artifact's entries. `--reindex` drops and rebuilds all entries (a
 a tokenizer change). Built from the **redacted stored artifact**. Auto post-archive chaining is
 deferred to P5 `run --profile daily`.
 
+### Rescan — retroactive re-redaction (P3.5 remediation)
+
+`yomi rescan` re-redacts the **existing** store against the hardened scanner, remediating raw secrets
+that a pre-hardening scanner archived into two faces: the browsable stored `.zst` and the search
+index (`entries.text` + FTS). Because a source may already be wiped, the **stored content is the only
+input** — sources are never re-read. Dry-run is the default; `--commit` mutates under the WriteLock.
+
+- **Scan scope.** No scanner-rules-version is recorded on artifacts, so the run is a **full sweep** of
+  every browsable stored artifact (`index_candidates()` roles). Each is decompressed, re-scanned with
+  the hardened scanner, and targeted **iff the re-scan changes the stored bytes** (`scan.redacted !=
+  stored`). `--session` narrows the sweep. Scratch and subagent-meta stores are out of v1 scope
+  (neither is catalog-registered/indexed — not part of this index exposure surface; a separate
+  mechanism is follow-up).
+- **Invariant 1 — both faces cleaned.** A targeted artifact's raw secret is removed from the stored
+  copy AND the index; the post-write verify proves no residual on either face.
+- **Invariant 2 — `source_sha256` is immutable.** It is the original raw's historical hash and the
+  basis of the GC gate-2 (`live_sha == source_sha256`) and require-indexed gate. Rescan updates
+  `stored_sha256` / `content_sha256` / `verified_at` (via a dedicated `rescan_update_artifact`) but
+  never the source identity.
+- **Invariant 3 — forced re-index from in-memory bytes.** Because `source_sha256` is held constant,
+  the normal incremental index would *skip* the rescanned artifact (`indexed_source_sha256 ==
+  source_sha256`). Rescan therefore rebuilds the index itself, in its own transaction, from the
+  **in-memory** re-redacted bytes (`docs_for_stored`) — never from a disk re-read.
+- **Invariant 4 — DB-commit before stored-rename (crash-safety core).** Per artifact: in-memory
+  fail-closed idempotency gate → temp store write → **DB transaction commit** (index purge + reindex
+  from in-mem bytes + `index_state` + catalog + findings) → **atomic stored rename** → manifest. At
+  every crash point the index holds no raw secret; the worst case is a stored copy briefly left as
+  stale raw (owner-only, flagged by verify), which the next run re-targets and converges. The reverse
+  order would let a post-rename crash leave `stored == clean` so the artifact is no longer a target
+  while the index still carries the raw secret — a permanent leak.
+- **Invariant 5 — require-indexed gate preserved.** The forced re-index writes `index_state.
+  indexed_source_sha256 = source_sha256` (the unchanged value), so `require_indexed` GC keeps
+  permitting the delete of a rescanned source.
+- **scan layer — `trust_existing_tags`.** Re-scanning yomi's own stored output must NOT defang its
+  genuine `‹REDACTED:`/`‹QUARANTINED:` tags. `scan_content_with(ScanOpts{trust_existing_tags:true})`
+  skips only the forged-tag defang block. Soundness: archive-time scanning already defanged any
+  source-forged `‹`-tag, so a `‹`-tag surviving in stored content is necessarily a real redactor tag.
+  Archive callers keep the default (defang on).
+- **Three transitions.** `InPlaceRedact` (scannable, no HIGH → redact in place), `VisibleQuarantine`
+  (scannable + HIGH → redact in place, raw quarantined), `WholeQuarantine` (not fully scannable →
+  opaque marker stored, raw quarantined). A raw original is quarantined *before* any store/index
+  mutation so a failure there loses no recovery copy (the DB-commit-before-rename invariant is
+  unaffected). An already-whole-quarantined artifact is **skipped** — re-scanning a marker under a
+  JSONL role would re-quarantine it forever with a fresh tag. The skip requires **both** a strict
+  single-token stored shape (`‹QUARANTINED:…›` with no trailing content) **and** catalog provenance
+  (`quarantined = 1`, set by yomi, unforgeable by a source); a source-forged leading marker followed by
+  a real secret satisfies neither and is rescanned, so the trailing secret cannot shield itself.
+- **No secret in the report.** Dry-run / `--commit` / `--json` show only detector `kind × count`,
+  transition, sha8, and index-row counts — never placeholder contents, raw bytes, or secret values.
+
+**Known trade-offs.** A mixed-case whole-quarantine copy includes any prior placeholders (the true
+original was wiped); the findings row is replaced by the current re-scan's findings (a minor loss of
+old audit history — the stored placeholder remains the redaction evidence); a PerEntry role's
+whole-quarantine yields zero index docs (marker not separately searchable), identical to archive-time
+behavior. The dry-run plan lists an artifact as a target purely by its re-scan outcome; `--commit` may
+still skip that artifact at runtime (a residual-gate failure, a quarantine/temp-write/rename error) and
+record it under `failed` — so a previewed target is a best-effort forecast, not a guarantee.
+
+**Known limitation — gap-era forged tags.** The `trust_existing_tags` soundness argument (a surviving
+`‹`-tag is necessarily yomi's own) holds for P3-era stored content but is formally false for the
+gap-era population rescan exists to remediate: that era flagged a source-forged `‹REDACTED:`/
+`‹QUARANTINED:` token without defanging it, so such a token can persist un-defanged in gap-era stored
+content after rescan. This is **not a secret leak** — the lexical scan still redacts any real secret
+in the surrounding text, and the strict-shape + provenance skip guard prevents a forged leading marker
+from shielding a trailing secret — but a gap-era forged audit token may remain cosmetically in the
+stored copy. Removing it would require re-defanging, which rescan deliberately does not do (it would
+also mangle genuine tags).
+
 ---
 
 ## 7. mx codex absorption
@@ -489,6 +557,7 @@ yomi archive [--all | --session <uuid> | PATH] [--include transcript,subagents,t
 yomi gc      [--targets transcripts,scratch,mcp,empty-dirs,paste,snapshots] [--commit] [--min-age D]   # dry-run default
 yomi search  <query> [filters…]
 yomi index   [--reindex] [--session <uuid>]
+yomi rescan  [--commit] [--session <uuid>] [--fix-perms]                                                # dry-run default; retroactive re-redaction
 yomi read    <session-uuid> [--entry <uuid>] [--agents] [--grep P] [--human|--raw]
 yomi list    [--project P] [--since D] [--json]
 yomi status  [--secrets] [--unverified] [--storage]
