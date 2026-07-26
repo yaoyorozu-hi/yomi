@@ -9,6 +9,7 @@ use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use yomi::gc::safety::safe_unlink;
@@ -33,14 +34,21 @@ fn lpin(path: &Path) -> (u64, u64) {
     (md.dev(), md.ino())
 }
 
+/// Whether this process runs as uid 0, read off a file it just created — a new
+/// file takes its creator's effective uid. The permission-denial tests below are
+/// meaningless as root, which ignores directory write and search bits.
+///
+/// The earlier form probed by creating `/.yomi-root-probe`; in a root CI
+/// container that write actually succeeds, so the test suite littered the
+/// filesystem root to answer a question a local stat already answers.
 fn is_root() -> bool {
-    std::fs::metadata("/").map(|m| m.uid()).unwrap_or(1) == 0
-        && std::fs::File::create("/.yomi-root-probe")
-            .map(|_| {
-                let _ = std::fs::remove_file("/.yomi-root-probe");
-                true
-            })
-            .unwrap_or(false)
+    static ROOT: OnceLock<bool> = OnceLock::new();
+    *ROOT.get_or_init(|| {
+        let probe = tmp("uid-probe").join("p");
+        std::fs::write(&probe, b"").unwrap();
+        let uid = std::fs::metadata(&probe).unwrap().uid();
+        uid == 0
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -54,9 +62,13 @@ fn is_root() -> bool {
 #[test]
 fn p4u_pin_encoding_agrees_across_filesystems() {
     let mut bases: Vec<PathBuf> = vec![tmp("fs-tmp")];
-    // A second filesystem, if one is mounted, to exercise a distinct dev
-    // major/minor pair through the rustix statx -> makedev path.
-    for cand in ["/dev/shm", "."] {
+    // Further filesystems, where mounted, to exercise distinct dev major/minor
+    // pairs through the rustix statx -> makedev path. `CARGO_TARGET_TMPDIR` sits
+    // on whatever filesystem holds the build tree, which on CI is typically not
+    // the one backing /tmp. It replaces an earlier `.`, which scattered probe
+    // directories through the repository working copy and left them behind on
+    // any early panic — enough to dirty `git status` in CI.
+    for cand in ["/dev/shm", env!("CARGO_TARGET_TMPDIR")] {
         let p = Path::new(cand);
         if !p.is_dir() {
             continue;
@@ -118,20 +130,102 @@ fn p4u_toctou_same_name_new_inode_is_refused() {
     std::fs::write(&f, b"original\n").unwrap();
     let stale = pin(&f);
 
+    // Hold the pinned inode open under a second name before dropping the first.
+    // An inode is freed only when its link count reaches zero, so while
+    // `keepalive` exists the kernel CANNOT hand `stale`'s inode number to the
+    // file created below. Without this the swap is at the mercy of the
+    // filesystem's allocator: ext4 on a GitHub runner hands the just-freed inode
+    // straight back, the two inodes compare equal, and the test collapses before
+    // it ever reaches the assertion it exists to make.
+    let keep = base.join("keepalive");
+    std::fs::hard_link(&f, &keep).unwrap();
+
     // Attacker replaces the entry with a *different* inode under the same name.
     std::fs::remove_file(&f).unwrap();
+    assert_eq!(
+        pin(&keep),
+        stale,
+        "keepalive link does not hold the pinned inode; the swap below would not \
+         be guaranteed distinct"
+    );
     std::fs::write(&f, b"attacker\n").unwrap();
     let fresh = pin(&f);
     assert_ne!(
-        stale, fresh,
-        "inode was reused; retry-resistant setup failed"
+        stale,
+        fresh,
+        "the pinned inode was reused despite still being linked at {}",
+        keep.display()
     );
 
+    // The pin refers to an inode that is still very much alive — just not at
+    // this name. `safe_unlink` statats the NAME and compares, so where the
+    // pinned inode currently lives is irrelevant to the decision.
     assert!(
         !safe_unlink(&f, stale).unwrap(),
         "same-name/new-inode swap was deleted — inode pin is not effective"
     );
     assert_eq!(std::fs::read(&f).unwrap(), b"attacker\n");
+    assert!(
+        keep.exists(),
+        "safe_unlink removed a different link to the pinned inode"
+    );
+    assert_eq!(std::fs::read(&keep).unwrap(), b"original\n");
+}
+
+/// The invariant the test above relies on, pinned explicitly: `safe_unlink`
+/// statats the NAME and compares the result to `pinned`. Whether the pinned
+/// inode is still linked somewhere else is never consulted, so holding it alive
+/// with a keepalive hardlink cannot change any verdict — it only removes the
+/// filesystem allocator from the setup.
+///
+/// Both arms must agree, for a matching pin and a drifted one alike.
+#[test]
+fn p4u_pin_liveness_elsewhere_does_not_change_the_verdict() {
+    // Arm A: pinned inode kept alive at a second name.
+    let a = tmp("live-pin");
+    let fa = a.join("f");
+    std::fs::write(&fa, b"original\n").unwrap();
+    let pa = pin(&fa);
+    std::fs::hard_link(&fa, a.join("keep")).unwrap();
+    std::fs::remove_file(&fa).unwrap();
+    std::fs::write(&fa, b"attacker\n").unwrap();
+    let drift_live = safe_unlink(&fa, pa).unwrap();
+    let match_live = safe_unlink(&fa, pin(&fa)).unwrap();
+
+    // Arm B: pinned inode allowed to die.
+    let b = tmp("dead-pin");
+    let fb = b.join("f");
+    std::fs::write(&fb, b"original\n").unwrap();
+    let pb = pin(&fb);
+    std::fs::remove_file(&fb).unwrap();
+    std::fs::write(&fb, b"attacker\n").unwrap();
+    let drift_dead = if pin(&fb) == pb {
+        // The allocator handed the number straight back, so this is not a drift
+        // case at all; skip the comparison rather than assert a false one.
+        None
+    } else {
+        Some(safe_unlink(&fb, pb).unwrap())
+    };
+    let match_dead = safe_unlink(&fb, pin(&fb)).unwrap();
+
+    assert!(!drift_live, "a drifted pin was accepted while kept alive");
+    if let Some(d) = drift_dead {
+        assert_eq!(
+            drift_live, d,
+            "safe_unlink's drift verdict depends on whether the pinned inode is \
+             still linked elsewhere"
+        );
+    }
+    assert!(match_live, "a matching pin was refused while kept alive");
+    assert_eq!(
+        match_live, match_dead,
+        "safe_unlink's match verdict depends on whether the pinned inode is \
+         still linked elsewhere"
+    );
+    assert!(
+        a.join("keep").exists(),
+        "the keepalive link was removed by an unlink aimed at another name"
+    );
 }
 
 #[test]
@@ -244,7 +338,7 @@ fn p4u_directory_target_is_never_removed() {
 }
 
 #[test]
-fn p4u_fifo_and_empty_file_boundaries() {
+fn p4u_empty_file_and_deep_nesting_boundaries() {
     let base = tmp("kinds");
     let empty = base.join("empty");
     std::fs::write(&empty, b"").unwrap();
@@ -298,9 +392,17 @@ fn p4u_many_hardlinks_only_named_link_goes() {
     for l in &links {
         std::fs::hard_link(&a, l).unwrap();
     }
-    assert_eq!(std::fs::metadata(&a).unwrap().nlink(), 65);
+    // Relative, not absolute: what matters is that exactly one link goes, and
+    // some filesystems (overlayfs after a copy-up) do not report the link count
+    // a fresh ext4 inode would.
+    let before = std::fs::metadata(&a).unwrap().nlink();
+    assert!(before > 1, "hardlinks were not created (nlink {before})");
     assert!(safe_unlink(&links[0], pin(&a)).unwrap());
-    assert_eq!(std::fs::metadata(&a).unwrap().nlink(), 64);
+    assert_eq!(
+        std::fs::metadata(&a).unwrap().nlink(),
+        before - 1,
+        "safe_unlink removed more than the one named link"
+    );
     for l in &links[1..] {
         assert!(l.exists());
     }
@@ -317,7 +419,11 @@ fn p4u_non_utf8_filename_roundtrips() {
     // Invalid UTF-8 (lone continuation byte + a raw 0xff).
     let name = OsStr::from_bytes(b"bad-\xff\x80-name.jsonl");
     let f = base.join(name);
-    std::fs::write(&f, b"x").unwrap();
+    if std::fs::write(&f, b"x").is_err() {
+        // Some filesystems (CIFS, and some FUSE mounts) reject non-UTF-8 names
+        // outright. Nothing to assert about the delete primitive there.
+        return;
+    }
     assert!(f.to_str().is_none(), "fixture is not actually non-UTF-8");
 
     assert!(

@@ -158,13 +158,23 @@ fn set_tree_mtime_days(root: &Path, days: u64) {
     }
 }
 
+/// Whether this process runs as uid 0, read off a file it just created — a new
+/// file takes its creator's effective uid. The chmod-based denial tests below
+/// are meaningless as root, which ignores directory write bits.
+///
+/// The earlier form probed by creating `/.yomi-p4g-root-probe`; in a root CI
+/// container that write actually succeeds, so the suite wrote into the
+/// filesystem root to answer a question a local stat already answers.
 fn is_root() -> bool {
-    std::fs::File::create("/.yomi-p4g-root-probe")
-        .map(|_| {
-            let _ = std::fs::remove_file("/.yomi-p4g-root-probe");
-            true
-        })
-        .unwrap_or(false)
+    static ROOT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ROOT.get_or_init(|| {
+        use std::os::unix::fs::MetadataExt;
+        let probe = std::env::temp_dir().join(format!("yomi-p4g-uid-{}", std::process::id()));
+        std::fs::write(&probe, b"").unwrap();
+        let uid = std::fs::metadata(&probe).unwrap().uid();
+        let _ = std::fs::remove_file(&probe);
+        uid == 0
+    })
 }
 
 /// Deletable count from a dry-run plan, so a fixture that produces no candidate
@@ -354,11 +364,25 @@ fn shell_quote(s: &str) -> String {
 // C. The write lock under real concurrency and hostile lock paths.
 // ---------------------------------------------------------------------------
 
-/// Four `gc --commit` processes launched at once. At most one may do the delete;
-/// the rest must refuse with EXIT_REFUSED(3). Nobody may crash, and the source
-/// must be deleted at most once.
+/// Four `gc --commit` processes launched at once against one store. The
+/// properties asserted here hold under EVERY interleaving, including full
+/// serialization: nobody crashes, every source is reclaimed, and each is
+/// reclaimed exactly once.
+///
+/// Mutual exclusion is asserted as "at most one process reported reclaiming
+/// anything", not as "three of the four exited REFUSED". The latter is a
+/// statement about the scheduler: nothing forbids the four from running strictly
+/// back to back, each taking an uncontended lock, the first reclaiming all six
+/// and the rest finding an empty plan and also exiting OK. That is correct
+/// behaviour that the exit-code form would report as a lock failure. Counting
+/// reported deletions says the same thing about the lock without depending on
+/// overlap ever happening.
+///
+/// (Measured: even pinned to a single CPU, three of four did observe contention
+/// in 6/6 trials here — the exit-code form was not seen to fail. It is dropped
+/// as unsound in principle, not as an observed flake.)
 #[test]
-fn p4g_concurrent_commits_serialize() {
+fn p4g_concurrent_commits_never_double_delete() {
     let fx = Fx::new("concurrent");
     let uuids: Vec<String> = (0..6)
         .map(|i| format!("cccccccc-bbbb-cccc-dddd-00000000000{i}"))
@@ -373,8 +397,8 @@ fn p4g_concurrent_commits_serialize() {
 
     let mut children: Vec<_> = (0..4)
         .map(|_| {
-            fx.command(&["gc", "--targets", "transcripts", "--commit"])
-                .stdout(std::process::Stdio::null())
+            fx.command(&["gc", "--targets", "transcripts", "--commit", "--json"])
+                .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .spawn()
                 .expect("spawn gc")
@@ -394,19 +418,58 @@ fn p4g_concurrent_commits_serialize() {
             stderr(o).trim()
         );
     }
+    // Mutual exclusion, stated without reference to the scheduler: a process
+    // that refused reports nothing; at most one may report reclaiming anything,
+    // and between them they must account for all six exactly once.
+    let reported: Vec<u64> = outs
+        .iter()
+        .map(|o| {
+            serde_json::from_str::<serde_json::Value>(String::from_utf8_lossy(&o.stdout).trim())
+                .ok()
+                .and_then(|v| v["deleted"].as_u64())
+                .unwrap_or(0)
+        })
+        .collect();
     assert!(
-        codes.iter().filter(|c| **c != 3).count() <= 1,
-        "more than one concurrent `gc --commit` got past the write lock: {codes:?}"
+        reported.iter().filter(|n| **n > 0).count() <= 1,
+        "more than one concurrent `gc --commit` reclaimed sources: {reported:?} \
+         (exit codes {codes:?}) — the write lock did not serialize them"
     );
-    let deletes = fx
+    assert_eq!(
+        reported.iter().sum::<u64>(),
+        6,
+        "the four processes together reclaimed {:?}, expected 6 in total \
+         (exit codes {codes:?})",
+        reported
+    );
+
+    // Every source reclaimed, none left behind.
+    for u in &uuids {
+        assert!(
+            !fx.transcript(u).exists(),
+            "{u} survived four concurrent commits (exit codes {codes:?})"
+        );
+    }
+    // And each reclaimed exactly once. A second process re-deleting a source
+    // already gone — or double-counting one — shows up here as a 7th record.
+    let deletes: Vec<String> = fx
         .gc_log()
         .iter()
         .filter(|l| l["action"] == "delete")
-        .count();
+        .map(|l| l["source"].as_str().unwrap_or_default().to_string())
+        .collect();
     assert_eq!(
-        deletes, 6,
-        "expected exactly 6 delete records from the single winner, got {deletes} \
-         (exit codes {codes:?})"
+        deletes.len(),
+        6,
+        "expected exactly 6 delete records across all four processes, got {} \
+         (exit codes {codes:?})",
+        deletes.len()
+    );
+    let unique: std::collections::HashSet<&String> = deletes.iter().collect();
+    assert_eq!(
+        unique.len(),
+        6,
+        "a source was recorded as deleted more than once: {deletes:?}"
     );
 }
 
