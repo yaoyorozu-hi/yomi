@@ -481,19 +481,36 @@ pub fn commit(
                     evaluate_candidate(env, cfg, cat, bl, &item.candidate, &active, min_age)?;
                 match verdict {
                     Verdict::Delete { archive_id, checks } => {
-                        if perform_delete(bl, &item.candidate)? {
-                            report.deleted += 1;
-                            report.reclaimed_bytes += bytes;
-                            log.delete(
-                                &item.candidate,
-                                archive_id,
-                                &checks,
-                                cfg.require_indexed,
-                                bytes,
-                            )?;
-                        } else {
-                            report.flipped_unverified += 1;
-                            log.skip(&item.candidate.source, "InodeDriftOrBlacklist")?;
+                        // A delete that fails (EACCES on the parent, EIO, …) must
+                        // not end the run: every later candidate would go
+                        // unevaluated, unlinked and — worse — unrecorded, leaving
+                        // a silently truncated audit trail. One undeletable file
+                        // is a skip like any other, and makes the run partial.
+                        match perform_delete(bl, &item.candidate) {
+                            Ok(true) => {
+                                report.deleted += 1;
+                                report.reclaimed_bytes += bytes;
+                                log.delete(
+                                    &item.candidate,
+                                    archive_id,
+                                    &checks,
+                                    cfg.require_indexed,
+                                    bytes,
+                                )?;
+                            }
+                            Ok(false) => {
+                                report.flipped_unverified += 1;
+                                log.skip(&item.candidate.source, "InodeDriftOrBlacklist")?;
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    path = %item.candidate.source.display(),
+                                    error = %e,
+                                    "delete failed; candidate skipped, run continues"
+                                );
+                                report.flipped_unverified += 1;
+                                log.delete_failed(&item.candidate.source, &e.to_string())?;
+                            }
                         }
                     }
                     Verdict::Unverified { reason } => {
@@ -520,10 +537,10 @@ pub fn commit(
 /// Perform the physical delete for a re-verified candidate. Returns whether the
 /// candidate was actually removed.
 fn perform_delete(bl: &Blacklist, cand: &Candidate) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
     match cand.kind {
         CandidateKind::File => {
             use crate::blacklist::GuardOutcome;
-            use std::os::unix::fs::MetadataExt;
             match bl.open_guarded(&cand.source)? {
                 GuardOutcome::Opened(file, md) => {
                     // Hold the guarded fd open across the unlink so the pinned
@@ -540,7 +557,13 @@ fn perform_delete(bl: &Blacklist, cand: &Candidate) -> Result<bool> {
             safety::remove_tree_guarded(bl, &cand.source)?,
             safety::TreeRemoval::Removed
         )),
-        CandidateKind::EmptyDir => Ok(std::fs::remove_dir(&cand.source).is_ok()),
+        // `symlink_metadata` so a name that became a symlink is never pinned as
+        // the directory it points at; `safe_rmdir` then re-checks that same
+        // (dev,ino) through a pinned parent fd before removing.
+        CandidateKind::EmptyDir => match std::fs::symlink_metadata(&cand.source) {
+            Ok(md) if md.is_dir() => safety::safe_rmdir(&cand.source, (md.dev(), md.ino())),
+            _ => Ok(false),
+        },
     }
 }
 
@@ -588,6 +611,16 @@ impl GcLog {
         self.write(&serde_json::json!({
             "ts": now_iso(), "action": "skip",
             "source": source.to_string_lossy(), "reason": reason,
+        }))
+    }
+
+    /// A candidate that passed every gate but whose physical delete failed. The
+    /// errno is carried in its own field so the reason stays machine-readable.
+    fn delete_failed(&mut self, source: &Path, error: &str) -> Result<()> {
+        self.write(&serde_json::json!({
+            "ts": now_iso(), "action": "skip",
+            "source": source.to_string_lossy(), "reason": "DeleteFailed",
+            "error": error,
         }))
     }
 

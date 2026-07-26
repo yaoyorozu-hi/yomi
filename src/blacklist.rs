@@ -37,7 +37,14 @@ impl Blacklist {
     /// Build the denylist, anchoring `~`-relative entries to the real `$HOME`
     /// and folding in any config-supplied additions.
     pub fn compile(extra: &[String]) -> Result<Self> {
-        let home = home_dir()?;
+        Self::compile_with_home(&home_dir()?, extra)
+    }
+
+    /// [`Self::compile`] against an explicit home. Callers (and tests) that need
+    /// the denylist anchored somewhere other than `$HOME` use this instead of
+    /// mutating the process-global environment, which races every other thread
+    /// reading it.
+    pub fn compile_with_home(home: &Path, extra: &[String]) -> Result<Self> {
         let home = home.to_string_lossy();
 
         let base = [
@@ -157,57 +164,35 @@ impl Blacklist {
 mod tests {
     use super::*;
 
-    fn with_home<T>(dir: &Path, f: impl FnOnce() -> T) -> T {
-        // Tests run single-threaded via `--test-threads` is not assumed; each
-        // asserts against an explicit home, so set and restore around the call.
-        let prev = std::env::var_os("HOME");
-        // SAFETY: test-only, serialized by the blacklist test module.
-        unsafe { std::env::set_var("HOME", dir) };
-        let out = f();
-        // SAFETY: restore prior value.
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-        }
-        out
-    }
-
     #[test]
     fn denies_credentials_and_config() {
         let home = std::path::PathBuf::from("/home/tester");
-        with_home(&home, || {
-            let bl = Blacklist::compile(&[]).unwrap();
-            assert!(bl.is_blacklisted(&home.join(".claude/.credentials.json")));
-            assert!(bl.is_blacklisted(&home.join(".claude.json")));
-            assert!(bl.is_blacklisted(&home.join(".claude/backups/.claude.json.backup.123")));
-            assert!(bl.is_blacklisted(&home.join(".claude/mcp-needs-auth-cache.json")));
-            assert!(bl.is_blacklisted(&home.join(".zaibatsu/memory/anything")));
-            assert!(bl.is_blacklisted(&home.join(".local/share/claude/versions/2.1.207/x")));
-            assert!(bl.is_blacklisted(&home.join(".local/state/claude/locks/a.lock")));
-        });
+        let bl = Blacklist::compile_with_home(&home, &[]).unwrap();
+        assert!(bl.is_blacklisted(&home.join(".claude/.credentials.json")));
+        assert!(bl.is_blacklisted(&home.join(".claude.json")));
+        assert!(bl.is_blacklisted(&home.join(".claude/backups/.claude.json.backup.123")));
+        assert!(bl.is_blacklisted(&home.join(".claude/mcp-needs-auth-cache.json")));
+        assert!(bl.is_blacklisted(&home.join(".zaibatsu/memory/anything")));
+        assert!(bl.is_blacklisted(&home.join(".local/share/claude/versions/2.1.207/x")));
+        assert!(bl.is_blacklisted(&home.join(".local/state/claude/locks/a.lock")));
     }
 
     #[test]
     fn permits_transcripts() {
         let home = std::path::PathBuf::from("/home/tester");
-        with_home(&home, || {
-            let bl = Blacklist::compile(&[]).unwrap();
-            assert!(!bl.is_blacklisted(&home.join(".claude/projects/-home/uuid.jsonl")));
-            assert!(!bl.is_blacklisted(&home.join(".claude/history.jsonl")));
-        });
+        let bl = Blacklist::compile_with_home(&home, &[]).unwrap();
+        assert!(!bl.is_blacklisted(&home.join(".claude/projects/-home/uuid.jsonl")));
+        assert!(!bl.is_blacklisted(&home.join(".claude/history.jsonl")));
     }
 
     #[test]
     fn config_can_add_not_remove() {
         let home = std::path::PathBuf::from("/home/tester");
-        with_home(&home, || {
-            let bl = Blacklist::compile(&["~/.claude/secret-notes/**".into()]).unwrap();
-            assert!(bl.is_blacklisted(&home.join(".claude/secret-notes/a.txt")));
-            // base entries still enforced
-            assert!(bl.is_blacklisted(&home.join(".claude/.credentials.json")));
-        });
+        let bl =
+            Blacklist::compile_with_home(&home, &["~/.claude/secret-notes/**".into()]).unwrap();
+        assert!(bl.is_blacklisted(&home.join(".claude/secret-notes/a.txt")));
+        // base entries still enforced
+        assert!(bl.is_blacklisted(&home.join(".claude/.credentials.json")));
     }
 
     #[test]
@@ -222,27 +207,25 @@ mod tests {
         std::fs::create_dir_all(link.parent().unwrap()).unwrap();
         std::fs::hard_link(&cred, &link).unwrap();
 
-        with_home(&tmp, || {
-            let bl = Blacklist::compile(&[]).unwrap();
-            assert!(bl.is_blacklisted(&cred), "path glob failed");
-            assert!(
-                bl.is_blacklisted(&link),
-                "hardlink to credentials bypassed the denylist"
-            );
-            // A distinct file at the same kind of path is still allowed.
-            let benign = tmp.join(".claude/projects/-x/real.jsonl");
-            std::fs::write(&benign, b"{}").unwrap();
-            assert!(!bl.is_blacklisted(&benign));
+        let bl = Blacklist::compile_with_home(&tmp, &[]).unwrap();
+        assert!(bl.is_blacklisted(&cred), "path glob failed");
+        assert!(
+            bl.is_blacklisted(&link),
+            "hardlink to credentials bypassed the denylist"
+        );
+        // A distinct file at the same kind of path is still allowed.
+        let benign = tmp.join(".claude/projects/-x/real.jsonl");
+        std::fs::write(&benign, b"{}").unwrap();
+        assert!(!bl.is_blacklisted(&benign));
 
-            // TOCTOU: a hardlink created *after* the Blacklist was built is still
-            // caught, because credential paths are re-stat'd live per check (B4).
-            let late = tmp.join(".claude/projects/-x/late.jsonl");
-            std::fs::hard_link(&cred, &late).unwrap();
-            assert!(
-                bl.is_blacklisted(&late),
-                "post-compile hardlink to credentials bypassed the denylist"
-            );
-        });
+        // TOCTOU: a hardlink created *after* the Blacklist was built is still
+        // caught, because credential paths are re-stat'd live per check (B4).
+        let late = tmp.join(".claude/projects/-x/late.jsonl");
+        std::fs::hard_link(&cred, &late).unwrap();
+        assert!(
+            bl.is_blacklisted(&late),
+            "post-compile hardlink to credentials bypassed the denylist"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

@@ -12,6 +12,8 @@ use crate::gc::{PassedChecks, ProtectReason, SkipReason, Verdict, policy};
 use anyhow::Result;
 use serde::Deserialize;
 use std::collections::HashSet;
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -318,30 +320,62 @@ pub fn evaluate_empty_dir(
 /// `fstatat` the entry to confirm it is still the exact `(dev,ino)` the gate
 /// pinned, then `unlinkat`. This pins both the directory and the entry, closing
 /// the symlinked-parent race a path-based `remove_file` leaves open. Returns
-/// `Ok(false)` (without deleting) if the inode drifted since the gate.
+/// `Ok(false)` (without deleting) if the inode drifted since the gate, or if the
+/// entry was already gone by the time `unlinkat` ran.
 pub fn safe_unlink(path: &Path, pinned: (u64, u64)) -> Result<bool> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("/"));
-    let name = match path.file_name() {
-        Some(n) => n,
-        None => return Ok(false),
-    };
-    let dir = match std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
-        .open(parent)
-    {
-        Ok(d) => d,
-        Err(_) => return Ok(false),
-    };
-    let st = match rustix::fs::statat(&dir, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW) {
-        Ok(st) => st,
-        Err(_) => return Ok(false),
-    };
-    if (st.st_dev, st.st_ino) != pinned {
+    let Some((dir, name)) = pin_entry(path, pinned) else {
         return Ok(false);
+    };
+    remove_at(&dir, name, path, rustix::fs::AtFlags::empty())
+}
+
+/// Remove an empty directory under the same guarantees as [`safe_unlink`]:
+/// parent fd pinned `O_DIRECTORY|O_NOFOLLOW`, entry re-`fstatat`ed against the
+/// pinned `(dev,ino)`, then `unlinkat(AT_REMOVEDIR)`. A path-based `remove_dir`
+/// left the swapped-parent window open that `safe_unlink` closes, so the commit
+/// loop ran two delete primitives under two different threat models.
+pub fn safe_rmdir(path: &Path, pinned: (u64, u64)) -> Result<bool> {
+    let Some((dir, name)) = pin_entry(path, pinned) else {
+        return Ok(false);
+    };
+    remove_at(&dir, name, path, rustix::fs::AtFlags::REMOVEDIR)
+}
+
+/// Open the entry's parent `O_DIRECTORY|O_NOFOLLOW` and prove `name` under it
+/// still resolves to `pinned`. `None` means anything drifted — refuse, never
+/// delete.
+fn pin_entry(path: &Path, pinned: (u64, u64)) -> Option<(std::fs::File, &OsStr)> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("/"));
+    let name = path.file_name()?;
+    let flags = rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::NOFOLLOW;
+    let dir = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(flags.bits() as i32)
+        .open(parent)
+        .ok()?;
+    let st = rustix::fs::statat(&dir, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW).ok()?;
+    if (st.st_dev, st.st_ino) != pinned {
+        return None;
     }
-    match rustix::fs::unlinkat(&dir, name, rustix::fs::AtFlags::empty()) {
+    Some((dir, name))
+}
+
+fn remove_at(
+    dir: &std::fs::File,
+    name: &OsStr,
+    path: &Path,
+    flags: rustix::fs::AtFlags,
+) -> Result<bool> {
+    use rustix::io::Errno;
+    match rustix::fs::unlinkat(dir, name, flags) {
         Ok(()) => Ok(true),
+        // The candidate is simply no longer deletable, which is not a failure:
+        // ENOENT means a racer (or Claude Code itself) already removed the entry
+        // between the statat and here — the delete happened, it just was not us —
+        // and ENOTEMPTY means an empty-dir candidate refilled. Both are refusals.
+        // Every other errno is a genuine failure and is surfaced to the caller,
+        // which records it and moves to the next candidate.
+        Err(e) if e == Errno::NOENT || e == Errno::NOTEMPTY => Ok(false),
         Err(e) => Err(anyhow::anyhow!("unlinkat {} failed: {}", path.display(), e)),
     }
 }
@@ -444,20 +478,25 @@ fn verify_scratch_tree(
     store_dir: &Path,
     mf: &ScratchManifestRead,
 ) -> Option<SkipReason> {
-    let by_path: std::collections::HashMap<&str, &ScratchManifestEntry> =
-        mf.entries.iter().map(|e| (e.path.as_str(), e)).collect();
+    // Keyed by raw bytes, never by `to_string_lossy()`: two distinct non-UTF-8
+    // filenames both decode to the same `U+FFFD` string, so a lossy key let an
+    // UNARCHIVED file inherit an archived sibling's manifest entry and authorize
+    // the whole-tree delete. A name the manifest cannot represent losslessly now
+    // simply matches nothing, and the tree is refused (safe side).
+    let by_path: std::collections::HashMap<&[u8], &ScratchManifestEntry> =
+        mf.entries.iter().map(|e| (e.path.as_bytes(), e)).collect();
 
     for entry in WalkDir::new(session_dir).into_iter().filter_map(|e| e.ok()) {
         if !entry.file_type().is_file() {
             continue;
         }
         let rel = match entry.path().strip_prefix(session_dir) {
-            Ok(r) => r.to_string_lossy().replace('\\', "/"),
+            Ok(r) => r,
             Err(_) => return Some(SkipReason::NoCatalogRow),
         };
         // (1) A live file absent from the manifest is unarchived data (created
         // after the last archive) — refuse the whole-tree delete.
-        let Some(e) = by_path.get(rel.as_str()) else {
+        let Some(e) = by_path.get(rel.as_os_str().as_bytes()) else {
             return Some(SkipReason::NoCatalogRow);
         };
         let Ok(md) = entry.metadata() else {
@@ -557,17 +596,7 @@ mod tests {
 
         // Compile the denylist against the fake HOME (credential inode captured);
         // the check itself re-stats stored absolute paths, not HOME.
-        let prev = std::env::var_os("HOME");
-        // SAFETY: test-only; restored immediately after compile.
-        unsafe { std::env::set_var("HOME", &fake_home) };
-        let bl = crate::blacklist::Blacklist::compile(&[]).unwrap();
-        // SAFETY: restore prior value.
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-        }
+        let bl = crate::blacklist::Blacklist::compile_with_home(&fake_home, &[]).unwrap();
 
         let outcome = remove_tree_guarded(&bl, &tree).unwrap();
         assert!(

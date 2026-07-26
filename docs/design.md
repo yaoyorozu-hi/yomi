@@ -42,8 +42,9 @@ pillars — **archive**, **wipe**, **index/search** — plus **codex absorption*
 | `catalog` | SQLite registry: sessions, artifacts, checksums, archive+index status, gc audit |
 | `index` | search index (SQLite FTS5 v1, `Index` trait, tantivy = future) + query |
 | `gc` | archive-verify-then-delete, live-session guard, age policy, /tmp + empty-dir janitor |
-| `importer` | ingest codex / wonka archives (idempotent) |
-| `lock` | single-writer advisory lock |
+| `rescan` | retroactive re-redaction of the existing store against the hardened scanner (P3.5) |
+| `importer` | ingest codex / wonka archives (idempotent) — **P4, not yet built** |
+| `lock` | single-writer advisory lock, dual-anchor (lock file + store directory) — §4 |
 
 ---
 
@@ -80,12 +81,15 @@ Rejected `~/.zaibatsu/memory/vol/yomi/`. Rationale:
     _paste/<name>.txt.zst          # paste-cache
     _scratch/<slug--uuid>/         # scratch: manifest.json (every file) + allow-listed stored files
   quarantine/<session-uuid>/<rel>  # mode 700 — unredacted originals, keyed by artifact rel-path; NOT indexed
-  index/                           # FTS5 db (or tantivy dir) — P4
+                                   # (no `index/` directory: the shipped FTS5 index lives
+                                   #  inside state/catalog.db — §6. A tantivy upgrade would
+                                   #  add index/ here.)
   state/
     catalog.db                     # SQLite (mode 600) — sessions, artifacts, findings
-    gc.log                         # append-only wipe audit (P2)
+  gc.log                           # append-only wipe audit (P2), mode 600 — at the store root
   config.toml                      # mode 600
-  .yomi.lock                       # advisory single-writer lock
+  .yomi.lock                       # advisory single-writer lock — first anchor; the store
+                                   # directory itself is the second (§4 Single-writer lock)
 ```
 
 **P1 layout notes (reconciled to implementation):**
@@ -138,7 +142,9 @@ Transcripts append-only → two-level idempotency:
    - source `sha` unchanged → **skip** (no-op).
    - source grew, first `last_src_offset` bytes hash-match prior → capture **tail only**, append a
      new **zstd frame** (zstd reads concatenated frames transparently), update offset. O(delta) write.
-   - prefix diverged (rewrite/rotation) → re-capture whole, new version, keep prior under `.v<n>`.
+   - prefix diverged (rewrite/rotation) → re-capture whole, overwriting the store in place
+     (atomic temp-write + rename). **No `.v<n>` rotation in P1** — see the P1 layout notes above;
+     catalog-tracked versioning is deferred to P3.
 2. **Content-addressed.** `tool-results/*.txt` are already hash-named → dedup by hash across increments.
 
 Frame proliferation hurts ratio slightly; **compaction** (rewrite to single frame) runs opportunistically during GC.
@@ -158,8 +164,8 @@ Frame proliferation hurts ratio slightly; **compaction** (rewrite to single fram
 | `~/.cache/claude-cli-nodejs/**/mcp-logs-*/*.jsonl` | yes | → `_mcp/`; LOW-MED |
 | `shell-snapshots/*.sh` | yes | → `_snapshots/`; **secret scan mandatory** (env dump) |
 | `paste-cache/*.txt` | yes | MEDIUM |
-| `/tmp/claude-1007/<slug>/<uuid>/scratchpad/**` | **manifest-only default** | see below |
-| `/tmp/claude-1007/<slug>/<uuid>/tasks/*.output` | yes | small task output |
+| `/tmp/claude-1007/<slug>/<uuid>/scratchpad/**` | manifest **+ allowlist-under-cap store** | decision #4; see below |
+| `/tmp/claude-1007/<slug>/<uuid>/tasks/*.output` | yes | small task output — **only the `.output` extension is enumerated** |
 | `~/.local/share/claude/versions/` (248M) | **never** | runtime binary — not session data |
 | `.credentials.json`, `.claude.json`(+backups), `mcp-needs-auth-cache.json` | **never** | hard blacklist §4 |
 | `~/.zaibatsu/**` | **never** | 既管理 |
@@ -180,6 +186,30 @@ total_cap = "20MB"   # whole scratch over cap → manifest-only + flag
 
 The 134M cloned repo → excluded by `deny` + `total_cap`, but its existence is recorded in the scratch
 manifest. Nothing about it is lost except bytes we deliberately declined to hoard.
+
+**Scratch path identity is byte-valued, and three layers must agree on it.** The manifest is the only
+gate authorizing a whole-tree delete (§5), so the *writer* (what gets manifested), the *reader* (what
+the GC gate walks) and the *deleter* (what `remove_dir_all` removes) must enumerate the same set and
+key it the same way. They do not yet, and the gaps are recorded here rather than assumed away:
+
+- **Enumeration.** The writer walks `scratchpad/**` plus `tasks/*.output`; the reader walks the entire
+  `<slug>/<uuid>/` tree; the deleter removes the entire tree. Any file outside those two sets — a
+  `tasks/notes.txt`, anything dropped directly in `<uuid>/` — is unmanifested, so the reader refuses
+  and the tree is **never reclaimed**. Fail-safe, but the safety rests on the reader alone, not on the
+  three layers agreeing.
+- **Key encoding.** The manifest's `path` is a `to_string_lossy()` string while the gate keys by raw
+  bytes; a non-UTF-8 name therefore matches nothing (tree refused forever) and two distinct non-UTF-8
+  names collapse to one `U+FFFD` key, so their stored `.zst` files **overwrite each other**. The store
+  path must be derived from the raw `OsStr`, and the manifest must carry a lossless companion field
+  (`path_b64`, emitted only when the name is not valid UTF-8) so old manifests keep parsing.
+- **`over_total_cap` marks entries `stored: true` while writing no `.zst`**, and the gate treats a
+  stored entry with no hashes as unverifiable — so the over-cap tree, which is exactly the 134M-clone
+  case this section exists for, is **permanently unreclaimable**. Over-cap must write `stored: false`
+  for every entry; the `over_total_cap` flag already records why, and the gate's size-only path is the
+  intended "manifest-only" assurance.
+
+Target state: one module owns `ScratchRel` — derived from a live path, serialized to/parsed from a
+manifest entry, and resolved to a stored `.zst` path — with archive and GC both going through it.
 
 ---
 
@@ -319,6 +349,60 @@ present, or empty) — it will not chmod an unrelated directory the user pointed
 Read-side commands (`status`, `verify`, `archive --dry-run`) never require an initialized store: a
 fresh or missing home reports "nothing archived" rather than erroring, and creates nothing.
 
+### Single-writer lock — dual anchor
+
+Every mutating command (`archive`, `gc --commit`, `index`, `rescan --commit`, and `verify`'s
+`verified_at` persistence) holds one advisory lock for its whole run. `ensure_layout` (perm/marker
+check) runs **before** the lock, so a too-loose or non-yomi home is refused at exit 3 rather than
+locked.
+
+**Two anchors are locked, not one.**
+
+| Anchor | Role |
+|---|---|
+| `~/.yomi/.yomi.lock` | first contention check; the named, inspectable artifact |
+| `~/.yomi/` itself (the lock path's parent) | the load-bearing mutex |
+
+Why two. `flock` attaches to an **inode**, never to a name. A lock held only on `.yomi.lock` is
+defeated by removing that name: the next acquirer creates a fresh inode, locks it successfully, and
+runs concurrently with the first holder. Re-`stat`ing the path after acquisition does **not** close
+this — the second acquirer's inode *is* what the path resolves to, so the re-check passes for both
+holders. The store directory has no such gap for the unlink case: it cannot be `rmdir`'d while
+non-empty, so the first holder's inode stays reachable by name.
+
+Acquisition order is fixed — file, then directory — and **both are non-blocking**, so no deadlock is
+possible and a partial acquisition releases on the early return. Mixed old/new binaries stay safe in
+either order, because the new binary takes the *file* anchor first and the old binary knows only that
+anchor: whichever starts first, the other sees contention on `.yomi.lock`.
+
+**What this lock does and does not defend.** It is an advisory lock: it defends yomi against *yomi* —
+a cron run overlapping an interactive one, two shells, a `run --profile daily` firing twice. It is
+**not** an adversarial control, and cannot be made into one: a process that simply never calls `flock`
+is unaffected, and any principal that can write inside a mode-700 `~/.yomi` can rewrite `catalog.db`
+or replace the binary directly. The directory anchor is **unlink-resistant, not rename-resistant** —
+`mv ~/.yomi ~/.yomi.bak && mkdir ~/.yomi` admits a second holder exactly as unlinking the lock file
+used to. That residual is accepted: it requires the store owner's own UID, which already defeats every
+other control in this document. The value delivered is robustness against the *accidental* removal of
+`.yomi.lock` (stale-lock-cleanup habits, a partial `rm -rf ~/.yomi/*`, a restore that drops the file).
+
+**Filesystem support.** `flock` on a **file** can fail outright on mounts without support (some NFS,
+FUSE, older CIFS); that is reported as a distinct, permanent error, never as contention, so an
+operator is not sent hunting for a process that does not exist. `flock` on a **directory** falls back
+to the VFS-local implementation on effectively every filesystem (no `.flock` in the directory
+`file_operations` of NFS or FUSE), so the directory anchor is node-local on a network filesystem: the
+file anchor carries cross-host exclusion, the directory anchor carries same-host exclusion.
+
+**Lock path is never followed.** `.yomi.lock` is opened `O_NOFOLLOW` and never `O_TRUNC`
+(`File::create` did both, so a `.yomi.lock` symlinked at `state/catalog.db` wiped the catalog on the
+next write command). The lock file carries no content, so a symlink there is never legitimate state:
+on `ELOOP` the path is re-confirmed to still be a symlink, the **link node only** is removed (never
+its target), a real file is created `O_CREAT|O_EXCL|O_NOFOLLOW`, and a warning is emitted. Self-heal
+rather than refusal, because the repair provably destroys zero bytes while a refusal wedges every
+write command — including the unattended `run --profile daily` — until a human intervenes.
+
+**`--discover-all-users` takes no lock at all.** It is read-only by construction (§9 P2) and never
+opens, let alone locks, a foreign store root.
+
 ---
 
 ## 5. Wipe / GC
@@ -343,6 +427,37 @@ No deletion path exists that isn't gated on a verified archive. Per source file:
 
 Any check fails → **skip**, mark `unverified` in status. Never delete on doubt.
 
+### `gc.log` — every candidate leaves a record
+
+`~/.yomi/gc.log` is append-only JSONL, mode 600, and carries four record kinds: `delete`, `skip`
+(a gate refused), `protect` (live/too-young/retain-window), and `delete_failed` (the gates passed but
+the physical removal errored). The audit trail is the point of the whole layer, so **one candidate
+failing must never truncate it**:
+
+- A failed `unlinkat` (EACCES on the parent, EIO, …) is recorded as `delete_failed` and the run
+  **continues**; the run reports exit 2 (partial).
+- `ENOENT` (a racer, or Claude Code itself, already removed the entry) and `ENOTEMPTY` (an empty-dir
+  candidate refilled) are not failures — the delete either happened or is no longer applicable — and
+  are recorded as skips.
+- The commit loop aborts only on a **global** doubt: a `catalog.db` failure, which makes every
+  subsequent evaluation unreliable, or a failure to write `gc.log` itself, which would mean acting
+  without recording. A **per-candidate** doubt — one unreadable source, one corrupt `.zst` — must
+  degrade to a `skip` record, never to an abort: aborting leaves every later candidate unevaluated,
+  undeleted **and unrecorded**, which is indistinguishable from "looked at and found safe".
+
+> **Known gap (P2 residual).** `evaluate_candidate` still returns `Err` for per-candidate I/O — a
+> source read failure, a `.zst` that will not decompress — and the plan and commit loops propagate it,
+> so a single unreadable artifact aborts the pass. Only the *physical delete* has been split into the
+> two layers above. The gate layer must be split the same way: per-candidate I/O → `Unverified`;
+> catalog/SQL → `Err`.
+
+Skips are recorded by reason, so the log distinguishes *why* a candidate survived. The physical-delete
+layer currently collapses four distinct outcomes — `ENOENT`, `ENOTEMPTY`, an inode that drifted since
+the gate, and a blacklist hit — into one boolean and logs them all as `InodeDriftOrBlacklist`, which
+is a false reason for three of the four. The delete primitives should return an explicit outcome
+(`Removed` / `AlreadyGone` / `Refilled` / `Drifted` / `Failed(errno)`) so the errno→category mapping
+lives once, in the syscall wrapper where the errno is in scope, and the log records the truth.
+
 **Stored re-verification (`yomi verify`, P1) is two-layer, not one:** the compressed bytes must hash
 to the catalog's `stored_sha256`, **and** the *decompressed* content must hash to `content_sha256`
 (the sha of the intended, post-redaction content, recorded at capture). The content-hash layer is
@@ -357,7 +472,8 @@ proves the store is byte-exact to what capture intended.
 - Parse `~/.claude/sessions/<pid>.json` → active session UUIDs + cwd; confirm liveness via `/proc/<pid>`.
 - Consult `~/.local/state/claude/locks/*.lock`.
 - A transcript is **protected** if: its `sessionId` ∈ active set, OR mtime within `active_window` (default 1h), OR age < `min_age`.
-- yomi holds its own advisory lock during GC; refuses concurrent runs.
+- `gc --commit` holds the dual-anchor single-writer lock (§4) for the whole run and refuses (exit 3)
+  on contention. `gc` without `--commit` and `gc --discover-all-users` are read-only and take no lock.
 
 ### Policy (config)
 
@@ -559,20 +675,21 @@ yomi search  <query> [filters…]
 yomi index   [--reindex] [--session <uuid>]
 yomi rescan  [--commit] [--session <uuid>] [--fix-perms]                                                # dry-run default; retroactive re-redaction
 yomi read    <session-uuid> [--entry <uuid>] [--agents] [--grep P] [--human|--raw]
-yomi list    [--project P] [--since D] [--json]
 yomi status  [--secrets] [--unverified] [--storage]
 yomi verify  [<uuid> | --all]
-yomi import  --from-codex [PATH] | --from-wonka [PATH]
-yomi config  [get|set|path]
-yomi run     --profile daily          # composite: archive --all && index && gc --commit
+yomi config  [get|path]
 ```
+
+**Not yet shipped** (kept here as the designed surface for their phases):
+`yomi list` (P5), `yomi import --from-codex|--from-wonka` (P4, §7), `yomi run --profile daily` (P5),
+`yomi config set` (only `get`/`path` exist).
 
 Global: `--home <dir>` (`YOMI_HOME`), `--config <path>`, `--json`, `-v`.
 Exit codes: `0` ok · `1` error · `2` partial (items skipped/unverified) · `3` refused (perm/lock/safety).
 
 ### Cron / scheduled
 
-`yomi run --profile daily` is idempotent + lock-guarded → safe hourly/daily. Emits `--json` summary
+`yomi run --profile daily` (P5) is idempotent + lock-guarded → safe hourly/daily. Emits `--json` summary
 (counts: archived, indexed, deleted, reclaimed-bytes, secret-flags, unverified) for 千里眼 (senri) monitoring.
 
 ---
@@ -591,21 +708,32 @@ yomi/
     blacklist.rs            # compiled path denylist
     model.rs                # Entry, Session, Manifest, Finding (serde)
     lock.rs                 # advisory single-writer lock
-    source/  {mod, claude, tmp, history, mcp, snapshots}.rs
-    archive/ {mod, manifest, fidelity, incremental, compress}.rs   # zstd frames
-    scan/    {mod, rules, redact, quarantine}.rs
+    source/  {mod, claude, single, discover}.rs
+    archive/ {mod, manifest, incremental, compress}.rs             # zstd frames
+    scan/    {mod, content, rules, redact, quarantine}.rs
     catalog/ {mod.rs, schema.sql}                                  # rusqlite
-    index/   {mod, ftsindex, query}.rs   (trait Index; tantivy.rs future)
+    index/   {mod, ftsindex, parse, query}.rs   (trait Index; tantivy.rs future)
     gc/      {mod, safety, policy, live}.rs
-    importer/{mod, codex, wonka}.rs
-  tests/fixtures/           # sample jsonl, secret-laden fixture, codex archive sample
+    rescan/  {mod}.rs                                              # P3.5 re-redaction
+    importer/{mod, codex, wonka}.rs                                # P4, not yet built
+  tests/  e2e.rs · p4_gc_break.rs · p4_toctou_break.rs · p4_umask_break.rs · p4_unlink_break.rs
+          # fixtures are fabricated in-test under a tmpdir; no committed fixtures/ tree
 ```
+
+Crate is published as `yhi-yomi`; the binary and lib are both `yomi`. Edition 2024, MSRV 1.89.
 
 ### Dependencies
 
-`clap`(derive) · `serde`+`serde_json`+`toml` · `zstd` · `rusqlite`(bundled, FTS5) · `sha2` ·
-`regex`+`aho-corasick` · `walkdir`+`globset` · `chrono` · `anyhow`/`thiserror` · `tracing`(+subscriber) ·
-`fs2`/`nix`(lock, /proc) · `rayon`(opt, parallel scan). Future: `tantivy`. Mirror mx crate conventions (follow-up: read mx repo for shared style/lint config).
+`clap`(derive+env) · `serde`+`serde_json`+`toml` · `zstd` · `rusqlite`(bundled, FTS5) · `sha2` ·
+`regex` · `unicode-normalization`+`unicode-properties`(canonical-form scanner, §4) ·
+`walkdir`+`globset` · `chrono` · `anyhow`/`thiserror` · `tracing`(+subscriber) ·
+`rustix`(fs+process: `unlinkat`/`statat`/`O_NOFOLLOW`, `/proc` liveness). The single-writer lock uses
+**std** `File::try_lock` (`flock`), not `fs2`. Dev: `filetime`. Future: `tantivy`. Mirror mx crate
+conventions (follow-up: read mx repo for shared style/lint config).
+
+**Platform: Linux only.** `/proc`-based liveness and the `statx`/`unlinkat` paths are not portable,
+and `O_NOFOLLOW` on a symlink is `ELOOP` on Linux but `EMLINK`/`EFTYPE` on some BSDs — the lock's
+symlink self-heal keys on `ELOOP`.
 
 ### CI
 
@@ -623,6 +751,10 @@ Load-bearing fixtures: secret-scan **must** catch AKIA/PRIVATE KEY; double-archi
   *Done:* deletes only verified+aged+non-live; refuses on any mismatch/live/lock (test);
   dry-run shows plan; reclaims the 134M scratch clone + 65 empty dirs; `--discover-all-users`
   inventories all ephemeral shapes without touching foreign data.
+  > **Not met:** the "reclaims the 134M scratch clone" criterion. An over-`total_cap` tree is
+  > manifested with `stored: true` entries but no stored bytes, and the GC gate refuses a stored
+  > entry with no hashes — so the over-cap tree is never reclaimed. See §3, scratch path identity.
+  > The tests exercising scratch reclaim all stay under the cap, so this is untested territory.
 - **P3 — Index + search.** FTS5, per-entry docs, filters, incremental index, `search`/`read`.
   *Done:* ranked filtered results; incremental index no dup; redacted-only content.
 - **P4 — Codex absorption + cutover.** importer, freeze codex writes, hook/shutdown rewire. **No mx changes** — codex left as frozen read-only vestige (decided §5).
