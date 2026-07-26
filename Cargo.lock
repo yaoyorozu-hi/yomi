@@ -1078,7 +1078,6 @@ dependencies = [
  "clap",
  "filetime",
  "globset",
- "libc",
  "regex",
  "rusqlite",
  "rustix",

@@ -328,9 +328,16 @@ impl Env {
     /// Create the store root and required subdirectories with mode 700.
     /// Refuses (returns Err) if an existing root is looser than 700 and
     /// `fix_perms` is false.
+    ///
+    /// **Mutates process-global state and never restores it.** This sets the
+    /// process umask to `0o077` and discards the previous value, so every later
+    /// file created by *any* thread of the calling process is owner-only. That is
+    /// exactly what the `yomi` binary wants; a library consumer that calls this
+    /// has its own umask permanently rewritten with no way to recover what it was.
     pub fn ensure_layout(&self, fix_perms: bool) -> Result<()> {
-        // Tighten umask so nested creates never widen beyond owner.
-        rustix::process::umask(rustix::fs::Mode::RWXG | rustix::fs::Mode::RWXO);
+        // Tighten umask so nested creates never widen beyond owner. Spelled in
+        // octal because that is how a umask is read and reasoned about.
+        rustix::process::umask(rustix::fs::Mode::from_bits_truncate(0o077));
 
         if self.home.exists() {
             let mode = std::fs::metadata(&self.home)?.permissions().mode() & 0o777;
