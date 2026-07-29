@@ -182,12 +182,25 @@ mod scratch {
         }
     }
 
-    /// Why an entry's bytes are not in the store. The manifest records the
-    /// outcome, not the cause, so the cause is reconstructed from the ledger and
-    /// the config in the order archive applies them — a capture failure overrides
-    /// policy, the tree cap overrides the per-file rules, and what is left is the
-    /// globs. Never a bare "not found": the reader's question is *why*.
+    /// Why an entry's bytes are not in the store. Never a bare "not found": the
+    /// reader's question is *why*.
+    ///
+    /// Precedence follows the order archive applies its decisions — a denylisted
+    /// inode and a capture failure both mean *nothing was read* and outrank
+    /// policy; the tree cap outranks the per-file rules; the recorded policy
+    /// cause answers the rest.
+    ///
+    /// Only the last step can fall back to inference, and only for a manifest
+    /// written before the cause was recorded. That path is **labelled in the
+    /// output**, because inferring from the config in force *now* is exactly how
+    /// a widened `file_cap` made yomi blame the globs for a rejection they had
+    /// no part in.
     fn not_stored_reason(env: &Env, mf: &ScratchManifest, e: &ScratchEntry) -> String {
+        if e.blacklisted {
+            return "its inode is on the compiled-in denylist, so it was never opened — \
+                    §4 forbids opening a blacklisted path for read or delete"
+                .into();
+        }
         if e.capture_failed {
             return "the capture failed — nothing of this file was ever read (an I/O or \
                     permission error, a denylisted inode, or a file past the read bound). \
@@ -201,11 +214,22 @@ mod scratch {
                 env.config.scratch.total_cap.0
             );
         }
-        let file_cap = env.config.scratch.file_cap.0;
-        if e.bytes > file_cap {
-            return format!("{} bytes is over [scratch] file_cap ({file_cap})", e.bytes);
+        if let Some(cause) = e.not_stored {
+            return cause.reason().to_string();
         }
-        "the [scratch] allow/deny globs did not admit it".into()
+        // Pre-`not_stored` manifest: the cause was never written down, so this is
+        // a guess made from a config that may not be the one that produced the
+        // entry. Say so rather than assert it.
+        let file_cap = env.config.scratch.file_cap.0;
+        let guess = if e.bytes > file_cap {
+            format!("{} bytes is over [scratch] file_cap ({file_cap})", e.bytes)
+        } else {
+            "the [scratch] allow/deny globs did not admit it".into()
+        };
+        format!(
+            "{guess} — inferred from the current config, because this manifest predates \
+             the recorded reason; re-run `yomi archive` to record it"
+        )
     }
 
     fn emit_file(

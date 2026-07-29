@@ -7,7 +7,9 @@ use crate::catalog::{ArtifactUpsert, Catalog, SessionUpsert};
 use crate::config::Env;
 use crate::model::{ArtifactRecord, ArtifactRole, Finding, Frame, Manifest, SecretScanSummary};
 use crate::scan::{Allowlist, ContentScan, scan_content};
-use crate::scratch::{ManifestRead, ScratchEntry, ScratchManifest, ScratchRel, StoreDir};
+use crate::scratch::{
+    ManifestRead, NotStored, ScratchEntry, ScratchManifest, ScratchRel, StoreDir,
+};
 use crate::source::claude::DiscoveredSession;
 use crate::source::single::{ScratchDir, SingleFile};
 use crate::util::{now_iso, sha256_hex};
@@ -406,9 +408,21 @@ impl<'a> Archiver<'a> {
             total += size;
             let glob_key = rel.glob_subpath();
             let subpath: &str = &glob_key;
-            let store =
-                allow.is_match(subpath) && !deny.is_match(subpath) && size <= cfg.file_cap.0;
-            entries.push(ScratchEntry::new(&rel, size, store));
+            // Record *which* rule declined, in the order `store = allow && !deny
+            // && size <= file_cap` evaluates them. A reader that reconstructs the
+            // cause from the config in force later gets it wrong the moment the
+            // config moves, and a retained entry carries its decision across
+            // several config generations.
+            let not_stored = if !allow.is_match(subpath) {
+                Some(NotStored::NotAllowed)
+            } else if deny.is_match(subpath) {
+                Some(NotStored::Denied)
+            } else if size > cfg.file_cap.0 {
+                Some(NotStored::FileCap)
+            } else {
+                None
+            };
+            entries.push(ScratchEntry::new(&rel, size, not_stored));
             kept.push((path.clone(), rel));
         }
 
