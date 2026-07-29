@@ -393,28 +393,28 @@ impl Env {
         // octal because that is how a umask is read and reasoned about.
         rustix::process::umask(rustix::fs::Mode::from_bits_truncate(0o077));
 
-        // **Before anything is created or chmod'd through them.** `create_dir_all`
-        // and `set_permissions` both follow symlinks, so an `archive/` that is a
-        // link resolves the whole store — `_scratch` and every key under it —
-        // outside the store root, and the per-key classification below reports
-        // `Own` for all of them. Every mutating run re-asserts this, because
-        // ownership is a property of the moment a write happens and not of the
-        // moment a store was created.
+        // The store root, classified before anything is created or chmod'd
+        // through it. Every mutating run re-asserts this, because ownership is a
+        // property of the moment a write happens and not of the moment a store
+        // was created.
         //
         // Refused, never repaired, for the reason a store directory is: a symlink
         // there may be an operator who deliberately put part of the store on
         // another volume, and replacing it would orphan that data and silently
         // begin an empty one. Refusing is reversible by hand; replacing is not.
-        for dir in self.owned_dirs() {
-            if crate::scratch::classify_store_dir(&dir) == crate::scratch::StoreDir::Foreign {
-                bail!(
-                    "refuse: {} is not a directory this run owns (a symlink, a \
-                     file, or a path it cannot stat); yomi will not write through \
-                     it. Move or remove it — it is not repaired automatically, \
-                     because it may be deliberate.",
-                    dir.display()
-                );
-            }
+        //
+        // **This is the one member still checked through a path**, because it is
+        // the outermost boundary — the path `--home` names, with no descriptor
+        // above it to descend from. The three below it are asserted differently;
+        // see the descent after the permission check.
+        if crate::scratch::classify_store_dir(&self.home) == crate::scratch::StoreDir::Foreign {
+            bail!(
+                "refuse: {} is not a directory this run owns (a symlink, a \
+                 file, or a path it cannot stat); yomi will not write through \
+                 it. Move or remove it — it is not repaired automatically, \
+                 because it may be deliberate.",
+                self.home.display()
+            );
         }
 
         if self.home.exists() {
@@ -442,19 +442,47 @@ impl Env {
             std::fs::set_permissions(&self.home, std::fs::Permissions::from_mode(0o700))?;
         }
 
-        // The same set, minus the root already handled above. Uniform: every
-        // member is asserted, then created, then tightened — no member is
-        // exempted from a step, because "the fixed set is asserted" is the whole
-        // contract and a special case dissolves it.
+        // **The assertion and the creation are one operation**, sharing the store
+        // root's descriptor. Classifying by path and then creating by path left a
+        // window between them: a symlink planted after the check was followed by
+        // the `create_dir_all` and the `set_permissions` that came next, so the
+        // guard proved a fact about a moment that had already passed. `child`
+        // does `mkdirat`, then `openat` with `O_NOFOLLOW`, then `fchmod` through
+        // the descriptor it just obtained — there is no interval in which a
+        // different object can be substituted, because nothing is re-resolved.
+        //
+        // Uniform across the set: every member is created and tightened the same
+        // way, because "the fixed set is asserted" is the whole contract and a
+        // special case dissolves it.
+        let root = crate::safefs::Dir::open_root(&self.home)
+            .with_context(|| format!("open store root {}", self.home.display()))?;
         for dir in self.owned_dirs().into_iter().skip(1) {
-            std::fs::create_dir_all(&dir)?;
-            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+            let name = dir
+                .file_name()
+                .expect("every owned directory below the root is named");
+            root.child(name, 0o700).with_context(|| {
+                format!(
+                    "refuse: {} is not a directory this run owns (a symlink, a \
+                     file, or a path it cannot stat); yomi will not write through \
+                     it. Move or remove it — it is not repaired automatically, \
+                     because it may be deliberate.",
+                    dir.display()
+                )
+            })?;
         }
 
+        // Through the same descriptor, so a link planted at the marker's name
+        // cannot capture the write either. Still only when absent: an existing
+        // marker is left exactly as it is.
         let marker = self.marker_path();
         if !marker.exists() {
-            std::fs::write(&marker, b"yomi store\n")?;
-            Self::chmod_600(&marker)?;
+            root.write_atomic(
+                marker
+                    .file_name()
+                    .expect("the marker path always has a name"),
+                b"yomi store\n",
+                0o600,
+            )?;
         }
         Ok(())
     }

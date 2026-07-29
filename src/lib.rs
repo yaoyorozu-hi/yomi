@@ -8,6 +8,7 @@ pub mod index;
 pub mod lock;
 pub mod model;
 pub mod rescan;
+pub mod safefs;
 pub mod scan;
 pub mod scratch;
 pub mod source;
