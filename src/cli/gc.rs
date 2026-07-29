@@ -72,7 +72,7 @@ pub fn run(env: &Env, args: &GcArgs, json: bool) -> Result<i32> {
         let partial = plan.unverified + report.flipped_unverified > 0;
         Ok(if partial { EXIT_PARTIAL } else { EXIT_OK })
     } else {
-        let cat = catalog::open_env_read(env)?;
+        let cat = catalog::open_env_read(env)?.catalog;
         let plan = gc::plan(env, cfg, &targets, &cat, &bl, &live, min_over)?;
         emit_plan(&plan, json);
         Ok(EXIT_OK)

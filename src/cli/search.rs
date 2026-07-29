@@ -38,7 +38,7 @@ pub struct SearchArgs {
 pub fn run(env: &Env, args: &SearchArgs, json: bool) -> Result<i32> {
     // Read-only: a fresh/missing home yields an empty in-memory catalog → 0 hits,
     // never an error (R8).
-    let cat = catalog::open_env_read(env)?;
+    let cat = catalog::open_env_read(env)?.catalog;
     let (since, until) = query::date_bounds(
         args.on.as_deref(),
         args.since.as_deref(),

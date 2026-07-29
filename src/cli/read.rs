@@ -42,7 +42,7 @@ pub fn run(env: &Env, args: &ReadArgs, json: bool) -> Result<i32> {
     if args.scratch {
         return scratch::run(env, args, json);
     }
-    let cat = catalog::open_env_read(env)?;
+    let cat = catalog::open_env_read(env)?.catalog;
 
     if args.raw {
         return read_raw(env, &cat, &args.session);

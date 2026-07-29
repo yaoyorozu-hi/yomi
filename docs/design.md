@@ -477,14 +477,38 @@ single-user ownership — and it is stated here so no later layer mistakes the g
 raises the bar from "a symlink left lying around" to "a race won against a locked writer"; it does not
 eliminate the class.
 
-**Ownership depth is defined.** yomi asserts — and `ensure_layout` re-asserts on every mutating run —
-that `~/.yomi/`, `archive/`, `quarantine/`, `state/` **and `archive/_scratch/`** are real directories
-it owns, refusing (exit 3) rather than repairing, for the same reason a store directory is refused.
-Below `archive/_scratch/`, each key is an item with its own lifecycle and is classified per-use.
-`_scratch` is the boundary because it is the deepest path yomi creates without a per-item decision;
-without this rule a symlink on `_scratch` itself classifies every key beneath it as `Own` and all three
-layers proceed through it. Read-side commands do not run `ensure_layout`, and for them per-use
+**Ownership depth is defined.** yomi asserts — and `ensure_layout` re-asserts on every mutating run,
+before anything is created or chmod'd through them — that `~/.yomi/`, `archive/`, `quarantine/` and
+`state/` are real directories it owns, refusing (exit 3) rather than repairing, for the same reason a
+store directory is refused. Read-side commands do not run `ensure_layout`, and for them per-use
 classification is the whole guarantee.
+
+**The membership test is §5's global-versus-per-candidate rule, applied to paths.** A path belongs in
+the fixed set exactly when a foreign one makes **every** subsequent operation unreliable — which is
+what earns an abort. Each of the four qualifies without argument: a foreign `~/.yomi/` puts the whole
+store elsewhere, a foreign `archive/` every stored artifact, a foreign `state/` the catalog every gate
+depends on, and a foreign `quarantine/` every unredacted original — that last one an exfiltration
+channel, not merely a misplacement.
+
+**`archive/_scratch/` fails that test and is *not* in the set.** A foreign `_scratch` leaves transcript
+capture, the catalog and the quarantine tree untouched; it is the root of one artifact family, not of
+the store. Putting it in the fixed set converted a contained fault into a total outage — `archive`,
+`gc`, `index` and `rescan` all refusing at exit 3, so transcripts stopped being captured because a
+scratch subtree was wrong.
+
+An earlier draft of this paragraph put it in the set, on the grounds that "without this rule a symlink
+on `_scratch` classifies every key beneath it as `Own` and all layers proceed through it." **That
+justification has expired.** Every layer that touches a scratch store now classifies the **root** as
+well as the key — the writer, the reconciler, the GC gate, `verify` and `read`, five call sites — each
+refusing before it opens anything beneath. The layout assertion had become pure duplication of a guard
+already made five times per use, and its only remaining effect was the abort. (This is the second
+justification in this document to expire the same way, after the `KEY_MAX` margin. A rule whose reason
+is "otherwise X is unguarded" must be re-read when X acquires a guard.)
+
+So `_scratch` stays out of the layout assertion entirely — no classify, no create, no chmod there.
+**The creator asserts its mode instead**: the scratch writer, which already classifies the root before
+`create_dir_all`, sets it 700 explicitly rather than inheriting a umask, for the reason §4 gives about
+`Archiver` being a library type whose caller may never have tightened one.
 
 **A key is resolved *through* the root, so the guard has to sit at both levels or it sits at neither.**
 Every one of the four layers that touches a scratch store — archive's writer, the reconciler, the GC
@@ -492,14 +516,13 @@ gate and `verify` — classifies the root **and** the key. A foreign root makes 
 each key still classifies `Own` on its own, so a guard at the key level alone is defeated by moving the
 level above it.
 
-**Still open: `archive/` itself is not classified.** `ensure_layout` `create_dir_all`s and `set_700`s
-the fixed set, both of which follow a symlink, so an `archive/` that is a link resolves the entire
-store — `_scratch` included — outside the store root, and the per-key classification below it all
-reports `Own`. The rule stated above is implemented for `archive/_scratch/` only. Completing it means
-`ensure_layout` asserting `symlink_metadata`-is-a-directory for `~/.yomi/`, `archive/`, `quarantine/`,
-`state/` and `archive/_scratch/`, and refusing (exit 3) rather than repairing — same reasoning as a
-store directory, and reaching every command rather than only the scratch path, which is why it is its
-own unit (§9 P6.7) and not part of the scratch defect sweep.
+**Accepted residual: the assertion is not atomic with the writes it guards.** The classification is a
+`symlink_metadata` on a path, and the `create_dir_all` and `set_permissions` that follow are path-based
+too, so the whole set carries the plant-after-scan window a store directory carries — now at four
+levels instead of one. Bounded the same way: the held `WriteLock` plus single-user ownership. It is
+worth naming that the quarantine **writer** no longer has this window — U5-B1 replaced its path joins
+with a descent by directory fd — so the layout layer is the last path-based ownership check in the
+design, and that is where the technique should go next if the residual is ever judged too wide.
 
 #### `ManifestRead` — absent and unreadable are not the same
 
@@ -1600,7 +1623,7 @@ operator hunting for a competing process that does not exist":
 |---|---|---|
 | `Contended` | another yomi holds the lock | re-run later |
 | `Unsupported` | `flock` failed permanently (some NFS/FUSE/CIFS) | move the store (`--home` / `YOMI_HOME`) |
-| `NotAttempted` | the lock was never sought | see below — usually, restore the store's marker |
+| `NotAttempted` | the lock was never sought | see below — usually, restore the store's marker. Once the store-shape predicate is in use this means *there is no store here*, and a home that has run one mutating command never returns to it: `ensure_layout` creates `state/`, so the store is present from then on whatever else is lost |
 
 `NotAttempted` is the one that matters, because it is **permanent and silent**. `verify` gates its lock
 on `is_initialized()`, which is `marker || catalog.db` — so a store that has lost both, while
@@ -1617,6 +1640,21 @@ already does. **Introduce a distinct predicate rather than widening `is_initiali
 caller (`gc`'s "persist `shapes.json` if a store exists") is not a lock gate and must not change
 meaning. With the predicate corrected, `NotAttempted` arises only when there is nothing to verify — at
 which point the pass has no findings and exclusion is moot.
+
+**Why the pair had to be fixed together.** A store that lost `state/` produced *both* halves of the
+same wrong picture: the lock was never attempted, so every comparative finding was permanently
+downgraded, **and** the catalog read back as empty, so every session original became a false stray.
+Repairing one alone would have left the other making the store look broken; repaired together, the run
+reports `exclusion: held`, no downgrades, no strays — and `claims` stays non-zero, because scratch's
+ledger lives in its manifests and survived. **The output says which ledger was lost**, which is the
+whole point of separating the two.
+
+**The reason exclusion was unavailable is reported, not the fact alone.** `Unavailable` still folds
+`Contended` and `Unsupported` together, pending a typed error from the lock layer; that split is worth
+little beside `NotAttempted`, which was the permanent and silent one. Two fields now describe the same
+thing — `exclusive` is exactly "`exclusion` is `Held`" — and only one carries the reason. The derived
+one is redundant, and a redundant field is a second place for the truth to be written: **`exclusion` is
+authoritative, and `exclusive` should go once its consumers move.**
 
 **A downgraded finding does not fail the run.** `unverifiable` is uniformly non-failing, and splitting
 it into failing and non-failing halves would give one vocabulary two exit behaviours — which is the
@@ -2330,8 +2368,21 @@ Load-bearing fixtures: secret-scan **must** catch AKIA/PRIVATE KEY; double-archi
      **session→key resolution should read it instead of parsing the key** (§5), closing the last place
      the non-injective plain form is still consulted.
   7. **Store-root ownership** (§3, "Ownership depth"). `ensure_layout` asserts that `~/.yomi/`,
-     `archive/`, `quarantine/`, `state/` and `archive/_scratch/` are real directories — refusing
-     (exit 3), not repairing. Today only `archive/_scratch/` is guarded, and at use rather than at
+     `archive/`, `quarantine/` and `state/` are real directories — refusing (exit 3), not repairing.
+     **(implemented; in review)**
+
+     `store_exists()` landed as a **distinct** predicate with `is_initialized()` untouched, and
+     `open_env_read` now returns `Present`/`Fresh`/`Lost` so `verify` can withhold Q2 *and say which
+     reason* (`SessionScoped` versus `CatalogMissing`) — "not asked" and "asked with no ledger to
+     answer from" being different answers, which is the discipline the whole vocabulary rests on. Both
+     halves of the lost-`state/` picture close together (§5).
+
+     One correction: **`archive/_scratch/` must come back out of the fixed set.** It was put there on a
+     justification that has since expired, and its presence turns a foreign scratch subtree into an
+     exit-3 abort of `archive`, `gc`, `index` and `rescan` alike — transcripts stop being captured
+     because a scratch directory is wrong. §3 now states the membership test (a foreign member must
+     make *every* subsequent operation unreliable) and why `_scratch` fails it. Its mode assertion
+     moves to the writer that creates it. Today only `archive/_scratch/` is guarded, and at use rather than at
      layout, so an `archive/` that is a symlink still resolves the whole store elsewhere with every key
      beneath it classifying `Own`. Independent of scratch and reaching every command, hence its own
      unit rather than a line in the defect sweep. Carries the corrected lock-gate predicate with it

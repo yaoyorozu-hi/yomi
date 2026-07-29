@@ -382,11 +382,9 @@ pub struct QuarantineReport {
     pub verified: u64,
     /// Whether Q3 ran — i.e. whether any original was opened at all.
     pub opened_originals: bool,
-    /// Whether the Q2 sweep ran. False under a session selector: "every file
-    /// under `quarantine/` is claimed" is a statement about the whole tree, and a
-    /// subset of the ledger cannot support it — every other session's originals
-    /// would read as strays.
+    /// Whether the Q2 sweep ran, and why not when it did not.
     pub swept: bool,
+    pub sweep_skipped: Option<SweepSkip>,
     /// Files seen by the Q2 sweep.
     pub files: u64,
     /// Files the sweep declined to judge because the ledger covering them was
@@ -409,6 +407,7 @@ impl QuarantineReport {
             verified: 0,
             opened_originals: false,
             swept: false,
+            sweep_skipped: None,
             files: 0,
             unexamined: 0,
             violations: Vec::new(),
@@ -491,6 +490,54 @@ impl QuarantineReport {
     }
 }
 
+/// Whether Q2's sweep runs, and — when it does not — why.
+///
+/// "Not asked" and "asked and clean" are not the same answer, and neither is
+/// "asked, but nothing here can say what is claimed". Each of the two refusals
+/// below is a statement about the ledger rather than about the tree.
+pub enum Sweep<'a> {
+    Run(SweepScope<'a>),
+    Skipped(SweepSkip),
+}
+
+/// Why the sweep did not run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SweepSkip {
+    /// A session selector narrows the ledger, and "every file under
+    /// `quarantine/` is claimed" is a statement about the whole tree — every
+    /// other session's originals would read as strays.
+    SessionScoped,
+    /// The catalog is gone beside a store that is not. Session artifacts have no
+    /// ledger at all here, so **every** original of theirs would read as a stray:
+    /// an accusation drawn from the absence of the very record that would answer
+    /// it. Withheld, and said, rather than reported as a clean tree.
+    CatalogMissing,
+}
+
+impl SweepSkip {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SweepSkip::SessionScoped => "session_scoped",
+            SweepSkip::CatalogMissing => "catalog_missing",
+        }
+    }
+
+    pub fn note(self) -> &'static str {
+        match self {
+            SweepSkip::SessionScoped => {
+                "strays not swept: a session selector narrows the ledger, and \"every \
+                 file under quarantine/ is claimed\" is a statement about the whole tree."
+            }
+            SweepSkip::CatalogMissing => {
+                "strays not swept: state/catalog.db is missing beside a store that is \
+                 not, so there is no ledger for the session artifacts whose originals \
+                 sit here. Restore the catalog, or re-archive, before reading this \
+                 tree's strays."
+            }
+        }
+    }
+}
+
 /// How the sweep is scoped.
 pub struct SweepScope<'a> {
     /// Subtrees whose ledger this run refused to read, quarantine-relative.
@@ -507,12 +554,11 @@ pub struct SweepScope<'a> {
 /// an original is behind [`OpenOriginals`], which only the `--quarantine` flag can
 /// construct.
 ///
-/// `sweep` is `None` when the run is scoped to one session — see
-/// [`QuarantineReport::swept`].
+/// `sweep` carries its own refusal when it does not run — see [`SweepSkip`].
 pub fn verify_law_q(
     quarantine_root: &Path,
     claims: &[QuarantineClaim],
-    sweep: Option<SweepScope<'_>>,
+    sweep: Sweep<'_>,
     exclusive: bool,
     open: Option<&OpenOriginals>,
 ) -> QuarantineReport {
@@ -615,8 +661,12 @@ pub fn verify_law_q(
         );
     }
 
-    let Some(sweep) = sweep else {
-        return report;
+    let sweep = match sweep {
+        Sweep::Run(scope) => scope,
+        Sweep::Skipped(why) => {
+            report.sweep_skipped = Some(why);
+            return report;
+        }
     };
     report.swept = true;
 
@@ -876,7 +926,13 @@ mod tests {
             claim("k", "_scratch/K/scratchpad/note.md.zst", true),
             claim("k", "_scratch/K/scratchpad/note.md.zst", true),
         ];
-        let r = verify_law_q(root, &claims, None, true, None);
+        let r = verify_law_q(
+            root,
+            &claims,
+            Sweep::Skipped(SweepSkip::SessionScoped),
+            true,
+            None,
+        );
         assert_eq!(
             issues(&r.violations)
                 .iter()
@@ -899,7 +955,13 @@ mod tests {
             claim("a", "_scratch/K/scratchpad/note.md.zst", true),
             claim("b", "_scratch/K/scratchpad/note.md.zst", false),
         ];
-        let r = verify_law_q(Path::new("/nonexistent"), &claims, None, true, None);
+        let r = verify_law_q(
+            Path::new("/nonexistent"),
+            &claims,
+            Sweep::Skipped(SweepSkip::SessionScoped),
+            true,
+            None,
+        );
         assert!(
             issues(&r.violations)
                 .iter()
@@ -916,7 +978,13 @@ mod tests {
             "-home-t/u1/transcript.jsonl.zst",
             true,
         )];
-        let r = verify_law_q(Path::new("/nonexistent"), &claims, None, true, None);
+        let r = verify_law_q(
+            Path::new("/nonexistent"),
+            &claims,
+            Sweep::Skipped(SweepSkip::SessionScoped),
+            true,
+            None,
+        );
         assert_eq!(
             issues(&r.violations),
             vec![("QuarantineMissing", "-home-t/u1/transcript.jsonl")]
@@ -1018,7 +1086,13 @@ mod tests {
             "-home-t/u1/transcript.jsonl.zst",
             true,
         )];
-        let r = verify_law_q(Path::new("/nonexistent"), &claims, None, true, None);
+        let r = verify_law_q(
+            Path::new("/nonexistent"),
+            &claims,
+            Sweep::Skipped(SweepSkip::SessionScoped),
+            true,
+            None,
+        );
         assert!(!r.opened_originals);
         assert_eq!(r.verified, 0);
         assert!(

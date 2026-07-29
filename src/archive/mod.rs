@@ -515,6 +515,14 @@ impl<'a> Archiver<'a> {
 
         if !self.dry_run {
             std::fs::create_dir_all(&store_dir)?;
+            // The scratch root as well as the key. `create_dir_all` creates both
+            // when neither exists, and the creator is what asserts the mode:
+            // `ensure_layout` does not cover `archive/_scratch/` (it is one
+            // artifact family's root, not the store's), and `Archiver` is a
+            // library type a caller can use without ever having tightened the
+            // umask — the same reason §4 gives for chmodding every level of a
+            // quarantine path rather than inheriting.
+            set_700(&crate::scratch::store_root(&self.env.archive_dir()))?;
             set_700(&store_dir)?;
             for (entry, (path, rel)) in entries.iter_mut().zip(kept.iter()) {
                 if !entry.stored {

@@ -817,15 +817,55 @@ pub fn open_env(env: &Env) -> Result<Catalog> {
     Ok(cat)
 }
 
+/// Where a read-side command's catalog came from.
+///
+/// **`Fresh` and `Lost` are not the same fact**, and substituting one empty
+/// in-memory catalog for both erased the difference: a store that lost its
+/// `catalog.db` beside a populated `archive/` became indistinguishable from a
+/// home nothing has ever been archived into. Law Q then has *no ledger at all*
+/// for the session artifacts whose originals sit in `quarantine/`, and reports
+/// every one of them as a stray. This is `ManifestRead`'s `Missing`-versus-
+/// `Unreadable` distinction, unmade one layer down: to a reader that only
+/// refuses they look alike; to a caller that accuses they are opposites.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatalogState {
+    /// `catalog.db` was there and was opened.
+    Present,
+    /// No catalog and no store — nothing has ever been archived here (W1/R8).
+    Fresh,
+    /// No catalog, but a store is. Its bookkeeping is gone while its artifacts
+    /// are not, so an empty catalog here is an absence of evidence and must not
+    /// be read as evidence of absence.
+    Lost,
+}
+
+/// A catalog opened for a read-side command, and what its absence would mean.
+pub struct ReadCatalog {
+    pub catalog: Catalog,
+    pub state: CatalogState,
+}
+
 /// Open the catalog for read-side commands without requiring an initialized
 /// store: an existing db is opened as-is; a missing one yields an empty
 /// in-memory catalog so `status`/`verify`/`--dry-run` report "nothing archived"
 /// instead of erroring on a fresh home (W1/R8).
-pub fn open_env_read(env: &Env) -> Result<Catalog> {
+///
+/// The returned [`CatalogState`] says which of the two absences this was, so a
+/// caller that would otherwise accuse can withhold instead.
+pub fn open_env_read(env: &Env) -> Result<ReadCatalog> {
     let path = env.catalog_path();
     if path.exists() {
-        Catalog::open(&path)
-    } else {
-        Catalog::open_in_memory()
+        return Ok(ReadCatalog {
+            catalog: Catalog::open(&path)?,
+            state: CatalogState::Present,
+        });
     }
+    Ok(ReadCatalog {
+        catalog: Catalog::open_in_memory()?,
+        state: if env.store_exists() {
+            CatalogState::Lost
+        } else {
+            CatalogState::Fresh
+        },
+    })
 }
