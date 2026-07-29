@@ -42,7 +42,7 @@ pub fn run(env: &Env, args: &RescanArgs, json: bool) -> Result<i32> {
         let partial = report.verify_failures + report.failed.len() as u64 > 0;
         Ok(if partial { EXIT_PARTIAL } else { EXIT_OK })
     } else {
-        let cat = catalog::open_env_read(env)?;
+        let cat = catalog::open_env_read(env)?.catalog;
         let plan = rescan::plan(env, &cat, &allow, args.session.as_deref())?;
         emit_plan(&plan, json);
         Ok(EXIT_OK)

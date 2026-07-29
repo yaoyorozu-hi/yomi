@@ -1,11 +1,12 @@
 use super::{EXIT_OK, EXIT_PARTIAL};
 use crate::archive::verify_stored;
 use crate::catalog;
+use crate::catalog::CatalogState;
 use crate::config::Env;
 use crate::lock::WriteLock;
 use crate::model::Severity;
 use crate::scan::quarantine::{
-    OpenOriginals, QuarantineClaim, QuarantineFinding, SweepScope, verify_law_q,
+    OpenOriginals, QuarantineClaim, QuarantineFinding, Sweep, SweepScope, SweepSkip, verify_law_q,
 };
 use anyhow::Result;
 use std::path::PathBuf;
@@ -40,10 +41,58 @@ pub struct VerifyArgs {
     pub quarantine: bool,
 }
 
+/// Why `verify` did or did not hold the write lock.
+///
+/// Three causes, three operator actions — collapsing them into "the lock was
+/// unavailable, so a concurrent archive may be mid-write" states a falsehood in
+/// the case that matters most, which is the same error §4 refuses when it insists
+/// lock contention and an unsupported `flock` be reported apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Exclusion {
+    Held,
+    /// The lock was sought and not obtained: another yomi holds it (re-run
+    /// later), or `flock` failed permanently on this filesystem (move the
+    /// store). Telling those two apart needs a typed error out of `lock.rs` and
+    /// is queued; what they share is that the lock *was* attempted here.
+    Unavailable,
+    /// The lock was never sought, because there is no store at this path. With
+    /// the gate asking the right question this arises only when there is nothing
+    /// to verify, at which point exclusion is moot.
+    NotAttempted,
+}
+
+impl Exclusion {
+    fn as_str(self) -> &'static str {
+        match self {
+            Exclusion::Held => "held",
+            Exclusion::Unavailable => "unavailable",
+            Exclusion::NotAttempted => "not_attempted",
+        }
+    }
+
+    /// The line an operator acts on, or `None` when the lock was held.
+    fn note(self) -> Option<&'static str> {
+        match self {
+            Exclusion::Held => None,
+            Exclusion::Unavailable => Some(
+                "  not exclusive: the write lock was sought and not obtained — another \
+                 yomi may hold it, or flock may be unsupported on this filesystem. \
+                 Findings that compare the ledger against the store are reported as \
+                 unverifiable rather than as defects.",
+            ),
+            Exclusion::NotAttempted => Some(
+                "  not exclusive: no store exists at this path, so the write lock was \
+                 never sought and there was nothing to verify. This is not a \
+                 concurrent writer.",
+            ),
+        }
+    }
+}
+
 pub fn run_status(env: &Env, args: &StatusArgs, json: bool) -> Result<i32> {
     // Read-side: a fresh, uninitialized home reports "nothing archived" rather
     // than erroring (W1/R8).
-    let cat = catalog::open_env_read(env)?;
+    let cat = catalog::open_env_read(env)?.catalog;
     let counts = cat.counts()?;
 
     if args.secrets {
@@ -117,7 +166,8 @@ pub fn run_status(env: &Env, args: &StatusArgs, json: bool) -> Result<i32> {
 }
 
 pub fn run_verify(env: &Env, args: &VerifyArgs, json: bool) -> Result<i32> {
-    let cat = catalog::open_env_read(env)?;
+    let read = catalog::open_env_read(env)?;
+    let cat = &read.catalog;
     let rows = match &args.session {
         Some(uuid) => cat.verify_rows_for_session(uuid)?,
         None => cat.verify_rows()?,
@@ -125,12 +175,22 @@ pub fn run_verify(env: &Env, args: &VerifyArgs, json: bool) -> Result<i32> {
     let archive_dir = env.archive_dir();
 
     // Persisting `verified_at` is a write; take the single-writer lock so it
-    // never races an archive run. If unavailable (or the store is fresh),
+    // never races an archive run. If unavailable (or there is no store here),
     // verify still reports but does not persist (W4).
-    let lock = if env.is_initialized() {
-        WriteLock::acquire(&env.lock_path()).ok()
+    //
+    // Gated on whether a store is **there**, not on whether its bookkeeping
+    // survives: the gate exists so a read-side command does not create a store on
+    // a fresh home, and a store that lost its marker and its catalog is still
+    // entirely present. Asking the other question made this run never attempt the
+    // lock on such a store, so `exclusive` was false forever and the pass could
+    // confirm but never accuse.
+    let (lock, exclusion) = if env.store_exists() {
+        match WriteLock::acquire(&env.lock_path()) {
+            Ok(l) => (Some(l), Exclusion::Held),
+            Err(_) => (None, Exclusion::Unavailable),
+        }
     } else {
-        None
+        (None, Exclusion::NotAttempted)
     };
 
     let mut ok = 0u64;
@@ -185,9 +245,18 @@ pub fn run_verify(env: &Env, args: &VerifyArgs, json: bool) -> Result<i32> {
     // the sweep would report every other session's originals as strays — a
     // partial ledger cannot support a whole-tree accusation, which is the same
     // rule that stops the orphan sweep on a key it cannot fully name.
-    let sweep = args.session.is_none().then(|| SweepScope {
-        unexamined: &scratch.quarantine_unexamined,
-    });
+    let sweep = if args.session.is_some() {
+        Sweep::Skipped(SweepSkip::SessionScoped)
+    } else if read.state == CatalogState::Lost {
+        // No ledger for the session artifacts, beside a store that plainly has
+        // them: every original of theirs would read as a stray, which is an
+        // accusation drawn from the absence of the record that would answer it.
+        Sweep::Skipped(SweepSkip::CatalogMissing)
+    } else {
+        Sweep::Run(SweepScope {
+            unexamined: &scratch.quarantine_unexamined,
+        })
+    };
     let open = OpenOriginals::requested(args.quarantine);
     let q = verify_law_q(
         &env.quarantine_dir(),
@@ -202,6 +271,7 @@ pub fn run_verify(env: &Env, args: &VerifyArgs, json: bool) -> Result<i32> {
             "verified": ok,
             "failed": failed.len(),
             "failures": failed,
+            "exclusion": exclusion.as_str(),
             "scratch": {
                 "exclusive": scratch.exclusive,
                 "keys": scratch.keys,
@@ -218,6 +288,7 @@ pub fn run_verify(env: &Env, args: &VerifyArgs, json: bool) -> Result<i32> {
                 "opened_originals": q.opened_originals,
                 "verified": q.verified,
                 "swept": q.swept,
+                "sweep_skipped": q.sweep_skipped.map(|w| w.as_str()),
                 "files": q.files,
                 "unexamined": q.unexamined,
                 "violations": q_findings_json(&q.violations),
@@ -239,12 +310,8 @@ pub fn run_verify(env: &Env, args: &VerifyArgs, json: bool) -> Result<i32> {
             "Scratch: {} store dirs, {} artifacts verified.",
             scratch.keys, scratch.verified
         );
-        if !scratch.exclusive {
-            println!(
-                "  not exclusive: the write lock was unavailable, so a concurrent \
-                 archive may be mid-write. Findings that compare the ledger against \
-                 the store are reported as unverifiable rather than as defects."
-            );
+        if let Some(note) = exclusion.note() {
+            println!("{note}");
         }
         // Only violations and refusals are defects; the other two sections say
         // what the ledger cannot prove and what only an operator can clear.
@@ -281,12 +348,8 @@ pub fn run_verify(env: &Env, args: &VerifyArgs, json: bool) -> Result<i32> {
                     String::new()
                 }
             );
-        } else {
-            println!(
-                "  strays not swept: a session selector narrows the ledger, and \
-                 \"every file under quarantine/ is claimed\" is a statement about the \
-                 whole tree."
-            );
+        } else if let Some(why) = q.sweep_skipped {
+            println!("  {}", why.note());
         }
         if !q.opened_originals {
             println!(

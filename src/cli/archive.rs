@@ -71,7 +71,7 @@ pub fn run(env: &Env, args: &ArchiveArgs, json: bool) -> Result<i32> {
     // A real run initializes and writes the catalog; a dry run opens read-only
     // (empty if the home is fresh) and never touches disk (W1/R8).
     let cat = if args.dry_run {
-        catalog::open_env_read(env)?
+        catalog::open_env_read(env)?.catalog
     } else {
         catalog::open_env(env)?
     };

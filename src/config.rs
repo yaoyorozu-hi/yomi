@@ -306,8 +306,62 @@ impl Env {
     }
 
     /// Whether the store exists and has been initialized by yomi.
+    ///
+    /// **Not a lock gate** — see [`Env::store_exists`]. This asks whether yomi's
+    /// bookkeeping is present, which is the right question for "is there
+    /// anything here worth writing an inventory beside".
     pub fn is_initialized(&self) -> bool {
         self.marker_path().exists() || self.catalog_path().exists()
+    }
+
+    /// Whether a store is **there** — the question a read-side command must ask
+    /// before taking the write lock.
+    ///
+    /// Distinct from [`Env::is_initialized`] deliberately, rather than widening
+    /// it: that predicate's other caller asks a different question and must not
+    /// change meaning. A lock gate exists so a read-side command does not
+    /// *create* a store on a fresh home; for that the question is whether a store
+    /// is present, not whether it still has its bookkeeping. A store that lost
+    /// its marker and its `catalog.db` while `archive/` survives intact is
+    /// entirely present — and gating on the bookkeeping made `verify` never
+    /// attempt the lock there, so `exclusive` was false on every run forever and
+    /// the pass could confirm but never accuse. Taking the lock inside an
+    /// existing store directory creates only `.yomi.lock`, which every mutating
+    /// command already does.
+    pub fn store_exists(&self) -> bool {
+        self.marker_path().exists() || self.archive_dir().exists() || self.state_dir().exists()
+    }
+
+    /// The fixed set of directories yomi asserts it owns, outermost first.
+    ///
+    /// **Membership is decided by one question: would a foreign member make
+    /// every later operation untrustworthy?** That is what earns an abort, and
+    /// only these four answer yes — each is load-bearing for *every* artifact.
+    /// A foreign `~/.yomi/` puts the whole store elsewhere; a foreign `archive/`
+    /// puts every stored artifact there; a foreign `state/` puts the catalog
+    /// every gate consults there; a foreign `quarantine/` puts every unredacted
+    /// original there, which is an exfiltration channel as well as a loss.
+    ///
+    /// **`archive/_scratch/` is deliberately not a member**, and the reason it
+    /// once looked like one is worth keeping: it is the root of *one artifact
+    /// family*, not of the store. A symlink on it costs the scratch artifacts
+    /// and nothing else — transcript capture, the catalog and the quarantine
+    /// tree are untouched — so refusing the whole run over it aborts work that
+    /// is provably still safe.
+    ///
+    /// It also needs no assertion here to be guarded: the scratch root is
+    /// classified together with the key at every one of the five sites that
+    /// resolve a key *through* it — archive's writer, its reconciler, the GC
+    /// gate, `verify` and `ScratchStore::open`. A layout-level check would be a
+    /// pure duplicate of a guard already made per use, whose only remaining
+    /// effect is the abort.
+    fn owned_dirs(&self) -> [PathBuf; 4] {
+        [
+            self.home.clone(),
+            self.archive_dir(),
+            self.quarantine_dir(),
+            self.state_dir(),
+        ]
     }
 
     /// True if `home` is an existing dir that yomi may safely operate on: it is
@@ -339,6 +393,30 @@ impl Env {
         // octal because that is how a umask is read and reasoned about.
         rustix::process::umask(rustix::fs::Mode::from_bits_truncate(0o077));
 
+        // **Before anything is created or chmod'd through them.** `create_dir_all`
+        // and `set_permissions` both follow symlinks, so an `archive/` that is a
+        // link resolves the whole store — `_scratch` and every key under it —
+        // outside the store root, and the per-key classification below reports
+        // `Own` for all of them. Every mutating run re-asserts this, because
+        // ownership is a property of the moment a write happens and not of the
+        // moment a store was created.
+        //
+        // Refused, never repaired, for the reason a store directory is: a symlink
+        // there may be an operator who deliberately put part of the store on
+        // another volume, and replacing it would orphan that data and silently
+        // begin an empty one. Refusing is reversible by hand; replacing is not.
+        for dir in self.owned_dirs() {
+            if crate::scratch::classify_store_dir(&dir) == crate::scratch::StoreDir::Foreign {
+                bail!(
+                    "refuse: {} is not a directory this run owns (a symlink, a \
+                     file, or a path it cannot stat); yomi will not write through \
+                     it. Move or remove it — it is not repaired automatically, \
+                     because it may be deliberate.",
+                    dir.display()
+                );
+            }
+        }
+
         if self.home.exists() {
             let mode = std::fs::metadata(&self.home)?.permissions().mode() & 0o777;
             if mode & 0o077 != 0 {
@@ -364,7 +442,11 @@ impl Env {
             std::fs::set_permissions(&self.home, std::fs::Permissions::from_mode(0o700))?;
         }
 
-        for dir in [self.archive_dir(), self.quarantine_dir(), self.state_dir()] {
+        // The same set, minus the root already handled above. Uniform: every
+        // member is asserted, then created, then tightened — no member is
+        // exempted from a step, because "the fixed set is asserted" is the whole
+        // contract and a special case dissolves it.
+        for dir in self.owned_dirs().into_iter().skip(1) {
             std::fs::create_dir_all(&dir)?;
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
         }

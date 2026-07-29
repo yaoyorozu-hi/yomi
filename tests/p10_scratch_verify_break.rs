@@ -764,7 +764,16 @@ fn p10_bytes_and_source_sha256_are_never_consulted() {
 // ---------------------------------------------------------------------------
 
 /// A store that has never archived scratch is not a defect, and verifying it
-/// must not bring `_scratch` into existence.
+/// must not change the store's shape.
+///
+/// **Sharpened when `archive/_scratch/` joined `ensure_layout`'s fixed set
+/// (U7).** The old assertion was that `archive/_scratch` does not exist after
+/// `verify` — which conflated two commands, because the fixture's `archive` run
+/// is what creates it now: the design (§3, "Ownership depth") puts `_scratch` in
+/// the set yomi asserts it owns on every mutating run, and a directory yomi
+/// asserts it owns is one it creates. What this test is *for* — that `verify`
+/// creates nothing — is unchanged and is now actually isolated: the root's
+/// existence is captured before the call and compared after it.
 #[test]
 fn p10_fresh_store_verifies_clean_and_creates_nothing() {
     let fx = Fx::new("fresh");
@@ -781,12 +790,21 @@ fn p10_fresh_store_verifies_clean_and_creates_nothing() {
         "fixture did not initialize a store"
     );
 
+    let root = fx.yomi_home.join("archive/_scratch");
+    let before = root.exists();
+
     let v = fx.verify();
     assert_eq!(v.code, 0, "{}", v.summary());
     assert_eq!(v.keys(), 0, "{}", v.summary());
-    assert!(
-        !fx.yomi_home.join("archive/_scratch").exists(),
-        "verify created the scratch store root"
+    assert_eq!(
+        root.exists(),
+        before,
+        "verify changed whether the scratch store root exists"
+    );
+    assert_eq!(
+        std::fs::read_dir(&root).map(|d| d.count()).unwrap_or(0),
+        0,
+        "verify put something in the scratch store root"
     );
 }
 
