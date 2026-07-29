@@ -360,10 +360,13 @@ read*: no decision was made at all, so presence and size assure nothing whatsoev
 nobody has seen. A gate that cannot tell them apart must mishandle one of them; handling the first
 correctly (reclaim on size match) is exactly what makes the second a deletion of unarchived data.
 
-All three refusal paths of the source read — a blacklisted inode swapped in after the walk, an
-unreadable file, a file that outgrew the read bound between stat and read — set the one flag, because
-the single fact the ledger records is the one they share: **not one byte of this file's content was
-captured.** The gate maps it to a refusal of the whole tree.
+**Four paths set the one flag**, because the single fact the ledger records is the one they share:
+**not one byte of this file's content was captured.** Three are refusals of the source read — a
+blacklisted inode swapped in after the walk, an unreadable file, a file that outgrew the read bound
+between stat and read. The fourth is a **failure to quarantine**: nothing of a file may enter the store
+while its unredacted original is unpreserved, because the store copy is redacted or an opaque marker,
+so writing it and losing the original would leave the secret-bearing bytes only in the live file —
+which the gate would then let GC reclaim. The gate maps the flag to a refusal of the whole tree.
 
 **The refusal is transient, and that is what separates it from the `#9` failure mode.** `#9`
 regenerated an identical broken manifest on every run, so no number of archive/GC cycles ever helped.
@@ -1002,12 +1005,40 @@ who may check them.
 | | Assertion | Cost |
 |---|---|---|
 | **Q0 — injectivity** | no two artifacts map to one quarantine path | ledger only, opens nothing |
-| **Q1 — existence** | every artifact recorded `quarantined` has a file at its quarantine path | `stat` only |
+| **Q1 — existence** | every artifact recorded `quarantined` has a file at its quarantine path **or at one a superseded derivation produced** | `stat` only |
 | **Q2 — no strays** | every file under `quarantine/` is claimed by some artifact | `readdir` only |
 | **Q3 — integrity** | the original hashes to the artifact's `source_sha256` | **opens a raw secret** |
 
 Q3 is checkable with no new field: the bytes handed to quarantine are exactly the bytes
 `source_sha256` describes, at every call site, for both session artifacts and scratch.
+
+**Q1's fallback is not a weakening; leaving it out was an inconsistency in this section.** Three
+paragraphs above, this design rules that existing quarantine trees are **never** migrated — so every
+original written before the mirror rule legitimately sits at a path the current derivation does not
+produce. A Q1 that accused on that would report this document's own ratified behaviour as a defect, and
+would do it nightly, on exactly the stores with the most history: the outcome §5 refuses when it keeps
+a legacy population from failing `verify`. So Q1 asks the current path first, then the superseded ones,
+and reports the second case as **legacy layout** — advisory, and the same fact Q2 reports for an
+unowned file, named here against the artifact that owns this one. `QuarantineMissing` then means
+*present at neither*, which is a stronger and more exact accusation than the one it replaces: the
+original is genuinely gone.
+
+Deriving a superseded path and `stat`ing it is not the reader §4 leaves to its own design. Nothing in
+law Q can emit an original; the fallback opens nothing.
+
+**The three checks range over three different sets, and collapsing them is wrong in both directions.**
+
+| | Set | Why |
+|---|---|---|
+| **Q0** | artifacts recorded `quarantined` | a collision destroys an original only when both sides wrote one; reporting a pair where only one did asserts damage that has not happened |
+| **Q1** | artifacts recorded `quarantined` | the obligation to have an original is exactly what the flag records |
+| **Q2** | **every** artifact | the mirror rule says `quarantine/<X>` belongs to `archive/<X>.zst` — the claim is a property of the artifact, not of any run's finding |
+
+Q2's wider set is what its own assertion says: *claimed by some artifact*, not *by a quarantined
+artifact*. It has to be. An artifact quarantined by one run and found clean by a later one has
+`quarantined: false` in the current ledger while its original is still on disk — nothing removes it, by
+design — so the narrow set would report the design's own behaviour as foreign matter, again in the
+store with the most history first.
 
 **Q0 is the one that catches the collision, and it opens nothing.** Q1 does not: when two artifacts
 collided onto one path, that path exists, so existence is satisfied for both while one original is
@@ -1040,7 +1071,25 @@ a store dir (§5), it is something only an operator can resolve.
 for a scratch file the ledger does not say an original was ever written and Q0/Q1 cannot even be
 asked. The addition is the same additive shape as `present`, `capture_failed` and `not_stored`
 (§3) — default false, emitted only when true. Session artifacts already carry the flag, in both the
-manifest and the catalog.
+manifest and the catalog. Salvage carries it forward with the capture it salvages: the flag describes
+the `.zst` that is still there and the original that still backs it, so dropping it would have the
+ledger deny an original law Q would then read as a stray.
+
+**The quarantine root is classified like any other store path.** `stat` and `readdir` both follow a
+symlink, so a root that is not a directory this run owns would have every check attesting about another
+tree — the same reason §5 classifies the scratch store root, applied to the one path law Q is stated
+over. An **absent** root does not stop the pass, and the asymmetry is the point: a fresh store has no
+claims either, so it reports nothing and creates nothing (W1/R8), while a store whose quarantine tree
+was deleted out from under a ledger that still claims originals must not pass in silence — which is
+precisely what an early return on absence would buy it. Q0 needs no tree at all, and Q1's stats are
+true statements about an empty one.
+
+**Q1 traverses; it does not classify every level.** `symlink_metadata` declines to follow only the
+*final* component, so a symlinked directory inside `quarantine/` is followed and a file beneath it can
+satisfy Q1 — an existence check answered by a file that may not be ours. This is not made silent: the
+link node itself is reported by Q2 as foreign matter, because the sweep does not descend it either.
+Classifying every directory level is disproportionate for a tree nothing reads, so the honest statement
+of Q1's strength is: *a file is at the path*, and **Q3 is what proves it is the right file**.
 
 ### Permission model
 
@@ -1317,20 +1366,75 @@ path — `stat` only), **Q2** (every file under `quarantine/` is claimed by an a
 only). None of them opens a file, which is the property that lets them run in cron over a tree of raw
 secrets.
 
-| Finding | Class |
-|---|---|
-| `QuarantineCollision` — two artifacts derive one quarantine path (**Q0**) | **violation** — one original has overwritten another |
-| `QuarantineMissing` — an artifact recorded `quarantined` has no file at its path (**Q1**) | **violation** |
-| `QuarantineLegacyLayout` — a file at a path a superseded derivation produced (**Q2**) | **foreign matter** — advisory; also the inventory for a by-hand reconciliation |
-| `QuarantineStray` — a file matching no derivation, current or legacy (**Q2**) | **foreign matter** — advisory |
+| Finding | Class | Needs exclusion |
+|---|---|---|
+| `QuarantineForeignRoot` — `quarantine/` is not a directory this run owns | **refused key** | no |
+| `QuarantineCollision` — two artifacts derive one quarantine path (**Q0**) | **violation** — one original has overwritten another | no |
+| `QuarantineMissing` — an artifact recorded `quarantined` has a file at neither its path nor any superseded one (**Q1**) | **violation** | no |
+| `QuarantineLegacyLayout` — a file at a path a superseded derivation produced, whether found for a claim (**Q1**) or unowned (**Q2**) | **foreign matter** — advisory; also the inventory for a by-hand reconciliation | no |
+| `QuarantineStray` — a file matching no derivation, current or legacy (**Q2**) | **foreign matter** — advisory | **yes** |
+| `QuarantineMismatch` — the original does not hash to `source_sha256` (**Q3**) | **violation** | **yes** |
+| `QuarantineNoSourceHash` — Q3 was asked and the ledger records no `source_sha256` | **unverifiable** | no |
 
 Q0 is the check that catches the collision, and Q1 is not: when two originals collided onto one path
 that path exists, so existence holds for both while one original is gone. Q0 also finds the damage
 retrospectively, from the ledger alone.
 
+**The exclusion column follows from the write order, which is the same at every writer: the original is
+quarantined *before* the store write and before the ledger update.** So a concurrent `archive` can
+transiently produce a file no row yet claims — the Q2 direction, hence `QuarantineStray` downgrades —
+but never a claim whose file is missing, hence Q1 stands. Nothing ever removes a file from
+`quarantine/`, which closes the other direction. `QuarantineMismatch` downgrades because re-quarantining
+an artifact whose source changed rewrites the original in place, so mid-run the file and the ledger's
+`source_sha256` legitimately disagree. Q0 is ledger-only, and a legacy-layout path is one no current
+writer produces at all.
+
 **Q3 — the original hashes to the artifact's `source_sha256` — runs only under `verify --quarantine`.**
 It hashes and drops, exactly as the store pass does, so no finding carries content; the flag exists so
 that opening raw secrets is an attended decision rather than a nightly habit (§4).
+
+**When Q3 is asked and cannot be answered, it must say so.** A claim carrying no `source_sha256` is not
+currently produced by any writer — `quarantined` is set immediately before the hash is recorded — but a
+hand-edited or corrupted ledger reaches it, the same population that produces `UndecodableEntry` and
+`DuplicateIdentity`, and salvage carries both fields forward together so a future change to its shape
+could reach it too. Silently skipping is the one behaviour the three vocabularies exist to prevent:
+`NoContentHash` is exactly this shape in S2. `QuarantineNoSourceHash` is emitted **only when Q3 was
+requested** — in the default path nothing is checked, and the silence there is correct.
+
+**Q2 does not run under a session selector.** "Every file under `quarantine/` is claimed" is a statement
+about the whole tree, and a selector narrows the ledger — so every other session's originals would read
+as strays. A partial ledger cannot support a whole-tree accusation, which is the same rule that stops
+the orphan sweep on a key it cannot fully name. The report says `swept: false` rather than reporting
+zero strays, because "not asked" and "asked and clean" are not the same answer.
+
+**A subtree whose ledger was refused is not judged.** When the scratch pass refuses a key — a foreign
+store dir, a missing or unreadable manifest, an undecodable entry — it hands law Q that key's
+quarantine subtree as *unexamined*, and the sweep passes over everything beneath it. Nothing there can
+be called a stray, because nothing there can be shown to be unclaimed: an unreadable record is a reason
+to refuse, not a licence to accuse what it describes.
+
+**The same must hold when a whole ledger is gone, and two cases currently do not.**
+
+- **`archive/_scratch/` absent.** The scratch pass returns early without marking anything unexamined,
+  so if that directory was *deleted* while `quarantine/_scratch/…` still holds originals, every one of
+  them reads as a stray. Advisory, so nothing fails — but the label is false, and a false reason is
+  worse than a coarse one (D-S7). Mark `_scratch` unexamined on absence too: on a store that never
+  archived scratch the mark covers an empty subtree and costs nothing, and on a store that lost the
+  directory it says the true thing.
+- **`catalog.db` absent.** `open_env_read` substitutes an empty in-memory catalog, so a store that
+  lost its catalog beside a populated `archive/` is indistinguishable from a fresh one — and law Q
+  then reports **every** session original as a stray. This is the manifest's `Missing`-versus-
+  `Unreadable` distinction, unmade one layer down, and it is the same store state §5's `NotAttempted`
+  identifies for the lock gate. Both belong to the store-shape work in §9 P6.7: `open_env_read` should
+  tell a fresh store from one whose catalog is missing, and `verify` should withhold Q2 — saying why —
+  in the second case rather than accusing a tree it has no ledger for.
+
+**B2 has made the lock-gate defect more expensive.** A store that lost its marker and its catalog never
+attempts the lock, so `exclusive` is permanently false — and that now permanently downgrades
+`QuarantineStray` and `QuarantineMismatch` as well as the scratch comparatives. On such a store law Q
+can confirm and can never accuse. The repair is unchanged (§5, `NotAttempted`), but it has moved from
+*a defect in one pass* to *a precondition for two*, and should be sequenced ahead of the rest of P6.7 if
+that unit is scheduled late.
 
 Scope: session artifacts come from the catalog (`quarantined`, `stored_path`, `source_sha256`); scratch
 comes from its manifest and needs the `quarantined` flag §4 specifies before Q applies to it at all.
@@ -1401,7 +1505,15 @@ the loudest false alarm, in place.
 nothing about exclusion; they push an issue and the report decides where it lands, with
 `requires_exclusion()` as the single predicate. That predicate is an exhaustive `match`, so a new issue
 that fails to declare itself does not silently stand — it fails to compile. "Someone adds a comparative
-check and forgets the downgrade" is designed out rather than remembered.
+check and forgets the downgrade" is designed out rather than remembered. Both passes share one
+`FindingClass`, so *which class fails the run* stays a single decision rather than one per tree; the
+emitted strings are unchanged.
+
+> This paragraph was, for one round, false about the code — the predicate was a `matches!`, which
+> answers `false` for an undeclared issue in silence. A claim of the form *"X is impossible by
+> construction"* is worth exactly the construction behind it, and this document has now made that
+> mistake twice (the other: the store-root classification, stated for three layers and implemented at
+> one). Such a claim is to be verified against the code, not asserted about it.
 
 **Exclusion is store-wide and cannot be per-key.** While `archive` writes key A, comparative findings
 for keys B…Z are downgraded too. The lock is the only exclusion signal that exists, and per-key locking
@@ -1888,9 +2000,14 @@ each finding a `{key, rel, issue, class}`. `rel` is the lossy display path and i
 findings; it is never an identity (§3). The human form prints the same, one labelled block per class,
 so a reader can see the class of every finding without consulting this document.
 
-A `quarantine` section reports law Q (§5) beside the `scratch` section: `checked`, and the same four
-finding lists. `--quarantine` adds **Q3**, the only check that opens a file under `quarantine/` — it is
-a flag rather than a default precisely so that reading raw secrets stays an attended decision (§4).
+A `quarantine` section reports law Q (§5) beside the `scratch` section, with the same four finding
+lists plus `claims`, `present`, `legacy`, `swept`, `files`, `unexamined`, `opened_originals` and
+`verified`. Three of those are there so a reader can tell *not asked* from *asked and clean*, which is
+the distinction the whole vocabulary rests on: `swept: false` says the stray sweep did not run (a
+session selector narrows the ledger, and a partial ledger cannot support a whole-tree accusation),
+`opened_originals: false` says no original was hashed, and `unexamined` counts files under a ledger
+this run refused. `--quarantine` adds **Q3**, the only check that opens a file under `quarantine/` — a
+flag rather than a default precisely so that reading raw secrets stays an attended decision (§4).
 
 `--all` is an explicit alias for "no session", not an independent mode: the two are mutually exclusive
 and omitting both is the same as `--all`. The flag is currently never read — the positional alone
@@ -2095,6 +2212,25 @@ Load-bearing fixtures: secret-scan **must** catch AKIA/PRIVATE KEY; double-archi
      **U5-B2 — law Q in `verify`** (§4, §5). Q0/Q1/Q2 by default, opening nothing; Q3 under
      `--quarantine`. Depends on B1 for the derivation and the flag. Same shape as U2→U3: one unit stops
      producing the defect, the next detects it, including retrospectively.
+     **(implemented; in review)**
+
+     Q3's isolation is carried by a **type**, not by discipline: the permission token has a private
+     field, one constructor that takes the flag, and the only code in the crate that opens a file under
+     `quarantine/` is a private method on it. Forgetting the flag is a compile error rather than a leak
+     — which is what §4 asked for and better than what it specified.
+
+     Three adjustments, all adopted and now written into §4/§5: **Q1's legacy fallback** (leaving it
+     out was an inconsistency in §4, which three paragraphs earlier rules that legacy trees are never
+     migrated — a strict Q1 would have accused this document's own behaviour, nightly, on the oldest
+     stores); **`QuarantineForeignRoot`** (the store-path classification rule applied to the one path
+     law Q is stated over, with absence deliberately *not* an early return); and the exhaustive
+     `requires_exclusion` **match**, which corrected the code to a claim §5 had already made and the
+     code did not meet.
+
+     Outstanding, small: mark `_scratch` unexamined when the scratch root is *absent* (a deleted store
+     dir currently turns every scratch original into a false stray), and add `QuarantineNoSourceHash`
+     so a Q3 that was asked and cannot be answered says so instead of skipping in silence. The
+     `open_env_read` fresh-versus-missing distinction belongs to P6.7 with the lock gate.
 
      **`DuplicateIdentity` in `verify`** (§5) — a violation, and `prior_tail` collapsing retained
      entries by identity so archive cannot propagate one. Closes the referral `read --scratch` already
@@ -2113,7 +2249,11 @@ Load-bearing fixtures: secret-scan **must** catch AKIA/PRIVATE KEY; double-archi
      beneath it classifying `Own`. Independent of scratch and reaching every command, hence its own
      unit rather than a line in the defect sweep. Carries the corrected lock-gate predicate with it
      (§5, `NotAttempted`): a distinct store-shape test, not a widening of `is_initialized()`, whose
-     other caller is not a lock gate.
+     other caller is not a lock gate. Also `open_env_read` telling a fresh store from one whose
+     `catalog.db` is missing beside a populated `archive/` — the same question, one layer down, and
+     without it law Q reports every session original as a stray on such a store (§5). B2 raised the
+     cost of the lock gate specifically: `exclusive: false` now permanently disarms two law-Q checks as
+     well as the scratch comparatives, so this predicate should lead the unit.
 
   *Done:* an archived scratch file is retrievable by `yomi read --scratch --file`, byte-identical to
   its stored (post-redaction) content; a corrupted or orphaned scratch store fails `yomi verify` while

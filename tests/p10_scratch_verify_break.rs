@@ -169,6 +169,11 @@ struct Verify {
 }
 
 impl Verify {
+    /// The whole report, not just its `scratch` half — law Q reports beside it.
+    fn stdout_json(&self) -> serde_json::Value {
+        serde_json::from_str(self.stdout.trim()).expect("verify --json")
+    }
+
     fn issues(&self, class: &str) -> Vec<String> {
         self.scratch[class]
             .as_array()
@@ -505,9 +510,21 @@ fn p10_verify_never_reads_the_live_tree() {
     assert_eq!(with_tree.verified(), 2);
 }
 
-/// `quarantine/` holds the raw, un-redacted originals. `verify`'s scratch pass
-/// must neither read them nor name them: they are the one place in the store
-/// where a secret still exists verbatim.
+/// `quarantine/` holds the raw, un-redacted originals. `verify` must not read
+/// them and must not emit them: they are the one place in the store where a
+/// secret still exists verbatim.
+///
+/// **Narrowed when law Q landed (U5-B2), and the reason is in the design.** This
+/// test asserted that the word "quarantine" appears nowhere in the output, which
+/// was a sound proxy while `verify` had no quarantine pass at all. §5 now
+/// requires it to *attest* to that tree — Q0/Q1/Q2 by default, reporting
+/// `QuarantineCollision`, `QuarantineMissing`, `QuarantineLegacyLayout` and
+/// `QuarantineStray` — and a report about a tree cannot avoid naming it. What
+/// the design actually keeps is stronger and is what is asserted here: the
+/// default pass **opens nothing** under `quarantine/`, emits no content, and
+/// leaves every original byte-identical. Names were never part of the claim —
+/// `p10_non_exposure_covers_content_not_filenames` below pins that boundary
+/// explicitly.
 #[test]
 fn p10_verify_never_touches_quarantine() {
     let fx = Fx::new("quarantine");
@@ -553,11 +570,15 @@ fn p10_verify_never_touches_quarantine() {
             !contains(text.as_bytes(), FIXTURE_AKIA.as_bytes()),
             "{label} exposed the quarantined original"
         );
-        assert!(
-            !text.contains("quarantine"),
-            "{label} named the quarantine tree: {text}"
-        );
     }
+    // The default pass reached the tree with `stat` and `readdir` and nothing
+    // else. Opening an original is behind a token only `--quarantine` can mint,
+    // so this is a report of a structural fact, not of a remembered check.
+    assert_eq!(
+        v.stdout_json()["quarantine"]["opened_originals"],
+        serde_json::Value::Bool(false),
+        "verify opened a file containing a raw secret without --quarantine"
+    );
     for (p, before, _) in &originals {
         assert_eq!(
             &std::fs::read(p).unwrap(),

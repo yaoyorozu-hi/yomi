@@ -1088,10 +1088,22 @@ fn prior_tail(
     let live: std::collections::HashSet<&ScratchRel> = live.iter().map(|(_, r)| r).collect();
     let mut vanished: Vec<(ScratchRel, ScratchEntry)> = Vec::new();
     let mut undecodable: Vec<ScratchEntry> = Vec::new();
+    // Retained entries are collapsed by identity. Archive cannot *create* a
+    // duplicate — the live pass yields one entry per walked path and this tail
+    // skips identities already live — and it must not be able to *propagate* one
+    // either: two prior rows sharing an identity would otherwise be carried
+    // forward together on every subsequent run, so a defect that arrived by
+    // hand-editing or corruption would become permanent. The first row wins;
+    // `verify` reports the duplicate on the manifest that still holds it, and
+    // repairing one already on disk stays a manual act.
+    let mut retained: std::collections::HashSet<ScratchRel> = std::collections::HashSet::new();
     for e in &prior.entries {
         match e.rel() {
             Some(rel) if live.contains(&rel) => {}
             Some(rel) => {
+                if !retained.insert(rel.clone()) {
+                    continue;
+                }
                 let mut e = e.clone();
                 e.present = false;
                 vanished.push((rel, e));
