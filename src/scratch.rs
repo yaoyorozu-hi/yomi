@@ -232,6 +232,74 @@ pub struct ScratchEntry {
     /// as it did.
     #[serde(default, skip_serializing_if = "is_false")]
     pub capture_failed: bool,
+    /// Which policy rule declined to store this file, recorded rather than
+    /// reconstructed.
+    ///
+    /// The manifest used to record only the outcome, so a reader explaining a
+    /// `stored: false` entry had to infer the cause from the config in force
+    /// *now* — which is not the one that produced the entry. Widen `file_cap`
+    /// after the fact and an entry rejected at capture for exceeding the old cap
+    /// is thereafter explained as "the globs did not admit it": a confident,
+    /// wrong answer. A retained entry makes it worse still, since it carries a
+    /// decision taken under a config several changes old. Recorded here, the
+    /// explanation travels with the entry and stays true.
+    ///
+    /// `over_total_cap` and `capture_failed` are deliberately **not** in this
+    /// set: the first is a property of the tree and lives on the manifest, and
+    /// the second answers a different question — *nothing was read*, rather than
+    /// *we decided not to keep it*.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_stored: Option<NotStored>,
+    /// The candidate's inode was on the denylist, so it was never opened —
+    /// §4 forbids opening a blacklisted path for read or delete.
+    ///
+    /// Manifested (with `bytes: 0` and no `stat`, so nothing about the denied
+    /// inode is recorded) purely so the tree's refusal is diagnosable: an
+    /// unmanifested file made the GC gate refuse forever, reported only as
+    /// `NoCatalogRow`. Safety is unchanged — `remove_tree_guarded` already
+    /// aborts a whole-tree removal on a denylisted inode.
+    ///
+    /// It belongs beside `capture_failed`, not inside `not_stored`: both say
+    /// *nothing was read*, where `not_stored` says *we decided not to keep it*.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub blacklisted: bool,
+}
+
+/// The policy rule that declined to store a file — exactly the three causes
+/// `store = allow.is_match && !deny.is_match && size <= file_cap` can produce.
+///
+/// `NotAllowed` and `Denied` are kept apart because they call for different
+/// configuration edits: adding an allow pattern versus removing a deny one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotStored {
+    /// No `[scratch] allow` glob matched.
+    NotAllowed,
+    /// A `[scratch] deny` glob matched.
+    Denied,
+    /// Larger than `[scratch] file_cap` as it stood at capture.
+    FileCap,
+}
+
+impl NotStored {
+    /// Phrased so every variant names the rule set an operator would edit, and
+    /// the parenthetical names which half of it decided.
+    pub fn reason(self) -> &'static str {
+        match self {
+            NotStored::NotAllowed => {
+                "the [scratch] allow/deny globs did not admit it (no allow glob matched)"
+            }
+            NotStored::Denied => {
+                "the [scratch] allow/deny globs did not admit it (a deny glob matched)"
+            }
+            // Deliberately without the cap's value: that would come from the
+            // config in force now, and the whole point of recording the cause is
+            // that the explanation does not move when the config does.
+            NotStored::FileCap => {
+                "it was over the [scratch] file_cap in force when it was captured"
+            }
+        }
+    }
 }
 
 fn present_default() -> bool {
@@ -249,17 +317,24 @@ fn is_false(flag: &bool) -> bool {
 impl ScratchEntry {
     /// A fresh entry for `rel`, with no hashes yet — the writer fills those in
     /// only after the bytes are actually stored.
-    pub fn new(rel: &ScratchRel, bytes: u64, stored: bool) -> Self {
+    ///
+    /// `stored` is derived from `not_stored` rather than passed alongside it, so
+    /// the two cannot be written into contradiction. (The tree cap flips
+    /// `stored` afterwards without a policy cause; `stored: true` still implies
+    /// `not_stored: None`.)
+    pub fn new(rel: &ScratchRel, bytes: u64, not_stored: Option<NotStored>) -> Self {
         let (path, path_hex) = rel.manifest_fields();
         ScratchEntry {
             path,
             path_hex,
             bytes,
-            stored,
+            stored: not_stored.is_none(),
             source_sha256: None,
             content_sha256: None,
             present: true,
             capture_failed: false,
+            not_stored,
+            blacklisted: false,
         }
     }
 
@@ -361,6 +436,314 @@ pub fn read_manifest(path: &Path) -> Option<ScratchManifest> {
     match read_manifest_at(path) {
         ManifestRead::Ok(mf) => Some(mf),
         ManifestRead::Missing | ManifestRead::Unreadable => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Retrieval — what `yomi read --scratch` opens (design §3, §8).
+// ---------------------------------------------------------------------------
+
+/// Why a store could not be opened for reading. Each is exit 2 with its own
+/// reason: "not found" is never reported for a store that exists but was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoreOpenError {
+    /// `archive/_scratch/` does not exist — nothing has ever been archived.
+    NoRoot,
+    /// The store root is not a directory yomi owns, or could not be enumerated.
+    /// Every key resolves *through* the root, so this refuses all of them.
+    ForeignRoot,
+    UnreadableRoot,
+    /// No store key answers to this selector.
+    NotFound,
+    /// More than one does. Never guess between stores.
+    Ambiguous(Vec<String>),
+    /// The key resolved, but its store directory is not one yomi owns.
+    ForeignStoreDir(String),
+    NoManifest(String),
+    UnreadableManifest(String),
+}
+
+impl StoreOpenError {
+    /// A stable token for `--json`, so a caller can branch without parsing prose.
+    pub fn code(&self) -> &'static str {
+        match self {
+            StoreOpenError::NoRoot => "NoScratchStore",
+            StoreOpenError::ForeignRoot => "ForeignStoreRoot",
+            StoreOpenError::UnreadableRoot => "UnreadableStoreRoot",
+            StoreOpenError::NotFound => "NotFound",
+            StoreOpenError::Ambiguous(_) => "Ambiguous",
+            StoreOpenError::ForeignStoreDir(_) => "ForeignStoreDir",
+            StoreOpenError::NoManifest(_) => "NoManifest",
+            StoreOpenError::UnreadableManifest(_) => "UnreadableManifest",
+        }
+    }
+
+    pub fn reason(&self) -> String {
+        match self {
+            StoreOpenError::NoRoot => "no scratch has ever been archived into this store".into(),
+            StoreOpenError::ForeignRoot => {
+                "the scratch store root is not a directory this run owns; refusing to read \
+                 through it"
+                    .into()
+            }
+            StoreOpenError::UnreadableRoot => "the scratch store root could not be read".into(),
+            StoreOpenError::NotFound => {
+                "no archived scratch tree answers to that session or key".into()
+            }
+            StoreOpenError::Ambiguous(keys) => format!(
+                "that selector matches {} store keys ({}); name one exactly",
+                keys.len(),
+                keys.join(", ")
+            ),
+            StoreOpenError::ForeignStoreDir(k) => format!(
+                "the store directory for {k} is not one this run owns; refusing to read through it"
+            ),
+            StoreOpenError::NoManifest(k) => format!("{k} has no manifest.json"),
+            StoreOpenError::UnreadableManifest(k) => {
+                format!("{k}'s manifest.json could not be read")
+            }
+        }
+    }
+}
+
+/// A scratch store directory that **has been classified as ours**, with the
+/// ledger inside it.
+///
+/// The only constructor is [`ScratchStore::open`], which classifies the root and
+/// the key before it reads anything under either — so holding one of these *is*
+/// the proof that the classification happened. Nothing can read a scratch store
+/// without first passing through it.
+pub struct ScratchStore {
+    key: String,
+    dir: PathBuf,
+    manifest: ScratchManifest,
+}
+
+impl ScratchStore {
+    /// Resolve `selector` — a session uuid or a full store key — to its store,
+    /// classifying every path level before opening anything under it.
+    ///
+    /// The root is classified as well as the key, because a key is resolved
+    /// *through* the root: a foreign root makes every key foreign while each one
+    /// still classifies `Own` on its own. This is the fifth layer to go through
+    /// [`classify_store_dir`], after the writer, the reconciler, the GC gate and
+    /// `verify`.
+    pub fn open(archive_dir: &Path, selector: &OsStr) -> Result<Self, StoreOpenError> {
+        let root = store_root(archive_dir);
+        match classify_store_dir(&root) {
+            StoreDir::Absent => return Err(StoreOpenError::NoRoot),
+            StoreDir::Foreign => return Err(StoreOpenError::ForeignRoot),
+            StoreDir::Own => {}
+        }
+        let Ok(dir) = std::fs::read_dir(&root) else {
+            return Err(StoreOpenError::UnreadableRoot);
+        };
+
+        let mut matched: Vec<String> = Vec::new();
+        for e in dir.flatten() {
+            let key = e.file_name().to_string_lossy().into_owned();
+            // A full key names itself; a uuid names the one store carrying it.
+            // `store_key_matches_session` is the shared resolver — a suffix test
+            // cannot address a hex key, and this must not be reimplemented here.
+            if OsStr::new(&key) == selector || store_key_matches_session(&key, selector) {
+                matched.push(key);
+            }
+        }
+        matched.sort();
+        matched.dedup();
+        let key = match matched.len() {
+            0 => return Err(StoreOpenError::NotFound),
+            1 => matched.remove(0),
+            _ => return Err(StoreOpenError::Ambiguous(matched)),
+        };
+
+        let dir = root.join(&key);
+        if classify_store_dir(&dir) != StoreDir::Own {
+            return Err(StoreOpenError::ForeignStoreDir(key));
+        }
+        let manifest = match read_manifest_at(&dir.join("manifest.json")) {
+            ManifestRead::Ok(mf) => mf,
+            ManifestRead::Missing => return Err(StoreOpenError::NoManifest(key)),
+            ManifestRead::Unreadable => return Err(StoreOpenError::UnreadableManifest(key)),
+        };
+        Ok(ScratchStore { key, dir, manifest })
+    }
+
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    pub fn manifest(&self) -> &ScratchManifest {
+        &self.manifest
+    }
+
+    /// The entry whose identity is exactly `wanted`.
+    ///
+    /// A **byte comparison against the ledger**, never a path construction: the
+    /// caller's value is compared to each entry's [`ScratchRel::as_bytes`] and
+    /// discarded. What comes back carries the *matched entry's* identity, so the
+    /// path that is eventually opened is derived from the manifest and never from
+    /// user input.
+    pub fn find(&self, wanted: &OsStr) -> Option<StoredEntry<'_>> {
+        let matched: Vec<(&ScratchEntry, ScratchRel)> = self
+            .manifest
+            .entries
+            .iter()
+            .filter_map(|entry| {
+                let rel = entry.rel()?;
+                if rel.as_bytes() != wanted.as_bytes() {
+                    return None;
+                }
+                Some((entry, rel))
+            })
+            .collect();
+        if matched.len() > 1 {
+            // A damaged ledger, and the one moment retrieval matters most. Every
+            // row here names the same identity and therefore the same artifact
+            // path, so choosing between them cannot answer about the wrong file
+            // — unlike an ambiguous *key*, where guessing would read a different
+            // session. Refusing would deny bytes that are demonstrably on disk
+            // and add nothing to safety, since reading destroys nothing: "a
+            // ledger yomi cannot read is a reason to refuse to *destroy*", not a
+            // reason to withhold. Prefer the row the store corroborates, and say
+            // the ledger is damaged rather than resolve it silently.
+            tracing::warn!(
+                key = %self.key,
+                rel = %String::from_utf8_lossy(wanted.as_bytes()),
+                rows = matched.len(),
+                "the ledger holds more than one entry for this identity; serving the \
+                 one the store corroborates. Run `yomi verify` and repair the manifest."
+            );
+        }
+        let (entry, rel) = matched
+            .iter()
+            .find(|(e, _)| e.stored)
+            .or_else(|| matched.first())?;
+        Some(StoredEntry {
+            store: self,
+            entry,
+            rel: rel.clone(),
+        })
+    }
+}
+
+/// Whether `path` holds an artifact yomi stored: a **regular file**, judged
+/// without following a symlink.
+///
+/// One predicate for every layer that asks the question. S1's left side is
+/// regular files only because reconciliation will not remove anything else —
+/// that would widen the delete authority past "the artifacts we stored" — so
+/// anything else is foreign matter only an operator can clear. `verify` and the
+/// read path must not be able to answer differently about one object.
+pub fn is_stored_artifact(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|md| md.is_file())
+}
+
+/// Why an entry's stored bytes could not be produced.
+///
+/// Every one is a statement about the **store**, not a failure of the tool, so
+/// each is a coded refusal rather than an error: `read` can serve or not serve,
+/// it never accuses. Distinguishing a transient window from a real defect needs
+/// the write lock, which is `yomi verify`'s job, so the messages point there
+/// instead of guessing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactError {
+    /// The ledger claims this artifact and the store does not hold it.
+    Missing,
+    /// Something is at the path, but it is not a regular file.
+    Foreign,
+    /// A regular file that could not be read.
+    Unreadable,
+    /// Read, but it did not decompress.
+    Corrupt,
+}
+
+impl ArtifactError {
+    /// A stable token for `--json`. `MissingArtifact` and `ForeignArtifact` are
+    /// deliberately the names `verify` already uses for the same conditions.
+    pub fn code(self) -> &'static str {
+        match self {
+            ArtifactError::Missing => "MissingArtifact",
+            ArtifactError::Foreign => "ForeignArtifact",
+            ArtifactError::Unreadable => "UnreadableArtifact",
+            ArtifactError::Corrupt => "CorruptArtifact",
+        }
+    }
+
+    /// States the fact and names where the cause can be settled. It does **not**
+    /// assert a cause: a concurrent `archive` and a real store defect are
+    /// indistinguishable from here.
+    pub fn reason(self) -> &'static str {
+        match self {
+            ArtifactError::Missing => {
+                "the ledger claims this artifact and the store does not hold it. A \
+                 concurrent `yomi archive` passes through this state; only `yomi verify` \
+                 under the write lock can tell that apart from a store defect"
+            }
+            ArtifactError::Foreign => {
+                "the object at this artifact's path is not a regular file, so it is not \
+                 something yomi stored. `yomi verify` reports it as foreign matter; only \
+                 an operator can resolve it"
+            }
+            ArtifactError::Unreadable => {
+                "this artifact is present but could not be read; run `yomi verify` for the \
+                 store's condition"
+            }
+            ArtifactError::Corrupt => {
+                "this artifact did not decompress; run `yomi verify` for the store's \
+                 condition"
+            }
+        }
+    }
+}
+
+/// One manifest entry, bound to the classified store it came from.
+///
+/// It has no public constructor: [`ScratchStore::find`] is the only way to obtain
+/// one. [`StoredEntry::read`] therefore takes **no arguments** — there is no
+/// function anywhere that turns a path or a string into stored bytes, so
+/// traversal is not defended against, it is unrepresentable. `ScratchRel` cannot
+/// hold `..` or an absolute path either (its components are all `Normal`), so the
+/// join below cannot leave the store directory even in principle.
+pub struct StoredEntry<'a> {
+    store: &'a ScratchStore,
+    entry: &'a ScratchEntry,
+    rel: ScratchRel,
+}
+
+impl StoredEntry<'_> {
+    pub fn entry(&self) -> &ScratchEntry {
+        self.entry
+    }
+
+    pub fn rel(&self) -> &ScratchRel {
+        &self.rel
+    }
+
+    /// The entry's decompressed stored bytes — `scan.redacted` as of capture,
+    /// which is either in-place-redacted text or the opaque `‹QUARANTINED:…›`
+    /// marker.
+    ///
+    /// The one and only path this opens is `<store dir>/<rel>.zst`, and the
+    /// **object** at that path is classified before it is read: a path being
+    /// beyond reproach says nothing about what sits at the end of it. Anything
+    /// that is not a regular file is [`ArtifactError::Foreign`] — the same
+    /// judgment and the same name `verify` gives it, so the two layers cannot
+    /// answer differently about one object.
+    ///
+    /// The live source and `quarantine/` are never opened, so there is no input
+    /// from which an un-redacted byte could reach a caller.
+    pub fn read(&self) -> Result<Vec<u8>, ArtifactError> {
+        let path = self.store.dir.join(self.rel.store_rel());
+        if !is_stored_artifact(&path) {
+            return Err(if path.symlink_metadata().is_ok() {
+                ArtifactError::Foreign
+            } else {
+                ArtifactError::Missing
+            });
+        }
+        let raw = std::fs::read(&path).map_err(|_| ArtifactError::Unreadable)?;
+        crate::archive::compress::decompress_all(&raw).map_err(|_| ArtifactError::Corrupt)
     }
 }
 
@@ -690,7 +1073,9 @@ fn verify_one_store(report: &mut ScratchVerifyReport, key: &str, store_dir: &Pat
         if e.path().extension().and_then(|x| x.to_str()) != Some("zst") {
             continue;
         }
-        if e.file_type().is_file() {
+        // The same predicate the read path applies, so the two layers cannot
+        // classify one object differently.
+        if is_stored_artifact(e.path()) {
             regular.insert(e.path().to_path_buf());
         } else {
             report.push(
@@ -1126,7 +1511,7 @@ mod tests {
     #[test]
     fn utf8_entry_serializes_without_the_hex_field() {
         let rel = live("/tmp/s/uuid", b"scratchpad/a.md").unwrap();
-        let mut e = ScratchEntry::new(&rel, 7, true);
+        let mut e = ScratchEntry::new(&rel, 7, None);
         e.source_sha256 = Some("aa".into());
         e.content_sha256 = Some("bb".into());
         assert_eq!(
@@ -1134,11 +1519,14 @@ mod tests {
             r#"{"path":"scratchpad/a.md","bytes":7,"stored":true,"source_sha256":"aa","content_sha256":"bb"}"#
         );
 
+        // A non-stored entry carries the recorded cause and nothing else; the
+        // pre-`not_stored` shape is what an *unknown* cause still serializes to,
+        // which is what keeps an old manifest readable unchanged.
         let odd = live("/tmp/s/uuid", b"scratchpad/n-\xff.md").unwrap();
-        let e = ScratchEntry::new(&odd, 3, false);
+        let e = ScratchEntry::new(&odd, 3, Some(NotStored::Denied));
         assert_eq!(
             serde_json::to_string(&e).unwrap(),
-            r#"{"path":"scratchpad/n-\u{fffd}.md","path_hex":"736372617463687061642f6e2dff2e6d64","bytes":3,"stored":false}"#
+            r#"{"path":"scratchpad/n-\u{fffd}.md","path_hex":"736372617463687061642f6e2dff2e6d64","bytes":3,"stored":false,"not_stored":"denied"}"#
                 .replace("\\u{fffd}", "\u{fffd}")
         );
         assert_eq!(e.rel().unwrap(), odd);
