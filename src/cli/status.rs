@@ -4,7 +4,11 @@ use crate::catalog;
 use crate::config::Env;
 use crate::lock::WriteLock;
 use crate::model::Severity;
+use crate::scan::quarantine::{
+    OpenOriginals, QuarantineClaim, QuarantineFinding, SweepScope, verify_law_q,
+};
 use anyhow::Result;
+use std::path::PathBuf;
 
 #[derive(clap::Args)]
 pub struct StatusArgs {
@@ -28,6 +32,12 @@ pub struct VerifyArgs {
     /// silently ignored flag.
     #[arg(long, conflicts_with = "session")]
     pub all: bool,
+    /// Also check Q3: that each quarantined original still hashes to its
+    /// artifact's source. This **opens files that contain raw secrets** — every
+    /// other check in this command opens nothing under `quarantine/` — so it is
+    /// an attended, deliberate act and never belongs in cron.
+    #[arg(long)]
+    pub quarantine: bool,
 }
 
 pub fn run_status(env: &Env, args: &StatusArgs, json: bool) -> Result<i32> {
@@ -157,6 +167,36 @@ pub fn run_verify(env: &Env, args: &VerifyArgs, json: bool) -> Result<i32> {
         lock.is_some(),
     );
 
+    // Law Q (§4). The ledger is the catalog for session artifacts and the
+    // manifests for scratch — the pass above already read those, under the
+    // store-dir guards, so its claims are the ones this may trust.
+    let mut claims: Vec<QuarantineClaim> = rows
+        .iter()
+        .map(|r| QuarantineClaim {
+            owner: format!("{} [{}]", r.session_uuid, r.role),
+            stored_rel: PathBuf::from(&r.stored_path),
+            quarantined: r.quarantined,
+            source_sha256: Some(r.source_sha256.clone()),
+        })
+        .collect();
+    claims.extend(scratch.quarantine_claims.iter().cloned());
+    // Q2 is a statement about the *whole* tree: "every file under `quarantine/`
+    // is claimed by some artifact". A session selector narrows the ledger, so
+    // the sweep would report every other session's originals as strays — a
+    // partial ledger cannot support a whole-tree accusation, which is the same
+    // rule that stops the orphan sweep on a key it cannot fully name.
+    let sweep = args.session.is_none().then(|| SweepScope {
+        unexamined: &scratch.quarantine_unexamined,
+    });
+    let open = OpenOriginals::requested(args.quarantine);
+    let q = verify_law_q(
+        &env.quarantine_dir(),
+        &claims,
+        sweep,
+        lock.is_some(),
+        open.as_ref(),
+    );
+
     if json {
         let v = serde_json::json!({
             "verified": ok,
@@ -170,6 +210,20 @@ pub fn run_verify(env: &Env, args: &VerifyArgs, json: bool) -> Result<i32> {
                 "unverifiable": findings_json(&scratch.unverifiable),
                 "foreign_matter": findings_json(&scratch.foreign_matter),
                 "refused": findings_json(&scratch.refused),
+            },
+            "quarantine": {
+                "claims": q.claims,
+                "present": q.present,
+                "legacy": q.legacy,
+                "opened_originals": q.opened_originals,
+                "verified": q.verified,
+                "swept": q.swept,
+                "files": q.files,
+                "unexamined": q.unexamined,
+                "violations": q_findings_json(&q.violations),
+                "unverifiable": q_findings_json(&q.unverifiable),
+                "foreign_matter": q_findings_json(&q.foreign_matter),
+                "refused": q_findings_json(&q.refused),
             },
         });
         println!("{}", serde_json::to_string_pretty(&v)?);
@@ -198,8 +252,55 @@ pub fn run_verify(env: &Env, args: &VerifyArgs, json: bool) -> Result<i32> {
         emit_findings("refused keys", &scratch.refused);
         emit_findings("unverifiable", &scratch.unverifiable);
         emit_findings("foreign matter", &scratch.foreign_matter);
+
+        println!(
+            "Quarantine: {} originals recorded, {} present{}{}.",
+            q.claims,
+            q.present,
+            if q.legacy > 0 {
+                format!(", {} only at a superseded path", q.legacy)
+            } else {
+                String::new()
+            },
+            if q.opened_originals {
+                format!(", {} hashed to their source", q.verified)
+            } else {
+                String::new()
+            }
+        );
+        if q.swept {
+            println!(
+                "  swept {} file(s){}.",
+                q.files,
+                if q.unexamined > 0 {
+                    format!(
+                        ", {} left unjudged under a key whose ledger was refused",
+                        q.unexamined
+                    )
+                } else {
+                    String::new()
+                }
+            );
+        } else {
+            println!(
+                "  strays not swept: a session selector narrows the ledger, and \
+                 \"every file under quarantine/ is claimed\" is a statement about the \
+                 whole tree."
+            );
+        }
+        if !q.opened_originals {
+            println!(
+                "  originals not opened: pass --quarantine to check that each one \
+                 still hashes to its source. Everything above was decided from the \
+                 ledger, a stat and a readdir."
+            );
+        }
+        q_emit_findings("QUARANTINE VIOLATIONS", &q.violations);
+        q_emit_findings("quarantine refusals", &q.refused);
+        q_emit_findings("quarantine unverifiable", &q.unverifiable);
+        q_emit_findings("quarantine foreign matter", &q.foreign_matter);
     }
-    Ok(if failed.is_empty() && !scratch.failed() {
+    Ok(if failed.is_empty() && !scratch.failed() && !q.failed() {
         EXIT_OK
     } else {
         EXIT_PARTIAL
@@ -215,6 +316,31 @@ fn findings_json(v: &[crate::scratch::ScratchFinding]) -> Vec<serde_json::Value>
             })
         })
         .collect()
+}
+
+fn q_findings_json(v: &[QuarantineFinding]) -> Vec<serde_json::Value> {
+    v.iter()
+        .map(|f| {
+            serde_json::json!({
+                "artifact": f.owner, "rel": f.rel, "issue": f.issue.as_str(),
+                "class": f.class.as_str(),
+            })
+        })
+        .collect()
+}
+
+fn q_emit_findings(label: &str, v: &[QuarantineFinding]) {
+    if v.is_empty() {
+        return;
+    }
+    println!("  {label} ({}):", v.len());
+    for f in v {
+        if f.owner.is_empty() {
+            println!("    {} — {}", f.rel, f.issue.as_str());
+        } else {
+            println!("    {} {} — {}", f.owner, f.rel, f.issue.as_str());
+        }
+    }
 }
 
 fn emit_findings(label: &str, v: &[crate::scratch::ScratchFinding]) {

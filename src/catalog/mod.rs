@@ -54,6 +54,12 @@ pub struct VerifyRow {
     pub stored_path: String,
     pub stored_sha256: String,
     pub content_sha256: String,
+    /// Law Q's ledger for a session artifact: whether an unredacted original
+    /// exists for this stored artifact, and — for Q3 — the sha of the bytes that
+    /// were handed to quarantine, which are by definition the ones
+    /// `source_sha256` describes.
+    pub quarantined: bool,
+    pub source_sha256: String,
 }
 
 #[derive(Debug, Default)]
@@ -330,7 +336,8 @@ impl Catalog {
 
     pub fn verify_rows(&self) -> Result<Vec<VerifyRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, session_uuid, role, stored_path, stored_sha256, content_sha256
+            "SELECT id, session_uuid, role, stored_path, stored_sha256, content_sha256,
+                    quarantined, source_sha256
              FROM artifacts ORDER BY id",
         )?;
         let rows = stmt
@@ -341,7 +348,8 @@ impl Catalog {
 
     pub fn verify_rows_for_session(&self, uuid: &str) -> Result<Vec<VerifyRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, session_uuid, role, stored_path, stored_sha256, content_sha256
+            "SELECT id, session_uuid, role, stored_path, stored_sha256, content_sha256,
+                    quarantined, source_sha256
              FROM artifacts WHERE session_uuid = ?1 ORDER BY id",
         )?;
         let rows = stmt
@@ -358,6 +366,8 @@ impl Catalog {
             stored_path: r.get(3)?,
             stored_sha256: r.get(4)?,
             content_sha256: r.get(5)?,
+            quarantined: r.get::<_, i64>(6)? != 0,
+            source_sha256: r.get(7)?,
         })
     }
 

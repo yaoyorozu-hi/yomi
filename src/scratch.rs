@@ -786,10 +786,14 @@ impl StoredEntry<'_> {
 /// Which of the three vocabularies a finding speaks in. Only [`Violation`] and
 /// [`RefusedKey`] fail the run.
 ///
-/// [`Violation`]: ScratchClass::Violation
-/// [`RefusedKey`]: ScratchClass::RefusedKey
+/// Shared by the scratch pass and the quarantine pass (law Q, §4): the classes
+/// are a discipline about *what a finding claims*, not about which tree it came
+/// from, and one enum keeps "which class fails the run" a single decision.
+///
+/// [`Violation`]: FindingClass::Violation
+/// [`RefusedKey`]: FindingClass::RefusedKey
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ScratchClass {
+pub enum FindingClass {
     /// S1 broken, or S2 broken where S2 applies — a defect of the store.
     Violation,
     /// S2 inapplicable (the entry carries no `content_sha256`), or an identity
@@ -806,18 +810,18 @@ pub enum ScratchClass {
     RefusedKey,
 }
 
-impl ScratchClass {
+impl FindingClass {
     /// Whether a finding of this class makes the run exit non-zero.
     pub fn fails_the_run(self) -> bool {
-        matches!(self, ScratchClass::Violation | ScratchClass::RefusedKey)
+        matches!(self, FindingClass::Violation | FindingClass::RefusedKey)
     }
 
     pub fn as_str(self) -> &'static str {
         match self {
-            ScratchClass::Violation => "violation",
-            ScratchClass::Unverifiable => "unverifiable",
-            ScratchClass::ForeignMatter => "foreign matter",
-            ScratchClass::RefusedKey => "refused key",
+            FindingClass::Violation => "violation",
+            FindingClass::Unverifiable => "unverifiable",
+            FindingClass::ForeignMatter => "foreign matter",
+            FindingClass::RefusedKey => "refused key",
         }
     }
 }
@@ -868,25 +872,38 @@ pub enum ScratchIssue {
     NoContentHash,
     /// A `*.zst` that is not a regular file.
     ForeignArtifact,
+    /// Two entries name one identity. `read --scratch` already detects this,
+    /// serves the row the store corroborates, and refers the operator to
+    /// `yomi verify` — which until now could not see the defect at all, so the
+    /// referral went nowhere.
+    ///
+    /// A **violation**, not a refused key: a refused key means the key was not
+    /// examined, and a duplicate prevents nothing. Both rows decode, both are
+    /// checkable against S1 and S2, and because they name one identity they name
+    /// one artifact path, so the orphan sweep stays sound and reconciliation
+    /// stays enabled. Everything remains examinable — what is broken is the
+    /// ledger, and a broken ledger over an intact store is a violation.
+    DuplicateIdentity,
 }
 
 impl ScratchIssue {
-    pub fn class(self) -> ScratchClass {
+    pub fn class(self) -> FindingClass {
         match self {
             ScratchIssue::ForeignStoreDir
             | ScratchIssue::UnreadableStoreRoot
             | ScratchIssue::StoreKeyCollision
-            | ScratchIssue::UnreconcilableKey => ScratchClass::RefusedKey,
+            | ScratchIssue::UnreconcilableKey => FindingClass::RefusedKey,
             ScratchIssue::NoManifest
             | ScratchIssue::UnreadableManifest
             | ScratchIssue::MissingArtifact
             | ScratchIssue::UnclaimedArtifact
             | ScratchIssue::OrphanArtifact
-            | ScratchIssue::ContentMismatch => ScratchClass::Violation,
+            | ScratchIssue::ContentMismatch
+            | ScratchIssue::DuplicateIdentity => FindingClass::Violation,
             ScratchIssue::NoContentHash | ScratchIssue::UndecodableEntry => {
-                ScratchClass::Unverifiable
+                FindingClass::Unverifiable
             }
-            ScratchIssue::ForeignArtifact => ScratchClass::ForeignMatter,
+            ScratchIssue::ForeignArtifact => FindingClass::ForeignMatter,
         }
     }
 
@@ -906,15 +923,31 @@ impl ScratchIssue {
     /// manifest is temp-write + rename, so a reader sees old or new, never torn)
     /// or on the store path's classification, and archive never transiently
     /// produces them.
+    /// An exhaustive `match` rather than a `matches!`, deliberately: a new issue
+    /// that fails to declare itself must not silently stand — it must fail to
+    /// compile. "Someone adds a comparative check and forgets the downgrade" is
+    /// designed out here rather than remembered.
     pub fn requires_exclusion(self) -> bool {
-        matches!(
-            self,
+        match self {
             ScratchIssue::NoManifest
-                | ScratchIssue::MissingArtifact
-                | ScratchIssue::UnclaimedArtifact
-                | ScratchIssue::OrphanArtifact
-                | ScratchIssue::ContentMismatch
-        )
+            | ScratchIssue::MissingArtifact
+            | ScratchIssue::UnclaimedArtifact
+            | ScratchIssue::OrphanArtifact
+            | ScratchIssue::ContentMismatch => true,
+            // Each depends on a single atomically-replaced object or on the
+            // store path's classification, and archive never transiently
+            // produces it. `DuplicateIdentity` is the strongest case: archive
+            // cannot produce one at all, transiently or otherwise.
+            ScratchIssue::ForeignStoreDir
+            | ScratchIssue::UnreadableStoreRoot
+            | ScratchIssue::StoreKeyCollision
+            | ScratchIssue::UnreadableManifest
+            | ScratchIssue::UndecodableEntry
+            | ScratchIssue::UnreconcilableKey
+            | ScratchIssue::NoContentHash
+            | ScratchIssue::ForeignArtifact
+            | ScratchIssue::DuplicateIdentity => false,
+        }
     }
 
     pub fn as_str(self) -> &'static str {
@@ -932,6 +965,7 @@ impl ScratchIssue {
             ScratchIssue::ContentMismatch => "ContentMismatch",
             ScratchIssue::NoContentHash => "NoContentHash",
             ScratchIssue::ForeignArtifact => "ForeignArtifact",
+            ScratchIssue::DuplicateIdentity => "DuplicateIdentity",
         }
     }
 }
@@ -947,7 +981,7 @@ pub struct ScratchFinding {
     /// The class this finding was filed under. Equal to `issue.class()` except
     /// where a comparative finding was downgraded for want of exclusion — the
     /// issue name never changes, only where it lands.
-    pub class: ScratchClass,
+    pub class: FindingClass,
 }
 
 /// The scratch pass's result. Findings are partitioned by class so a caller
@@ -971,6 +1005,16 @@ pub struct ScratchVerifyReport {
     pub unverifiable: Vec<ScratchFinding>,
     pub foreign_matter: Vec<ScratchFinding>,
     pub refused: Vec<ScratchFinding>,
+    /// What scratch contributes to law Q (§4). Collected here rather than by a
+    /// second walk because this pass is the one that reads the manifests — the
+    /// ledger law Q is stated over for scratch — and it reads them under the
+    /// store-dir guards, so a key it refused contributes no claims, which is
+    /// exactly right: a ledger not trusted enough to check S is not trusted
+    /// enough to attest to an original either.
+    pub quarantine_claims: Vec<crate::scan::quarantine::QuarantineClaim>,
+    /// Quarantine-relative subtrees whose ledger was refused, so law Q's sweep
+    /// must not judge anything under them.
+    pub quarantine_unexamined: Vec<PathBuf>,
 }
 
 impl ScratchVerifyReport {
@@ -983,12 +1027,14 @@ impl ScratchVerifyReport {
             unverifiable: Vec::new(),
             foreign_matter: Vec::new(),
             refused: Vec::new(),
+            quarantine_claims: Vec::new(),
+            quarantine_unexamined: Vec::new(),
         }
     }
 
     fn push(&mut self, key: &str, rel: &str, issue: ScratchIssue) {
         let class = if !self.exclusive && issue.requires_exclusion() {
-            ScratchClass::Unverifiable
+            FindingClass::Unverifiable
         } else {
             issue.class()
         };
@@ -999,11 +1045,18 @@ impl ScratchVerifyReport {
             class,
         };
         match class {
-            ScratchClass::Violation => self.violations.push(f),
-            ScratchClass::Unverifiable => self.unverifiable.push(f),
-            ScratchClass::ForeignMatter => self.foreign_matter.push(f),
-            ScratchClass::RefusedKey => self.refused.push(f),
+            FindingClass::Violation => self.violations.push(f),
+            FindingClass::Unverifiable => self.unverifiable.push(f),
+            FindingClass::ForeignMatter => self.foreign_matter.push(f),
+            FindingClass::RefusedKey => self.refused.push(f),
         }
+    }
+
+    /// Mark a scratch subtree as one law Q's sweep must not judge, named
+    /// quarantine-relative (`_scratch/<key>`, which is what `quarantine_rel`
+    /// yields for that key's artifacts).
+    fn unexamine(&mut self, rel: &Path) {
+        self.quarantine_unexamined.push(rel.to_path_buf());
     }
 
     /// Exit 2 on any violation and on any refused key. `unverifiable` and
@@ -1044,16 +1097,27 @@ pub fn verify_stores(
     // ledger. "A foreign ledger must not be read at all" is not a rule about
     // keys; it is a rule about store paths, and the root is one.
     match classify_store_dir(&root) {
-        // A store that has never archived scratch is not a defect (W1/R8).
-        StoreDir::Absent => return report,
+        // A store that has never archived scratch is not a defect (W1/R8) — but
+        // it produces no claims either, so law Q's sweep must not judge what sits
+        // under `quarantine/_scratch/`. A store whose `_scratch` was deleted
+        // still holds every original scratch ever quarantined, and calling those
+        // strays would be a false label rather than a coarse one — the D-S7
+        // mistake, which is the worse of the two. On a store that simply never
+        // archived scratch this covers an empty subtree and says nothing.
+        StoreDir::Absent => {
+            report.unexamine(Path::new(SCRATCH_ROOT));
+            return report;
+        }
         StoreDir::Foreign => {
             report.push(SCRATCH_ROOT, "", ScratchIssue::ForeignStoreDir);
+            report.unexamine(Path::new(SCRATCH_ROOT));
             return report;
         }
         StoreDir::Own => {}
     }
     let Ok(dir) = std::fs::read_dir(&root) else {
         report.push(SCRATCH_ROOT, "", ScratchIssue::UnreadableStoreRoot);
+        report.unexamine(Path::new(SCRATCH_ROOT));
         return report;
     };
 
@@ -1080,18 +1144,24 @@ fn verify_one_store(report: &mut ScratchVerifyReport, key: &str, store_dir: &Pat
     // A store path that is not a directory yomi owns may point anywhere, and
     // every fact drawn through it is foreign. The fourth caller of the one
     // predicate the writer, the reconciler and the GC gate already share.
+    // A key whose ledger this pass does not read is a key whose originals law Q
+    // must not judge either: nothing here can say which of them is claimed.
+    let quarantine_subtree = Path::new(SCRATCH_ROOT).join(key);
     if classify_store_dir(store_dir) != StoreDir::Own {
         report.push(key, "", ScratchIssue::ForeignStoreDir);
+        report.unexamine(&quarantine_subtree);
         return;
     }
     let mf = match read_manifest_at(&store_dir.join("manifest.json")) {
         ManifestRead::Ok(mf) => mf,
         ManifestRead::Missing => {
             report.push(key, "", ScratchIssue::NoManifest);
+            report.unexamine(&quarantine_subtree);
             return;
         }
         ManifestRead::Unreadable => {
             report.push(key, "", ScratchIssue::UnreadableManifest);
+            report.unexamine(&quarantine_subtree);
             return;
         }
     };
@@ -1124,12 +1194,37 @@ fn verify_one_store(report: &mut ScratchVerifyReport, key: &str, store_dir: &Pat
     // once, as the more specific `UnclaimedArtifact`.
     let mut accounted: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     let mut undecodable = false;
+    // One identity, one artifact path — so a repeat must be checked once, or the
+    // same object draws both a `verified` and a `ContentMismatch` and the counts
+    // stop meaning anything. The first row wins (manifest order is stable, so
+    // the choice is deterministic); the duplicate is reported once per repeated
+    // identity, not once per extra row, and the ledger is broken either way.
+    let mut seen: std::collections::HashSet<ScratchRel> = std::collections::HashSet::new();
+    let mut reported_dup: std::collections::HashSet<ScratchRel> = std::collections::HashSet::new();
     for entry in &mf.entries {
         let Some(rel) = entry.rel() else {
             undecodable = true;
             report.push(key, &entry.path, ScratchIssue::UndecodableEntry);
             continue;
         };
+        if !seen.insert(rel.clone()) {
+            if reported_dup.insert(rel.clone()) {
+                report.push(key, &entry.path, ScratchIssue::DuplicateIdentity);
+            }
+            continue;
+        }
+        // What this entry contributes to law Q. Every entry, not only the
+        // quarantined ones: Q1 asks about the ones that record an original, but
+        // Q2 asks whether a file is *claimed*, and the mirror rule makes an
+        // artifact's path belong to it whether or not an original is recorded.
+        report
+            .quarantine_claims
+            .push(crate::scan::quarantine::QuarantineClaim {
+                owner: key.to_string(),
+                stored_rel: Path::new(SCRATCH_ROOT).join(key).join(rel.store_rel()),
+                quarantined: entry.quarantined,
+                source_sha256: entry.source_sha256.clone(),
+            });
         let artifact = store_dir.join(rel.store_rel());
         if !entry.stored {
             // S1, the other direction: the ledger disclaims bytes the store holds.
@@ -1168,6 +1263,10 @@ fn verify_one_store(report: &mut ScratchVerifyReport, key: &str, store_dir: &Pat
     // key. The key-level refusal below says so instead.
     if undecodable {
         report.push(key, "", ScratchIssue::UnreconcilableKey);
+        // The same reasoning reaches law Q: that entry's quarantine path is
+        // unknowable too, so an original under this key may well be its, and
+        // calling it a stray would be the same false accusation.
+        report.unexamine(&quarantine_subtree);
     } else {
         for orphan in regular.difference(&accounted) {
             report.push(
@@ -1192,6 +1291,26 @@ mod tests {
 
     fn os(bytes: &[u8]) -> OsString {
         OsString::from_vec(bytes.to_vec())
+    }
+
+    /// A store with no `archive/_scratch/` produces no claims, so law Q must not
+    /// judge what sits under `quarantine/_scratch/`. On a store that never
+    /// archived scratch this covers an empty subtree and costs nothing; on one
+    /// whose `_scratch` was deleted it is the difference between "unexamined"
+    /// and every scratch original reported as a stray — a false label, which is
+    /// worse than a coarse one (D-S7).
+    #[test]
+    fn an_absent_scratch_root_leaves_law_q_nothing_to_judge() {
+        let report = verify_stores(Path::new("/nonexistent-archive-dir"), None, true);
+        assert_eq!(report.keys, 0);
+        assert!(report.quarantine_claims.is_empty());
+        assert_eq!(
+            report.quarantine_unexamined,
+            vec![PathBuf::from(SCRATCH_ROOT)],
+            "an absent scratch root left its quarantine subtree open to accusation"
+        );
+        // Absent is still not a defect: W1/R8 holds either way.
+        assert!(!report.failed());
     }
 
     fn live(session: &str, rel: &[u8]) -> Option<ScratchRel> {
@@ -1445,10 +1564,13 @@ mod tests {
             UnreconcilableKey,
             NoContentHash,
             ForeignArtifact,
+            // The strongest case of all: archive cannot produce one at all, so
+            // it cannot produce one transiently either.
+            DuplicateIdentity,
         ];
         for i in comparative {
             assert!(i.requires_exclusion(), "{} must downgrade", i.as_str());
-            assert_eq!(i.class(), ScratchClass::Violation);
+            assert_eq!(i.class(), FindingClass::Violation);
         }
         for i in standing {
             assert!(
@@ -1464,7 +1586,7 @@ mod tests {
         assert!(r.violations.is_empty());
         assert_eq!(r.unverifiable.len(), 1);
         assert_eq!(r.unverifiable[0].issue.as_str(), "OrphanArtifact");
-        assert_eq!(r.unverifiable[0].class, ScratchClass::Unverifiable);
+        assert_eq!(r.unverifiable[0].class, FindingClass::Unverifiable);
         assert!(!r.failed(), "a downgraded finding failed the run");
 
         // Under exclusion the same finding is a violation.
