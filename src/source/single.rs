@@ -16,10 +16,13 @@ pub struct SingleFile {
 pub struct ScratchDir {
     /// `<slug>--<uuid>` identity for the store path.
     pub key: String,
-    /// The `scratchpad/` directory (manifest-and-allowlist stored).
-    pub scratchpad: Option<PathBuf>,
-    /// `tasks/*.output` files (small, stored whole).
-    pub task_outputs: Vec<PathBuf>,
+    /// The session directory itself, `<tmp_root>/<slug>/<uuid>`. The deleter
+    /// removes this tree entire, so the writer enumerates it entire and
+    /// `scratchpad/`/`tasks/` are ordinary prefixes inside it rather than
+    /// enumeration roots. Carried as a field because the enumerator is the only
+    /// layer that knows it first-hand: archive and gc each used to re-derive it
+    /// from a member path, with two implementations and two failure behaviours.
+    pub session_dir: PathBuf,
 }
 
 pub fn history(roots: &SourceRoots) -> Vec<SingleFile> {
@@ -91,7 +94,18 @@ pub fn mcp(roots: &SourceRoots) -> Vec<SingleFile> {
     out
 }
 
-/// Scratch working dirs: `<tmp_root>/<slug>/<uuid>/{scratchpad,tasks}`.
+/// Scratch working dirs: every `<tmp_root>/<slug>/<uuid>/` session directory.
+///
+/// The whole session dir is the unit, not `scratchpad/` + `tasks/*.output`: the
+/// deleter removes `<slug>/<uuid>/` entire, so anything the writer declines to
+/// enumerate is a live file the GC gate cannot account for, which refuses the
+/// tree forever. Which files are *stored* is decided downstream by the
+/// `[scratch]` allow/deny globs and caps — configurable, and the same rules for
+/// every path in the tree. A hardcoded second filter here was the reason the
+/// three layers could disagree at all.
+///
+/// `file_type` is not followed, so a symlinked slug or session directory is
+/// skipped rather than walked out of `tmp_root`.
 pub fn scratch(roots: &SourceRoots) -> Result<Vec<ScratchDir>> {
     let mut out = Vec::new();
     if !roots.tmp_root.is_dir() {
@@ -102,38 +116,26 @@ pub fn scratch(roots: &SourceRoots) -> Result<Vec<ScratchDir>> {
         if !slug.file_type()?.is_dir() {
             continue;
         }
-        let slug_name = slug.file_name().to_string_lossy().to_string();
+        let slug_name = slug.file_name();
         for sess in std::fs::read_dir(slug.path())? {
             let sess = sess?;
             if !sess.file_type()?.is_dir() {
                 continue;
             }
-            let scratchpad = sess.path().join("scratchpad");
-            let tasks_dir = sess.path().join("tasks");
-            let scratchpad = scratchpad.is_dir().then_some(scratchpad);
-            let mut task_outputs: Vec<PathBuf> = Vec::new();
-            if tasks_dir.is_dir() {
-                for t in std::fs::read_dir(&tasks_dir)? {
-                    let t = t?;
-                    let p = t.path();
-                    if p.extension().and_then(|e| e.to_str()) == Some("output")
-                        && t.file_type()?.is_file()
-                    {
-                        task_outputs.push(p);
-                    }
-                }
-                task_outputs.sort();
-            }
-            if scratchpad.is_none() && task_outputs.is_empty() {
-                continue;
-            }
+            // Emitted even when the tree currently holds no file. A tree whose
+            // files have *all* vanished is the strongest case of "a vanished
+            // file keeps its archive": skipping it would leave the manifest
+            // claiming those files are still present while their `.zst` sit in
+            // the store, and nothing would ever correct the record.
             out.push(ScratchDir {
-                key: format!("{slug_name}--{}", sess.file_name().to_string_lossy()),
-                scratchpad,
-                task_outputs,
+                key: crate::scratch::store_key(&slug_name, &sess.file_name()),
+                session_dir: sess.path(),
             });
         }
     }
+    // `read_dir` yields in filesystem order; sort so a run's manifests, store
+    // writes and gc candidates do not depend on it.
+    out.sort_by(|a, b| a.session_dir.cmp(&b.session_dir));
     Ok(out)
 }
 

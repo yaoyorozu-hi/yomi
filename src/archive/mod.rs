@@ -7,7 +7,7 @@ use crate::catalog::{ArtifactUpsert, Catalog, SessionUpsert};
 use crate::config::Env;
 use crate::model::{ArtifactRecord, ArtifactRole, Finding, Frame, Manifest, SecretScanSummary};
 use crate::scan::{Allowlist, ContentScan, scan_content};
-use crate::scratch::{ScratchEntry, ScratchManifest, ScratchRel};
+use crate::scratch::{ManifestRead, ScratchEntry, ScratchManifest, ScratchRel, StoreDir};
 use crate::source::claude::DiscoveredSession;
 use crate::source::single::{ScratchDir, SingleFile};
 use crate::util::{now_iso, sha256_hex};
@@ -29,6 +29,11 @@ pub struct Report {
     pub flagged: u64,
     pub blacklisted_skipped: u64,
     pub oversize_skipped: u64,
+    /// Stored scratch artifacts the new manifest no longer claims, removed to
+    /// keep the store dir and the manifest one ledger. Counted (not performed)
+    /// under `--dry-run`. Surfaced because a config change that discards stored
+    /// bytes must be loud.
+    pub scratch_orphans_removed: u64,
 }
 
 pub struct Archiver<'a> {
@@ -283,49 +288,101 @@ impl<'a> Archiver<'a> {
         Vec::new()
     }
 
-    /// Archive one scratch dir: always write a manifest of every file (name,
-    /// size, and — for stored files only — hashes); store only allow-listed files
-    /// under the size caps. deny/allow globs match the tree-relative sub-path with
-    /// nested (`**/`) semantics so a cloned repo's `.git`/`node_modules` are
-    /// excluded wherever they sit (W2). A tree over `total_cap` is manifest-only:
-    /// nothing is stored, and every entry is recorded `stored: false`.
+    /// Archive one scratch dir: manifest **every** file in the session tree
+    /// (name, size, and — for stored files only — hashes); store only the files
+    /// the `[scratch]` allow/deny globs admit under the size caps. Globs match the
+    /// session-relative path with nested (`**/`) semantics, so a cloned repo's
+    /// `.git`/`node_modules` are excluded wherever they sit (W2). A tree over
+    /// `total_cap` is manifest-only: nothing is stored, and every live entry is
+    /// recorded `stored: false`.
+    ///
+    /// Two ledger duties beyond writing the manifest:
+    ///
+    /// * an entry whose live file has **vanished** keeps its record and its
+    ///   `.zst` verbatim, marked `present: false` — that artifact is the last
+    ///   copy and no cap decision authorizes destroying it;
+    /// * every other `*.zst` the new manifest does not claim is **removed**, so
+    ///   the store dir and the manifest stay one ledger (store law S, §3).
     pub fn archive_scratch(&self, sc: &ScratchDir, report: &mut Report) -> Result<()> {
         let cfg = &self.env.config.scratch;
         let allow = build_globs_nested(&cfg.allow)?;
         let deny = build_globs_nested(&cfg.deny)?;
 
         let store_dir = self.env.archive_dir().join("_scratch").join(&sc.key);
-        let mut entries = Vec::new();
-        let mut total: u64 = 0;
 
-        let mut candidates: Vec<PathBuf> = Vec::new();
-        if let Some(sp) = &sc.scratchpad {
-            for e in walkdir::WalkDir::new(sp).into_iter().filter_map(Result::ok) {
-                if e.file_type().is_file() {
-                    candidates.push(e.path().to_path_buf());
-                }
-            }
-        }
-        candidates.extend(sc.task_outputs.iter().cloned());
-        candidates.sort();
-
-        let Some(session_dir) = scratch_session_dir(sc) else {
-            tracing::warn!(key = %sc.key, "scratch entry locates no session dir; skipped");
+        // `create_dir_all`, `set_700` and `atomic_write` all follow a symlink, so
+        // a store dir that is not a real directory would take this key's manifest
+        // and artifacts outside the archive tree and rewrite an unrelated
+        // directory's mode to 700. Checked before the manifest is read, so a
+        // foreign ledger never informs a decision either.
+        //
+        // Refused, not repaired — unlike the lock file, whose symlink is
+        // self-healed. That file holds nothing, so removing a link node there
+        // destroys nothing; a store directory holds archived data, and a symlink
+        // on it may well be an operator who deliberately put the store on
+        // another volume. Replacing it would orphan that store and silently
+        // begin an empty one. Refusing is reversible by hand; replacing is not.
+        if crate::scratch::classify_store_dir(&store_dir) == StoreDir::Foreign {
+            tracing::warn!(
+                key = %sc.key,
+                store = %store_dir.display(),
+                "scratch store path is not a directory this run owns; leaving this \
+                 key untouched. Nothing is archived or removed for it until the path \
+                 is a real directory again."
+            );
             return Ok(());
+        }
+
+        let prior = match crate::scratch::read_manifest_at(&store_dir.join("manifest.json")) {
+            ManifestRead::Ok(mf) => Some(mf),
+            // No ledger at all: nothing to carry, and nothing to contradict.
+            ManifestRead::Missing => None,
+            // A ledger that exists but cannot be read says nothing about the
+            // artifacts beside it — including that they are unclaimed. This key
+            // is left exactly as found: nothing stored, nothing deleted, and
+            // above all the unreadable manifest is **not overwritten**. Replacing
+            // it with a ledger describing only the live tree would manufacture
+            // the confidence that lets the *next* run delete every archive-only
+            // copy it failed to mention, turning a refusal into a one-run
+            // reprieve.
+            ManifestRead::Unreadable => {
+                tracing::warn!(
+                    key = %sc.key,
+                    store = %store_dir.display(),
+                    "scratch ledger exists but cannot be read; leaving this store \
+                     untouched. Nothing is archived or removed for this key until \
+                     the manifest is repaired or removed."
+                );
+                return Ok(());
+            }
         };
 
+        // The whole session tree, not `scratchpad/` + `tasks/*.output`: the
+        // deleter removes `<slug>/<uuid>/` entire, so a live file the writer
+        // never manifests is one the GC gate cannot account for, and the tree is
+        // refused forever. Sorted because `WalkDir` yields in filesystem order.
+        let mut candidates: Vec<PathBuf> = walkdir::WalkDir::new(&sc.session_dir)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_type().is_file())
+            .map(|e| e.path().to_path_buf())
+            .collect();
+        candidates.sort();
+
+        let mut entries: Vec<ScratchEntry> = Vec::new();
         let mut kept: Vec<(PathBuf, ScratchRel)> = Vec::new();
+        let mut total: u64 = 0;
         for path in &candidates {
             if self.blacklist.is_blacklisted(path) {
                 report.blacklisted_skipped += 1;
                 continue;
             }
             // Identity first: a candidate with no session-relative identity has
-            // no manifest key and no store path, so it cannot be archived. Both
-            // enumeration roots are children of `session_dir`, so this is
+            // no manifest key and no store path, so it cannot be archived. Every
+            // candidate comes from a walk of `session_dir`, so this is
             // unreachable; leaving it unmanifested refuses the tree, which is the
             // safe side of an impossible case.
-            let Some(rel) = ScratchRel::from_live(&session_dir, path) else {
+            let Some(rel) = ScratchRel::from_live(&sc.session_dir, path) else {
                 tracing::warn!(path = %path.display(), "scratch candidate escapes its session dir; skipped");
                 continue;
             };
@@ -334,10 +391,10 @@ impl<'a> Archiver<'a> {
             };
             let size = md.len();
             total += size;
-            let subpath = scratch_subpath(sc, path);
-            let denied = deny.is_match(&subpath);
-            let allowed = allow.is_match(&subpath);
-            let store = allowed && !denied && size <= cfg.file_cap.0;
+            let glob_key = rel.glob_subpath();
+            let subpath: &str = &glob_key;
+            let store =
+                allow.is_match(subpath) && !deny.is_match(subpath) && size <= cfg.file_cap.0;
             entries.push(ScratchEntry::new(&rel, size, store));
             kept.push((path.clone(), rel));
         }
@@ -355,30 +412,122 @@ impl<'a> Archiver<'a> {
                 entry.stored = false;
             }
         }
+
+        // What an earlier run captured for each identity. A capture that fails
+        // this run must not discard it: those bytes are the last copy.
+        let prior_by_rel: std::collections::HashMap<ScratchRel, &ScratchEntry> = prior
+            .as_ref()
+            .map(|mf| {
+                mf.entries
+                    .iter()
+                    .filter_map(|e| e.rel().map(|r| (r, e)))
+                    .collect()
+            })
+            .unwrap_or_default();
+
         if !self.dry_run {
             std::fs::create_dir_all(&store_dir)?;
             set_700(&store_dir)?;
             for (entry, (path, rel)) in entries.iter_mut().zip(kept.iter()) {
-                if entry.stored
-                    && let Some(bytes) = self.read_source(path, report)?
-                {
-                    let dest = store_dir.join(rel.store_rel());
-                    if let Some(parent) = dest.parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-                    let scan = self.scan_bytes(&bytes, false);
-                    self.tally(report, &scan);
-                    if scan.needs_quarantine {
-                        let qrel = format!("{}/{}", sc.key, entry.path);
-                        self.quarantine(&uuid_for_scratch(sc), &qrel, &bytes, report)?;
-                    }
-                    atomic_write(&dest, &compress_frame(&scan.redacted)?)?;
-                    set_600(&dest)?;
-                    report.bytes_stored += std::fs::metadata(&dest)?.len();
-                    entry.source_sha256 = Some(sha256_hex(&bytes));
-                    entry.content_sha256 = Some(sha256_hex(&scan.redacted));
+                if !entry.stored {
+                    continue;
                 }
+                // Policy said to store this file and the read then refused it:
+                // a blacklisted inode swapped in after the walk, an I/O or
+                // permission error, or a file that outgrew the read bound
+                // between stat and read. Nothing was captured, so the entry must
+                // not go on claiming otherwise — `stored: true` with no hashes
+                // is a manifest that lies, and the gate reads it as a corrupt
+                // archive (the #9 failure mode, reached through another door).
+                //
+                // `capture_failed` keeps this apart from the bare `stored:
+                // false` that policy writes. That one means "we declined to
+                // hoard these bytes", and presence + size is then the intended
+                // assurance; this one means nothing about the content was ever
+                // read, so presence + size assures nothing and the gate refuses
+                // the tree rather than delete a file yomi meant to archive and
+                // could not.
+                //
+                // An earlier run's capture is carried forward verbatim. The live
+                // bytes are unreadable *now*; that `.zst` is the last copy of
+                // them, and dropping the claim would make reconciliation treat
+                // it as unclaimed and delete it — losing a good archive over a
+                // permission bit. Same law as a vanished file: never destroy
+                // what was already taken.
+                //
+                // The claim is grounded in the artifact actually being on disk,
+                // not in the prior ledger's word for it. Hashes are deliberately
+                // *not* required: a manifest written before D2/R1 carries none,
+                // and refusing to salvage those forfeited a real, valid archive
+                // — an entry that cannot be salvaged is no more a licence to
+                // destroy its artifact than one that cannot be parsed. Their
+                // absence is carried across too, so the gate keeps treating the
+                // artifact as unverifiable rather than gaining a claim it cannot
+                // check.
+                let Some(bytes) = self.read_source(path, report)? else {
+                    entry.capture_failed = true;
+                    let salvaged = prior_by_rel.get(rel).filter(|p| {
+                        p.stored
+                            && std::fs::symlink_metadata(store_dir.join(rel.store_rel()))
+                                .is_ok_and(|md| md.is_file())
+                    });
+                    match salvaged {
+                        Some(p) => {
+                            entry.stored = true;
+                            entry.source_sha256.clone_from(&p.source_sha256);
+                            entry.content_sha256.clone_from(&p.content_sha256);
+                        }
+                        None => entry.stored = false,
+                    }
+                    tracing::warn!(
+                        path = %path.display(),
+                        kept_earlier_capture = salvaged.is_some(),
+                        "scratch source could not be captured; this tree will not be \
+                         reclaimed until it can be read"
+                    );
+                    continue;
+                };
+                let dest = store_dir.join(rel.store_rel());
+                if let Some(parent) = dest.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let scan = self.scan_bytes(&bytes, false);
+                self.tally(report, &scan);
+                if scan.needs_quarantine {
+                    let qrel = format!("{}/{}", sc.key, entry.path);
+                    self.quarantine(&uuid_for_scratch(sc), &qrel, &bytes, report)?;
+                }
+                atomic_write(&dest, &compress_frame(&scan.redacted)?)?;
+                set_600(&dest)?;
+                report.bytes_stored += std::fs::metadata(&dest)?.len();
+                entry.source_sha256 = Some(sha256_hex(&bytes));
+                entry.content_sha256 = Some(sha256_hex(&scan.redacted));
             }
+        }
+
+        // Appended after the store pass and after the cap, so what the prior
+        // ledger carries over can be neither re-policied nor counted against the
+        // live tree.
+        let (tail, ledger_complete) = match &prior {
+            Some(mf) => prior_tail(mf, &kept),
+            // A store dir with no ledger holds no archive-only copy this run
+            // could be destroying.
+            None => (Vec::new(), true),
+        };
+        entries.extend(tail);
+
+        if !ledger_complete {
+            tracing::warn!(
+                key = %sc.key,
+                "prior scratch ledger holds an entry whose identity does not \
+                 decode; store dir left untouched. Its artifact cannot even be \
+                 named, so stale artifacts remain until the manifest is repaired — \
+                 an unreadable record is a reason to refuse, not a licence to \
+                 delete what it describes."
+            );
+        }
+
+        if !self.dry_run {
             let mf = ScratchManifest {
                 key: sc.key.clone(),
                 captured_at: now_iso(),
@@ -389,6 +538,17 @@ impl<'a> Archiver<'a> {
             let mfp = store_dir.join("manifest.json");
             atomic_write(&mfp, (serde_json::to_string_pretty(&mf)? + "\n").as_bytes())?;
             set_600(&mfp)?;
+            // Manifest first, then reconcile: a crash between them leaves a store
+            // holding *more* than the ledger claims, which the GC gate ignores and
+            // the next run cleans up. The reverse order would leave a ledger
+            // claiming a `.zst` that is gone, which refuses the tree until someone
+            // re-archives.
+            if ledger_complete {
+                report.scratch_orphans_removed +=
+                    reconcile_scratch_store(&store_dir, &mf.entries, false)?;
+            }
+        } else if ledger_complete {
+            report.scratch_orphans_removed += reconcile_scratch_store(&store_dir, &entries, true)?;
         }
         Ok(())
     }
@@ -844,28 +1004,136 @@ fn uuid_for_scratch(sc: &ScratchDir) -> String {
     format!("_scratch--{}", sc.key)
 }
 
-/// The session dir (`<tmp_root>/<slug>/<uuid>`) a scratch entry describes. Both
-/// enumeration roots — `scratchpad/` and `tasks/` — are its immediate children,
-/// so either one locates it. `None` only for an entry carrying neither, which
-/// `single::scratch` does not emit.
-fn scratch_session_dir(sc: &ScratchDir) -> Option<PathBuf> {
-    if let Some(sp) = &sc.scratchpad {
-        return sp.parent().map(Path::to_path_buf);
+/// The tail a prior manifest contributes to the new one, and whether that prior
+/// ledger was decodable in full.
+///
+/// Two kinds of entry are carried across:
+///
+/// * **vanished** — identity decodes, but this run's walk did not see the file.
+///   Retained verbatim and marked `present: false`; its `.zst` is the last copy.
+///   "Vanished" is decided by identity, not by a filesystem probe: the walk that
+///   produced `live` is the same walk the GC gate performs, so the two layers
+///   agree on what "still here" means, and a file that merely became unreadable
+///   or blacklisted this run is treated as gone — retaining its archive, the
+///   direction that cannot lose data. A file that has come *back* is not
+///   retained: the live pass already produced a fresh entry for it under current
+///   policy, and two entries with one identity would be a self-contradicting
+///   ledger.
+/// * **undecodable** — identity does not decode at all (a corrupt or hand-edited
+///   `path_hex`). Carried byte-for-byte with `present` untouched, because we
+///   cannot tell whether its file is live and marking it either way would assert
+///   more than the record supports.
+///
+/// An undecodable entry also makes the ledger incomplete, which the returned
+/// flag reports. Its `store_rel` is *unknowable* — `rel()` is precisely what
+/// would yield it — so its artifact cannot be named, and therefore cannot be
+/// kept out of an orphan set by name. The only sound response is to stop
+/// deleting for this key: a ledger the reader cannot parse is a reason to
+/// refuse, not a licence to destroy what it describes.
+fn prior_tail(
+    prior: &ScratchManifest,
+    live: &[(PathBuf, ScratchRel)],
+) -> (Vec<ScratchEntry>, bool) {
+    let live: std::collections::HashSet<&ScratchRel> = live.iter().map(|(_, r)| r).collect();
+    let mut vanished: Vec<(ScratchRel, ScratchEntry)> = Vec::new();
+    let mut undecodable: Vec<ScratchEntry> = Vec::new();
+    for e in &prior.entries {
+        match e.rel() {
+            Some(rel) if live.contains(&rel) => {}
+            Some(rel) => {
+                let mut e = e.clone();
+                e.present = false;
+                vanished.push((rel, e));
+            }
+            None => undecodable.push(e.clone()),
+        }
     }
-    sc.task_outputs
-        .first()
-        .and_then(|t| t.parent().and_then(Path::parent))
-        .map(Path::to_path_buf)
+    let complete = undecodable.is_empty();
+    vanished.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut out: Vec<ScratchEntry> = vanished.into_iter().map(|(_, e)| e).collect();
+    out.extend(undecodable);
+    (out, complete)
 }
 
-/// Tree-relative sub-path (no `scratchpad/`/`tasks/` prefix) for glob matching.
-fn scratch_subpath(sc: &ScratchDir, path: &Path) -> String {
-    if let Some(sp) = &sc.scratchpad
-        && let Ok(r) = path.strip_prefix(sp)
-    {
-        return r.to_string_lossy().to_string();
+/// Establish store law S for one scratch key: the `*.zst` under
+/// `archive/_scratch/<K>/` are exactly the `store_rel()` of the manifest's
+/// `stored: true` entries. Returns how many stale artifacts were removed — or,
+/// under `dry_run`, how many would be.
+///
+/// The delete authority is deliberately enumerable and cannot grow: **regular
+/// files only**, **`.zst` extension only**, **under this one key's store dir
+/// only**. `manifest.json` has the wrong extension, `quarantine/` and every
+/// other key are outside the walked root, and `WalkDir` does not follow
+/// symlinks, so the walk cannot leave the store dir. A store dir that is itself
+/// a symlink is refused outright rather than walked through.
+///
+/// It also refuses whenever any entry's identity fails to decode. Such an entry
+/// names an artifact whose path cannot be computed — `rel()` is what would
+/// compute it — so it cannot be kept out of the orphan set, and every unnamed
+/// artifact would be deleted as unclaimed. The caller already declines to call
+/// in that case; the check lives here too because this is the function that
+/// deletes, and a delete primitive must not depend on its caller's discipline.
+fn reconcile_scratch_store(
+    store_dir: &Path,
+    entries: &[ScratchEntry],
+    dry_run: bool,
+) -> Result<u64> {
+    if entries.iter().any(|e| e.rel().is_none()) {
+        tracing::warn!(
+            store = %store_dir.display(),
+            "refusing to reconcile a store whose ledger holds an entry with an \
+             undecodable identity"
+        );
+        return Ok(0);
     }
-    file_name(path)
+    if crate::scratch::classify_store_dir(store_dir) != StoreDir::Own {
+        return Ok(0);
+    }
+    let expected: std::collections::HashSet<PathBuf> = entries
+        .iter()
+        .filter(|e| e.stored)
+        .filter_map(|e| e.rel())
+        .map(|rel| store_dir.join(rel.store_rel()))
+        .collect();
+
+    let mut removed = 0u64;
+    for entry in walkdir::WalkDir::new(store_dir)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("zst") {
+            continue;
+        }
+        if !entry.file_type().is_file() {
+            // A symlink or device named `*.zst` is not something `archive` wrote.
+            // Acting on it would widen the authority past "remove the artifacts
+            // we stored", so it is reported and left alone.
+            tracing::warn!(
+                path = %path.display(),
+                "non-regular *.zst in a scratch store dir; left in place"
+            );
+            continue;
+        }
+        if expected.contains(path) {
+            continue;
+        }
+        if dry_run {
+            removed += 1;
+            continue;
+        }
+        match std::fs::remove_file(path) {
+            Ok(()) => {
+                tracing::info!(path = %path.display(), "removed stale scratch artifact");
+                removed += 1;
+            }
+            Err(e) => tracing::warn!(
+                path = %path.display(), error = %e,
+                "could not remove stale scratch artifact"
+            ),
+        }
+    }
+    Ok(removed)
 }
 
 /// Build a globset where each pattern also matches nested occurrences, so

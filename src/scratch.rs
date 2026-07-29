@@ -103,6 +103,46 @@ impl ScratchRel {
     }
 }
 
+/// Marker on a store key that had to be encoded. Chosen so the two key forms
+/// occupy disjoint namespaces — see [`store_key`].
+const HEX_KEY_PREFIX: &str = "_hex--";
+
+/// The store key of one scratch tree: the name of its directory under
+/// `archive/_scratch/`, and the discriminator inside its quarantine path.
+///
+/// `<slug>--<uuid>` verbatim whenever both directory names are valid UTF-8 —
+/// which every real one is — so existing stores keep their names byte for byte.
+///
+/// A name that is *not* valid UTF-8 must not go through `to_string_lossy`: two
+/// sessions differing only in invalid bytes collapse to one key, share one store
+/// directory and one manifest, and the later run's live pass then claims the
+/// earlier one's identity and overwrites its only archived copy. Such keys are
+/// hex, which is injective on bytes.
+///
+/// The two forms cannot be confused. The hex form always begins `_hex--`, and a
+/// plain form that would begin the same way is pushed into the hex branch, so
+/// their output spaces are disjoint. Hex carries no `-`, so the `--` inside the
+/// encoded form is an unambiguous separator even though the one in the plain
+/// form is not (a real slug contains `--`, which is why nothing parses a key —
+/// it only has to be unique).
+///
+/// The result is ASCII in the encoded case and a pair of existing directory
+/// names in the plain case, so it is a legal filename either way: no `/`, no
+/// NUL, never `.` or `..`.
+pub fn store_key(slug: &OsStr, uuid: &OsStr) -> String {
+    if let (Some(slug), Some(uuid)) = (slug.to_str(), uuid.to_str()) {
+        let plain = format!("{slug}--{uuid}");
+        if !plain.starts_with(HEX_KEY_PREFIX) {
+            return plain;
+        }
+    }
+    format!(
+        "{HEX_KEY_PREFIX}{}--{}",
+        crate::util::hex(slug.as_bytes()),
+        crate::util::hex(uuid.as_bytes())
+    )
+}
+
 /// One file in a scratch tree, as recorded in `manifest.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScratchEntry {
@@ -129,6 +169,47 @@ pub struct ScratchEntry {
     /// frame of the *wrong* content can never pass the scratch delete gate (D2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_sha256: Option<String>,
+    /// False once this entry's live file has vanished. Archive then retains the
+    /// entry and its `.zst` verbatim instead of reconciling them away: that
+    /// artifact is the only remaining copy, and the caps say "do not hoard *this
+    /// tree*", never "destroy what was already taken". A retained entry belongs
+    /// to no live tree, so it counts toward neither `total_bytes` nor the cap.
+    /// Defaults to `true` and is written only when false, so a manifest from
+    /// before this field reads unchanged and an all-live tree serializes exactly
+    /// as it did.
+    #[serde(default = "present_default", skip_serializing_if = "is_present")]
+    pub present: bool,
+    /// Set when policy decided to store this file and the capture then failed:
+    /// a blacklisted inode swapped in after the walk, an I/O or permission
+    /// error, or a file that outgrew the read bound between stat and read.
+    ///
+    /// It is **not** the same statement as a bare `stored: false`. That one says
+    /// policy declined to hoard the bytes, and presence + size is then the
+    /// intended assurance (design §3, decision #4). This one says nothing about
+    /// the content was ever captured — no decision was made at all — so
+    /// presence + size assures nothing and the GC gate must refuse the tree.
+    /// Deleting on it would break archive-verify-then-delete for a file yomi
+    /// *intended* to archive and could not.
+    ///
+    /// Self-clearing: every run rebuilds live entries from scratch, so the first
+    /// run that can read the file stores it and the flag is simply not written.
+    /// Defaults to false and is emitted only when true, so a manifest from
+    /// before this field reads unchanged and an ordinary tree serializes exactly
+    /// as it did.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub capture_failed: bool,
+}
+
+fn present_default() -> bool {
+    true
+}
+
+fn is_present(present: &bool) -> bool {
+    *present
+}
+
+fn is_false(flag: &bool) -> bool {
+    !*flag
 }
 
 impl ScratchEntry {
@@ -143,6 +224,8 @@ impl ScratchEntry {
             stored,
             source_sha256: None,
             content_sha256: None,
+            present: true,
+            capture_failed: false,
         }
     }
 
@@ -172,10 +255,79 @@ pub struct ScratchManifest {
     pub entries: Vec<ScratchEntry>,
 }
 
+/// What sits at `archive/_scratch/<K>/`, as every layer that touches a scratch
+/// store must classify it.
+///
+/// Three states rather than a bool, for the same reason [`ManifestRead`] splits
+/// `Missing` from `Unreadable`: "there is nothing here" and "there is something
+/// here that is not ours" call for opposite handling, and collapsing them would
+/// either make a first archive impossible or make a foreign directory writable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreDir {
+    /// Nothing at this path. `archive` creates it; nobody else has work to do.
+    Absent,
+    /// A real directory — this key's store, yomi's to write, walk and prune.
+    Own,
+    /// Something else: a symlink, a regular file, a device, or a path this run
+    /// cannot even stat. Not a directory yomi created, and acting through it
+    /// leaves the archive tree — writes land outside it, a walk escapes it, and
+    /// a manifest read through it is *foreign evidence for a decision that
+    /// deletes live data*. Every layer refuses.
+    Foreign,
+}
+
+/// Classify `archive/_scratch/<K>/`. `symlink_metadata`, never `metadata`: the
+/// whole point is to see the link rather than whatever it points at.
+///
+/// One function so the writer, the reconciler and the GC gate cannot drift on
+/// what a store directory *is* — the drift this module exists to end.
+pub fn classify_store_dir(path: &Path) -> StoreDir {
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => StoreDir::Absent,
+        // Un-stattable is not "ours" — a store we cannot even classify is one we
+        // must not write into, walk, or take evidence from.
+        Err(_) => StoreDir::Foreign,
+        Ok(md) if md.is_dir() => StoreDir::Own,
+        Ok(_) => StoreDir::Foreign,
+    }
+}
+
+/// What `archive/_scratch/<K>/manifest.json` yielded.
+///
+/// "There is no ledger" and "there is a ledger this run cannot read" are the
+/// same thing to a reader that only refuses, and opposite things to a caller
+/// that deletes: the first has nothing to contradict, the second says nothing at
+/// all about the artifacts beside it — including that they are unclaimed.
+pub enum ManifestRead {
+    /// No manifest: a store dir never written, or written by a run that crashed
+    /// before the ledger landed.
+    Missing,
+    /// A manifest exists but could not be read or parsed, so its contents are
+    /// unknown. Nothing may be concluded from the absence of a claim in it.
+    Unreadable,
+    Ok(ScratchManifest),
+}
+
+/// Read `manifest.json`, keeping "absent" and "unreadable" apart.
+pub fn read_manifest_at(path: &Path) -> ManifestRead {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ManifestRead::Missing,
+        Err(_) => return ManifestRead::Unreadable,
+    };
+    match serde_json::from_str(&text) {
+        Ok(mf) => ManifestRead::Ok(mf),
+        Err(_) => ManifestRead::Unreadable,
+    }
+}
+
 /// Read `manifest.json`. `None` for absent, unreadable or unparseable — every
 /// one of which means the GC gate cannot prove coverage and must refuse.
 pub fn read_manifest(path: &Path) -> Option<ScratchManifest> {
-    serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+    match read_manifest_at(path) {
+        ManifestRead::Ok(mf) => Some(mf),
+        ManifestRead::Missing | ManifestRead::Unreadable => None,
+    }
 }
 
 #[cfg(test)]
@@ -304,6 +456,94 @@ mod tests {
         // Malformed hex refuses rather than silently keying on the lossy path.
         assert!(ScratchRel::from_manifest("a.md", Some("zz")).is_none());
         assert!(ScratchRel::from_manifest("a.md", Some("abc")).is_none());
+    }
+
+    /// Every real slug and session name is UTF-8, and those keys must come out
+    /// exactly as the old `format!("{slug}--{uuid}")` produced them — an existing
+    /// store must not be renamed by this change.
+    #[test]
+    fn store_key_is_verbatim_for_utf8_names() {
+        for (slug, uuid) in [
+            ("-home-test", "aaaa1111-2222-3333-4444-555555555555"),
+            // A real project slug contains `--`; nothing parses a key, so this is
+            // passed through as-is.
+            ("-home-yhi-code-github-yaoyorozu-hi--yomi", "uuid-1"),
+            ("-", "x"),
+            ("\u{65e5}\u{672c}", "\u{8a9e}"),
+        ] {
+            assert_eq!(
+                store_key(OsStr::new(slug), OsStr::new(uuid)),
+                format!("{slug}--{uuid}"),
+                "the key for a UTF-8 session changed; existing stores would be \
+                 orphaned"
+            );
+        }
+    }
+
+    /// The defect: two session directories differing only in invalid bytes must
+    /// not share a store. They shared one directory, one manifest and one
+    /// namespace of `.zst`, so the later run's live pass claimed the earlier
+    /// one's identity and overwrote its only archived copy.
+    #[test]
+    fn store_key_separates_lossy_colliding_names() {
+        let a = store_key(OsStr::new("-home-test"), &os(b"sess-\xfe"));
+        let b = store_key(OsStr::new("-home-test"), &os(b"sess-\xff"));
+        assert_eq!(
+            OsStr::new("sess-\u{fffd}").to_string_lossy(),
+            os(b"sess-\xfe").to_string_lossy(),
+            "fixture is not a lossy collision; the test proves nothing"
+        );
+        assert_ne!(a, b, "two distinct session names produced one store key");
+
+        // The slug side collides the same way and must separate the same way.
+        let c = store_key(&os(b"slug-\xfe"), OsStr::new("u"));
+        let d = store_key(&os(b"slug-\xff"), OsStr::new("u"));
+        assert_ne!(c, d);
+        // Encoding is injective on bytes, so it separates every pair, not just
+        // the ones a test happens to name.
+        for k in [&a, &b, &c, &d] {
+            assert!(k.starts_with(HEX_KEY_PREFIX), "{k} is not the encoded form");
+        }
+    }
+
+    /// The two key forms must occupy disjoint namespaces, or a UTF-8 session
+    /// could be named so as to impersonate an encoded one.
+    #[test]
+    fn store_key_forms_cannot_impersonate_each_other() {
+        // A UTF-8 pair whose plain form would begin with the marker is pushed
+        // into the encoded branch instead of colliding with it.
+        let impostor = store_key(OsStr::new("_hex"), OsStr::new("aabb--ccdd"));
+        assert!(impostor.starts_with(HEX_KEY_PREFIX));
+        let genuine = store_key(&os(b"\xaa\xbb"), &os(b"\xcc\xdd"));
+        assert_eq!(genuine, "_hex--aabb--ccdd");
+        assert_ne!(
+            impostor, genuine,
+            "a UTF-8 session impersonated an encoded key"
+        );
+
+        // Anything not starting with the marker stays plain.
+        assert_eq!(
+            store_key(OsStr::new("_he"), OsStr::new("x--y")),
+            "_he--x--y"
+        );
+    }
+
+    /// Whatever branch it takes, the key is used as a directory name under
+    /// `archive/_scratch/` and inside a quarantine path.
+    #[test]
+    fn store_key_is_always_a_legal_filename() {
+        let keys = [
+            store_key(OsStr::new("-home-test"), OsStr::new("uuid-1")),
+            store_key(&os(b"slug-\xff"), &os(b"sess-\xfe")),
+            store_key(OsStr::new("_hex--a"), OsStr::new("b")),
+        ];
+        for k in keys {
+            assert!(!k.is_empty());
+            assert!(!k.contains('/'), "{k} would create a nested path");
+            assert!(!k.contains('\0'), "{k} carries an interior NUL");
+            assert_ne!(k, ".");
+            assert_ne!(k, "..");
+        }
     }
 
     /// A manifest written before `path_hex` existed must parse unchanged and key
