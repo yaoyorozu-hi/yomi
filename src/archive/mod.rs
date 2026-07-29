@@ -308,7 +308,20 @@ impl<'a> Archiver<'a> {
         let allow = build_globs_nested(&cfg.allow)?;
         let deny = build_globs_nested(&cfg.deny)?;
 
-        let store_dir = self.env.archive_dir().join("_scratch").join(&sc.key);
+        // The root gets the same classification a key does. Every path below it
+        // is resolved *through* it, so a foreign root makes every key foreign
+        // while each one still classifies `Own` on its own — the guard has to sit
+        // at both levels or it sits at neither.
+        let root = crate::scratch::store_root(&self.env.archive_dir());
+        if crate::scratch::classify_store_dir(&root) == StoreDir::Foreign {
+            tracing::warn!(
+                store_root = %root.display(),
+                "scratch store root is not a directory this run owns; archiving no \
+                 scratch until it is a real directory again."
+            );
+            return Ok(());
+        }
+        let store_dir = root.join(&sc.key);
 
         // `create_dir_all`, `set_700` and `atomic_write` all follow a symlink, so
         // a store dir that is not a real directory would take this key's manifest

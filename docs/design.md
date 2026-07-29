@@ -402,6 +402,21 @@ without this rule a symlink on `_scratch` itself classifies every key beneath it
 layers proceed through it. Read-side commands do not run `ensure_layout`, and for them per-use
 classification is the whole guarantee.
 
+**A key is resolved *through* the root, so the guard has to sit at both levels or it sits at neither.**
+Every one of the four layers that touches a scratch store — archive's writer, the reconciler, the GC
+gate and `verify` — classifies the root **and** the key. A foreign root makes every key foreign while
+each key still classifies `Own` on its own, so a guard at the key level alone is defeated by moving the
+level above it.
+
+**Still open: `archive/` itself is not classified.** `ensure_layout` `create_dir_all`s and `set_700`s
+the fixed set, both of which follow a symlink, so an `archive/` that is a link resolves the entire
+store — `_scratch` included — outside the store root, and the per-key classification below it all
+reports `Own`. The rule stated above is implemented for `archive/_scratch/` only. Completing it means
+`ensure_layout` asserting `symlink_metadata`-is-a-directory for `~/.yomi/`, `archive/`, `quarantine/`,
+`state/` and `archive/_scratch/`, and refusing (exit 3) rather than repairing — same reasoning as a
+store directory, and reaching every command rather than only the scratch path, which is why it is its
+own unit (§9 P6.7) and not part of the scratch defect sweep.
+
 #### `ManifestRead` — absent and unreadable are not the same
 
 | Variant | Meaning |
@@ -1005,25 +1020,87 @@ manifest and the store. `verify` attests to the ledger the delete gate actually 
 pass walks `archive/_scratch/*/` (scoped to the matching key when a session uuid is given) and checks
 law S (§3) per store dir.
 
-**The contract, in the three vocabularies §3 requires.** Only `violation` is a defect of the store;
-`unverifiable` is a statement about what the ledger can prove; `foreign matter` is something only an
-operator can resolve.
+**The contract, in the three vocabularies §3 requires, plus one for a key never examined.** Only
+`violation` is a defect of the store; `unverifiable` is a statement about what the ledger can prove;
+`foreign matter` is something only an operator can resolve; `refused key` is a key whose ledger could
+not be trusted enough to read, or whose reading would have meant trusting something outside the
+archive tree. The first and the last fail the run.
 
 | Check | Outcome when it fails |
 |---|---|
+| the store **root** `archive/_scratch/` classifies `Own` | `ForeignStoreDir` — **refused key**, filed under `_scratch`. Nothing below is attempted; `read_dir` follows a symlink, so without this the whole store could be enumerated from outside the archive tree |
+| the store root enumerates | `UnreadableStoreRoot` — **refused key**, filed under `_scratch` |
 | the store dir classifies `Own` | `ForeignStoreDir` — **refused key**, not a violation. Nothing below is attempted; a foreign ledger must not be read at all |
 | `manifest.json` parses | **violation** — `NoManifest` or `UnreadableManifest`, kept distinct (the gate would refuse this tree either way; `verify` says which) |
 | the manifest's `slug_hex`/`uuid_hex` match this key's tree, when recorded | `StoreKeyCollision` — **refused key** |
-| every entry's identity decodes | **unverifiable** for that entry, **and** a key-level note that reconciliation is permanently disabled here (§3) |
-| every `stored: true` entry's `.zst` exists as a regular file — **S1** | **violation** |
-| every `stored: false` entry has no `.zst` at its `store_rel()` — **S1** | **violation** |
-| every regular-file `*.zst` in the store dir is claimed by a `stored: true` entry — **S1** | **violation** (the orphan check; catches drift from outside) |
-| each claimed artifact decompresses to its `content_sha256` — **S2** | **violation** *only if* the entry has a `content_sha256`; otherwise **unverifiable**, never a violation |
-| every `*.zst` that is **not** a regular file | **foreign matter** — archive will neither claim nor remove it |
+| every entry's identity decodes | `UndecodableEntry` — **unverifiable**, per entry — **and** `UnreconcilableKey` — **refused key**, once per key |
+| every `stored: true` entry's `.zst` exists as a regular file — **S1** | `MissingArtifact` — **violation** |
+| every `stored: false` entry has no `.zst` at its `store_rel()` — **S1** | `UnclaimedArtifact` — **violation** |
+| every regular-file `*.zst` in the store dir is claimed by a `stored: true` entry — **S1** | `OrphanArtifact` — **violation** (the orphan check; catches drift from outside) |
+| each claimed artifact decompresses to its `content_sha256` — **S2** | `ContentMismatch` — **violation** *only if* the entry has a `content_sha256`; otherwise `NoContentHash` — **unverifiable**, never a violation |
+| every `*.zst` that is **not** a regular file | `ForeignArtifact` — **foreign matter**; archive will neither claim nor remove it |
 
 Exit 2 on any `violation`, and on any `refused key`. `unverifiable` and `foreign matter` are reported
 and do **not** by themselves fail the run: a legacy store full of pre-D2/R1 entries is not broken, and
 a `verify` that fails on it every night is a `verify` that gets ignored.
+
+**Root-level findings are filed under the key `_scratch`, and cannot collide with a real one.** Every
+store key contains `--` — the plain form is `<slug>--<uuid>` and the hex form begins `_hex--` — and
+`_scratch` does not. So the root reuses the `key` field rather than needing a second shape of finding,
+and no store directory can ever impersonate it.
+
+**`UnreadableStoreRoot` is separate from `ForeignStoreDir` because the diagnosis differs.** A root that
+will not enumerate is not foreign; it is ours and unreadable. Its reachable cause is narrow — a failing
+`stat` already maps to `Foreign` in `classify_store_dir`, so only a root that stats as a directory and
+still refuses `read_dir` arrives here (an `x` bit without an `r` bit). Reusing `ForeignStoreDir` would
+send an operator looking for a replaced store path instead of a permission bit, which is the same
+misdiagnosis §4 refuses when it keeps lock contention apart from an unsupported `flock`.
+
+**`UnreconcilableKey` is a refused key, not a note.** An undecodable entry produces *two* findings
+because it is two facts at two scopes: the entry cannot be checked (`unverifiable`), and the key can
+never be reconciled again for as long as the entry stands (§3). An earlier draft of this section called
+the second one "a key-level note", which is wrong — a note that does not move the exit code is a note
+that gets ignored, and §3 says plainly this is "a state an operator has to leave, not one the tool
+leaves by itself". A store that will never self-correct must not be reported as fine.
+
+The cry-wolf objection that keeps `NoContentHash` non-failing does not apply here, and the difference
+is what decides it: a hash-less entry is a **legacy population** — every pre-D2/R1 manifest is full of
+them and nothing is wrong. An undecodable entry is not a population at all. `ScratchEntry::new` builds
+from an already-validated `ScratchRel` and `manifest_fields()` round-trips by construction, so archive
+**cannot emit one**; it arises only from corruption or hand-editing. There is no nightly noise to fear
+and a permanent degradation to surface.
+
+**The rows above are checks, not a partition of objects.** Two rows can hold of the same path, and
+whether both are reported depends on whether they are two facts or two names for one:
+
+- **One fact, one name.** A `.zst` sitting at a `stored: false` entry's `store_rel()` satisfies both
+  the `UnclaimedArtifact` row and, read literally, the orphan row. It is reported **once**, as
+  `UnclaimedArtifact`: the entry *explains* that object, so the orphan sweep must not also claim it is
+  unexplained. Implementation follows from that reading — an artifact any entry accounts for, by
+  claiming **or** by disclaiming, is removed from the orphan sweep's input. Giving one object two
+  names is the misdiagnosis class D-S7 and the `InodeDriftOrBlacklist` collapse already correct.
+- **Two facts, two names.** A **symlinked** `.zst` at a `stored: true` entry's path yields *both*
+  `MissingArtifact` and `ForeignArtifact`, deliberately. The ledger claims a regular-file artifact that
+  is not there (archive can fix that by re-archiving) **and** an artifact-shaped object archive will
+  never touch is sitting in the store (only an operator can clear it). Neither implies the other — a
+  claimed path with nothing at all at it is only `MissingArtifact`; a stray symlinked `.zst` at an
+  unclaimed path is only `ForeignArtifact` — and the two call for different actions.
+
+**The orphan sweep does not run at all on a key with an undecodable entry.** The reasoning §3 gives for
+reconciliation refusing there transfers verbatim: that entry's `store_rel()` is *unknowable*, so a
+leftover artifact may well be its, and calling it unclaimed would be the same false accusation
+reconciliation declines to make. `UnreconcilableKey` says the true thing instead.
+
+**`StoreKeyCollision` is defined and deliberately unreachable until U6.** The `slug_hex`/`uuid_hex`
+fields it tests are queued with the store-key hardening (§3), which is why the row above is written
+"when recorded". The variant and its string exist now so that populating it later changes no output
+schema and no consumer. It is intentionally dead code until then — not an oversight, and not something
+a dead-code sweep should remove.
+
+**Symlinked *directories* inside a store dir are not descended**, by the reconciler or by `verify`
+(`WalkDir` does not follow them). Entries resolving through one therefore read as `MissingArtifact`
+and their contents are never opened. That is the safe direction, and one more thing only an operator
+can clear.
 
 **Three checks `verify` must *not* attempt.** Each looks reasonable and each is wrong:
 
@@ -1044,6 +1121,147 @@ exists and was skipped (§3, D-S4). Neither report subsumes the other; a key sil
 
 The pass is stateless: it persists no `verified_at`, because scratch has no catalog row to persist it
 on (§3, known gap).
+
+#### Exclusion: `verify` can confirm without the lock, but it cannot accuse
+
+`verify` already takes the write lock for its `verified_at` persistence and **continues without it**
+when it is unavailable (§4, W4) — the lock is held across the scratch pass too, when it was acquired
+at all. So the pass runs in one of two conditions, and they are not equivalent.
+
+**Held.** No other yomi writer can run, so the manifest and the store are one consistent snapshot and
+every finding above stands as classified.
+
+**Not held.** An `archive` may be running, and the store passes through states that look exactly like
+defects — by the design's own instruction. §3 fixes the order **manifest, then reconcile** for crash
+safety, so between them the store legitimately holds `.zst` the new ledger does not claim. That is not
+the only window, and the widest one is elsewhere: artifacts are written *before* the manifest, so for
+the whole store pass a new `.zst` sits under a manifest that predates it, and a rewritten `.zst` sits
+under an entry whose `content_sha256` describes the previous content.
+
+The rule is not a list of racy checks; it is one principle: **without exclusion the pair (manifest,
+store) is not a consistent snapshot, so no finding that compares one against the other may stand.**
+
+| Without exclusion | Findings |
+|---|---|
+| **stand** — each depends on a single atomically-replaced object, or on the store path's classification, and `archive` never transiently produces it | `ForeignStoreDir`, `UnreadableManifest` (the manifest is temp-write + rename, so a reader sees old or new, never torn), `UndecodableEntry`, `UnreconcilableKey`, `NoContentHash`, `ForeignArtifact`, `StoreKeyCollision` |
+| **downgraded to `unverifiable`** — each compares the ledger against the store, or is a state `archive` deliberately passes through | `NoManifest` (the store dir is created before the ledger lands), `MissingArtifact`, `UnclaimedArtifact`, `OrphanArtifact`, `ContentMismatch` |
+
+The issue name is unchanged by the downgrade — only the class moves — so a downgraded `OrphanArtifact`
+still reads as `{"issue":"OrphanArtifact","class":"unverifiable"}`, and the report carries
+`"exclusive": false` with a line saying why. That is the three-vocabulary discipline applied one level
+up: `unverifiable` already means "a statement about what the ledger can prove", and under a concurrent
+writer it genuinely cannot be proven.
+
+**Positives survive the downgrade; negatives do not.** An artifact that hashes to its entry's
+`content_sha256` is a true statement about that (manifest, artifact) pair even if both change a moment
+later, so `verified` is sound in either condition. Only the accusations are unsafe. `verify` without
+exclusion can confirm; it cannot accuse.
+
+**Two rejected alternatives.** *Requiring* the lock for the scratch pass turns a false-alarm problem
+into a no-coverage one: §4 lists `verify` among the lock's users only for its persistence, read-side
+commands are explicitly not lock-gated, and a nightly `verify` that refuses (exit 3) whenever archive
+overruns is a nightly `verify` that checks nothing — a worse outcome than the one being fixed.
+Gating *only* the orphan check covers one of the five affected findings and leaves `ContentMismatch`,
+the loudest false alarm, in place.
+
+**The downgrade happens at one point, and adding a check cannot bypass it.** The checks themselves know
+nothing about exclusion; they push an issue and the report decides where it lands, with
+`requires_exclusion()` as the single predicate. That predicate is an exhaustive `match`, so a new issue
+that fails to declare itself does not silently stand — it fails to compile. "Someone adds a comparative
+check and forgets the downgrade" is designed out rather than remembered.
+
+**Exclusion is store-wide and cannot be per-key.** While `archive` writes key A, comparative findings
+for keys B…Z are downgraded too. The lock is the only exclusion signal that exists, and per-key locking
+would change §4's single-writer model — multiplying the lock surface and its deadlock analysis for a
+pass that is cheap and re-runnable. Accepted as a property, not a defect: over-downgrading costs a
+re-run, under-downgrading costs a false accusation.
+
+**Why exclusion was unavailable must be reported, not guessed.** There are three causes and they call
+for three different operator actions, so collapsing them into "a concurrent archive may be mid-write"
+is a false explanation in two of the three cases — the same error §4 refuses when it insists lock
+contention and an unsupported `flock` be reported apart, because naming the wrong one "sends the
+operator hunting for a competing process that does not exist":
+
+| Cause | Meaning | Action |
+|---|---|---|
+| `Contended` | another yomi holds the lock | re-run later |
+| `Unsupported` | `flock` failed permanently (some NFS/FUSE/CIFS) | move the store (`--home` / `YOMI_HOME`) |
+| `NotAttempted` | the lock was never sought | see below — usually, restore the store's marker |
+
+`NotAttempted` is the one that matters, because it is **permanent and silent**. `verify` gates its lock
+on `is_initialized()`, which is `marker || catalog.db` — so a store that has lost both, while
+`archive/_scratch/` and every artifact in it survive intact, never attempts the lock at all.
+`exclusive` is then false on every run forever, and `verify` can confirm but can never accuse, about a
+store that is entirely present. The monitoring rule below ("never exclusive" is the alert) does catch
+it, but only after the operator has ruled out a concurrent archive that was never running.
+
+The gate asks the wrong question. It exists so a read-side command does not **create** a store on a
+fresh home (§4; `w1_fresh_home_read_commands_do_not_error` pins it), and for that the question is
+whether a store is *there* — `marker || archive/ || state/` — not whether it still has its bookkeeping.
+Taking the lock inside an existing store directory creates only `.yomi.lock`, which every other command
+already does. **Introduce a distinct predicate rather than widening `is_initialized()`**: its other
+caller (`gc`'s "persist `shapes.json` if a store exists") is not a lock gate and must not change
+meaning. With the predicate corrected, `NotAttempted` arises only when there is nothing to verify — at
+which point the pass has no findings and exclusion is moot.
+
+**A downgraded finding does not fail the run.** `unverifiable` is uniformly non-failing, and splitting
+it into failing and non-failing halves would give one vocabulary two exit behaviours — which is the
+confusion the three vocabularies exist to prevent. An overlapping cron would otherwise exit 2 nightly
+with no defect present, and that is the same ignored-alarm failure by another route. Visibility comes
+from `exclusive: false`, which a monitor can alert on directly: a scheduled `verify` that **never**
+gets exclusion is a `verify` that has never checked S1 or S2, and that is the condition worth paging
+on, not any individual downgraded finding.
+
+**Operational consequence for §8's cron path, stated rather than assumed.** Nothing here forbids
+running `archive` and `verify` concurrently — the point of the rule is that concurrency degrades
+honestly instead of lying. But for a nightly integrity check to *mean* anything it must obtain
+exclusion, so the scheduled `verify` belongs **inside** `run --profile daily` (P5), sequenced after
+archive within the single process that already holds the lock, rather than as an independently
+scheduled job that overlaps it.
+
+#### Resolving a session to a store key
+
+`verify <uuid>` and `read --scratch <uuid>` must resolve a session to its store directory, and a
+suffix test on the key does not do it. A key is `<slug>--<uuid>` only in the **plain** form; a session
+whose directory name is not valid UTF-8 is encoded `_hex--<hex(slug)>--<hex(uuid)>` (§3), which no
+`ends_with("--<uuid>")` can ever match. The failure mode is the worst kind for a verification tool:
+**zero keys matched, exit 0** — indistinguishable, by exit code alone, from "checked it, all clean".
+
+One resolver in `src/scratch.rs`, used by both commands:
+
+```rust
+pub fn store_key_matches_session(key: &str, uuid: &OsStr) -> bool
+```
+
+It handles both forms. The hex form parses unambiguously — hex contains no `-`, so after stripping the
+`_hex--` marker the remainder splits on `--` into exactly two fields — which is precisely the property
+the plain form lacks and the reason the two namespaces were made disjoint in the first place.
+
+**It dispatches on the form; it does not try both.** For the key `_hex--ff--3131` the real session name
+is `unhex("3131")`, and also attempting the plain suffix test would match a *different* session whose
+directory is literally named `3131` — turning the false negative into a false positive, which is
+strictly worse for a command whose job is to not miss anything. Because the two namespaces are
+disjoint, the form is known from the key alone and there is never a reason to guess.
+
+**One residual, which U6 closes for free.** The plain branch is a suffix test, and `<slug>--<uuid>` is
+not injective (§3) — so a session directory literally named `bbbb--cccc` matches the key of slug
+`-a--bbbb` and session `cccc`. This is N14 resurfacing in the resolver, reachable in pure ASCII and not
+naturally produced by Claude Code's uuids. Once the store-key hardening records `uuid_hex` in the
+manifest, **session resolution should read that field instead of parsing the key** — the manifest
+states the identity, so nothing has to be inferred from a name that cannot carry it unambiguously.
+
+The resolver belongs to whichever unit lands first and is **reused**, not reimplemented, by the other:
+U3 ships before U4, so U3 carries it. Shipping U3 with the suffix test and repairing it in U4 would
+release a known false-negative in the one command whose entire job is to not have any.
+
+#### A scratch-pass failure must not discard the catalog pass
+
+`verify` runs the catalog pass first and the scratch pass second, and an `Err` from the second
+propagates before anything is printed — so an unreadable `archive/_scratch/` throws away a completed
+catalog verification and reports only the error. The two passes attest to different ledgers and neither
+is a precondition of the other. A failure to enumerate the scratch root is a refusal of *that* pass:
+it should be reported as such, with the catalog results still emitted, under the same rule §5 already
+applies to the GC commit loop — a per-pass doubt degrades, only a global doubt aborts.
 
 **GC gating: unchanged — the scratch gate does not consult law S.** An orphaned `.zst` is a store
 hygiene defect, not a coverage defect: it does not make the live tree less archived, and the gate's
@@ -1328,9 +1546,28 @@ a file that was never captured at all.
 | `scratch_orphans_removed` | stored artifacts the new ledger no longer claims, removed to hold S1. Counted, not performed, under `--dry-run` |
 | `scratch_keys_refused` | keys archive touched nothing for (§3, D-S4) |
 | `scratch_refusals` | `[{key, reason}]` — `ForeignStoreDir`, `UnreadableManifest`, `UndecodableEntry`, `StoreKeyCollision`, `StoreWriteFailed` |
+| `scratch_root_refused` | the store **root** was refused, so **no** scratch was archived at all |
+
+A root refusal gets its own field rather than a row in `scratch_refusals`, because the blast radius is
+categorically different: a key refusal skips one tree, a root refusal skips every tree. Reporting it as
+"1 key refused" when the truth is "nothing was archived" is the same misreport as `NoCatalogRow` on the
+scratch path. The root check also belongs **outside** the per-key loop — it is a property of the run,
+not of the key — otherwise one root problem emits one warning per session directory on disk.
 
 A refusal is not an error: the run continues and reports exit 2 (partial), matching how §5 treats a
 per-candidate GC doubt. What it must never be is invisible, which is what it is today.
+
+**`verify` output.** Alongside the catalog counts, a `scratch` section carrying `keys`, `verified`,
+`exclusive`, and the four finding lists (`violations`, `unverifiable`, `foreign_matter`, `refused`),
+each finding a `{key, rel, issue, class}`. `rel` is the lossy display path and is empty for key-level
+findings; it is never an identity (§3). The human form prints the same, one labelled block per class,
+so a reader can see the class of every finding without consulting this document.
+
+`--all` is an explicit alias for "no session", not an independent mode: the two are mutually exclusive
+and omitting both is the same as `--all`. The flag is currently never read — the positional alone
+decides — so the surface documented here (`[<uuid> | --all]`) is a claim the binary does not honour.
+Enforce it with clap (`conflicts_with`) rather than deleting the flag; a documented alternative that
+silently does nothing is worse than either.
 
 **Not yet shipped** (kept here as the designed surface for their phases):
 `yomi list` (P5), `yomi import --from-codex|--from-wonka` (P4, §7), `yomi run --profile daily` (P5),
@@ -1343,6 +1580,14 @@ Exit codes: `0` ok · `1` error · `2` partial (items skipped/unverified) · `3`
 
 `yomi run --profile daily` (P5) is idempotent + lock-guarded → safe hourly/daily. Emits `--json` summary
 (counts: archived, indexed, deleted, reclaimed-bytes, secret-flags, unverified) for 千里眼 (senri) monitoring.
+
+**`verify` belongs inside the profile, not beside it.** The scratch pass's S1/S2 findings are only
+conclusive under the write lock (§5, "Exclusion"), and the profile already holds it for the whole run —
+so a `verify` sequenced there is exclusive by construction. An independently scheduled `verify` that
+overlaps an `archive` is not wrong and is not an error, but it downgrades its comparative findings to
+`unverifiable` and reports `exclusive: false`. The monitoring signal to watch is therefore not any
+individual finding but **`exclusive` being false every time**: a scheduled `verify` that never obtains
+exclusion has never actually checked the scratch store.
 
 ---
 
@@ -1372,6 +1617,7 @@ yomi/
   tests/  e2e.rs · p4_gc_break.rs · p4_toctou_break.rs · p4_umask_break.rs · p4_unlink_break.rs
           p5_scratch_cap_break.rs · p6_scratch_ledger_break.rs · p7_scratch_ledger_break.rs
           p8_scratch_capture_break.rs
+          p9_scratch_verify_break.rs · p10_scratch_verify_break.rs
           # fixtures are fabricated in-test under a tmpdir; no committed fixtures/ tree
 ```
 
@@ -1443,16 +1689,48 @@ Load-bearing fixtures: secret-scan **must** catch AKIA/PRIVATE KEY; double-archi
      manifest that will not parse, an entry whose identity will not decode, an artifact that cannot be
      salvaged, and a store directory that is not ours.
   3. **`yomi verify` scratch pass** — S1 and S2 per store dir, in the three vocabularies of §5
-     (`violation` / `unverifiable` / `foreign matter`), plus refused keys. **Next.**
+     (`violation` / `unverifiable` / `foreign matter`), plus refused keys. Manifest-driven; no catalog
+     schema change and no migration. **(implemented; in review)**
+
+     The three checks §5 forbids are not merely omitted but structurally absent — `verify_stores`
+     contains no reference to `source_sha256` or `entry.bytes` at all. Four additions the unit made to
+     the design, all adopted: `UnreconcilableKey` as a **refused key** (an undecodable entry is two
+     facts at two scopes, and the key-level one is a permanent degradation that must move the exit
+     code); the rule that an artifact any entry *explains* — by claiming or by disclaiming it — is
+     withheld from the orphan sweep, so one object never draws two names; `UnreadableStoreRoot` as its
+     own issue, because a root that is ours and unreadable is a different diagnosis from a root that is
+     foreign; and the convention that root-level findings are filed under the key `_scratch`, which no
+     real key can collide with because every key contains `--`.
+
+     The **exclusion rule** (§5), the shared **session→key resolver** and scratch-pass error
+     containment all landed here too. Two structural properties worth keeping: the downgrade happens at
+     the single point where a finding is filed, behind an exhaustive `requires_exclusion()` — a new
+     comparative check that forgets to declare itself fails to compile rather than silently standing;
+     and the root/key classification is applied by **all four** layers (writer, reconciler, GC gate,
+     `verify`), because a key resolved through a foreign root is foreign even when the key directory
+     itself classifies `Own`. `tests/p9_scratch_verify_break.rs` and
+     `tests/p10_scratch_verify_break.rs` pin the vocabulary and attack its boundary.
   4. **`yomi read --scratch`** — manifest listing and stored-bytes retrieval, stored-only by
-     construction. Independent of (3); may land in parallel.
+     construction. Independent of (3); may land in parallel. **Reuses** (3)'s session→key resolver.
   5. **Defect sweep D-S1 … D-S7** (§3). D-S1 (the GC gate reads a live scratch file outside the
      blacklist gate) and D-S2 (a scratch quarantine path keyed by the lossy name) are invariant
      repairs and should not wait on (3)/(4); D-S3/D-S4 (per-key failure containment and refusal
      reporting) are prerequisites for anything unattended; D-S5/D-S6/D-S7 are diagnosability.
   6. **Store-key hardening** (§3, "The store key of a tree"): `slug_hex`/`uuid_hex` identity fields
      with collision refusal, and the `KEY_MAX`/`_h256--` digest form for over-long keys. No migration
-     and no renaming — that is the point of choosing detection over an injective encoding.
+     and no renaming — that is the point of choosing detection over an injective encoding. `verify`'s
+     `StoreKeyCollision` variant is already defined and deliberately unreachable until this lands, so
+     populating it changes no output schema; it is not dead code to be swept. Once `uuid_hex` exists,
+     **session→key resolution should read it instead of parsing the key** (§5), closing the last place
+     the non-injective plain form is still consulted.
+  7. **Store-root ownership** (§3, "Ownership depth"). `ensure_layout` asserts that `~/.yomi/`,
+     `archive/`, `quarantine/`, `state/` and `archive/_scratch/` are real directories — refusing
+     (exit 3), not repairing. Today only `archive/_scratch/` is guarded, and at use rather than at
+     layout, so an `archive/` that is a symlink still resolves the whole store elsewhere with every key
+     beneath it classifying `Own`. Independent of scratch and reaching every command, hence its own
+     unit rather than a line in the defect sweep. Carries the corrected lock-gate predicate with it
+     (§5, `NotAttempted`): a distinct store-shape test, not a widening of `is_initialized()`, whose
+     other caller is not a lock gate.
 
   *Done:* an archived scratch file is retrievable by `yomi read --scratch --file`, byte-identical to
   its stored (post-redaction) content; a corrupted or orphaned scratch store fails `yomi verify` while
