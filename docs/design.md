@@ -187,6 +187,24 @@ total_cap = "20MB"   # whole scratch over cap → manifest-only + flag
 The 134M cloned repo → excluded by `deny` + `total_cap`, but its existence is recorded in the scratch
 manifest. Nothing about it is lost except bytes we deliberately declined to hoard.
 
+**Over-cap is manifest-only, and the manifest says so.** When the tree total exceeds `total_cap`,
+nothing is stored and **every** entry is written `stored: false`, with `over_total_cap: true`
+recording why. That is what makes the tree reclaimable: a `stored: false` entry takes the GC gate's
+size-only path (check 4 — presence and size must still match the manifest), whereas a `stored: true`
+entry with no `.zst` and no hashes reads to the gate as a corrupt archive and refuses the whole tree.
+The writer used to emit exactly that contradiction, so the 134M clone the cap exists for was
+**permanently** unreclaimable — no number of archive/GC cycles helped, because re-archiving
+regenerated the identical manifest.
+
+**Consequence, accepted deliberately.** Reclaiming an over-cap tree therefore deletes data that was
+never archived: the store holds zero bytes of it, and the only remaining guard is the size match of
+check 4. This is decision #4 taken to its conclusion — "whole scratch over cap → manifest-only +
+flag", "nothing about it is lost except bytes we deliberately declined to hoard" — so the tree's
+*existence and shape* survive in the manifest while its *contents* do not. Second-order effect of the
+same rule: an allow-listed file that would have been stored individually is **not** stored, and is
+deleted with the rest, once the tree as a whole goes over the cap. The trade is per-tree, not
+per-file.
+
 **Scratch path identity is byte-valued, and three layers must agree on it.** The manifest is the only
 gate authorizing a whole-tree delete (§5), so the *writer* (what gets manifested), the *reader* (what
 the GC gate walks) and the *deleter* (what `remove_dir_all` removes) must enumerate the same set and
@@ -202,11 +220,6 @@ key it the same way. They do not yet, and the gaps are recorded here rather than
   names collapse to one `U+FFFD` key, so their stored `.zst` files **overwrite each other**. The store
   path must be derived from the raw `OsStr`, and the manifest must carry a lossless companion field
   (`path_b64`, emitted only when the name is not valid UTF-8) so old manifests keep parsing.
-- **`over_total_cap` marks entries `stored: true` while writing no `.zst`**, and the gate treats a
-  stored entry with no hashes as unverifiable — so the over-cap tree, which is exactly the 134M-clone
-  case this section exists for, is **permanently unreclaimable**. Over-cap must write `stored: false`
-  for every entry; the `over_total_cap` flag already records why, and the gate's size-only path is the
-  intended "manifest-only" assurance.
 
 Target state: one module owns `ScratchRel` — derived from a live path, serialized to/parsed from a
 manifest entry, and resolved to a stored `.zst` path — with archive and GC both going through it.
@@ -751,10 +764,13 @@ Load-bearing fixtures: secret-scan **must** catch AKIA/PRIVATE KEY; double-archi
   *Done:* deletes only verified+aged+non-live; refuses on any mismatch/live/lock (test);
   dry-run shows plan; reclaims the 134M scratch clone + 65 empty dirs; `--discover-all-users`
   inventories all ephemeral shapes without touching foreign data.
-  > **Not met:** the "reclaims the 134M scratch clone" criterion. An over-`total_cap` tree is
-  > manifested with `stored: true` entries but no stored bytes, and the GC gate refuses a stored
-  > entry with no hashes — so the over-cap tree is never reclaimed. See §3, scratch path identity.
-  > The tests exercising scratch reclaim all stay under the cap, so this is untested territory.
+  > The "reclaims the 134M scratch clone" criterion was **not** met until the over-cap writer fix: a
+  > tree over `total_cap` was manifested with `stored: true` entries but no stored bytes, and the GC
+  > gate refuses a stored entry with no hashes, so that tree was never reclaimed — and every existing
+  > scratch-reclaim test stayed under the cap, which is why it went unnoticed. Over-cap entries are
+  > now written `stored: false` and take the gate's size-only path; `tests/p5_scratch_cap_break.rs`
+  > covers the over-cap tree directly, including the permanence claim across three archive/GC cycles.
+  > See §3, "Over-cap is manifest-only", for the accepted consequence.
 - **P3 — Index + search.** FTS5, per-entry docs, filters, incremental index, `search`/`read`.
   *Done:* ranked filtered results; incremental index no dup; redacted-only content.
 - **P4 — Codex absorption + cutover.** importer, freeze codex writes, hook/shutdown rewire. **No mx changes** — codex left as frozen read-only vestige (decided §5).

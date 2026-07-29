@@ -283,9 +283,11 @@ impl<'a> Archiver<'a> {
     }
 
     /// Archive one scratch dir: always write a manifest of every file (name,
-    /// size, hash); store only allow-listed files under the size caps. deny/allow
-    /// globs match the tree-relative sub-path with nested (`**/`) semantics so a
-    /// cloned repo's `.git`/`node_modules` are excluded wherever they sit (W2).
+    /// size, and — for stored files only — hashes); store only allow-listed files
+    /// under the size caps. deny/allow globs match the tree-relative sub-path with
+    /// nested (`**/`) semantics so a cloned repo's `.git`/`node_modules` are
+    /// excluded wherever they sit (W2). A tree over `total_cap` is manifest-only:
+    /// nothing is stored, and every entry is recorded `stored: false`.
     pub fn archive_scratch(&self, sc: &ScratchDir, report: &mut Report) -> Result<()> {
         let cfg = &self.env.config.scratch;
         let allow = build_globs_nested(&cfg.allow)?;
@@ -332,13 +334,24 @@ impl<'a> Archiver<'a> {
             kept.push(path.clone());
         }
 
+        // The cap is a property of the whole tree, so it can only be applied once
+        // every candidate has been sized — hence a second pass rather than a term
+        // in `store` above. An over-cap tree stores nothing, and no entry may
+        // claim otherwise: `stored: true` with no `.zst` and no hashes reads to
+        // the GC gate as a corrupt archive, which refuses the tree forever (the
+        // 134M clone the cap exists for was never reclaimable). `over_total_cap`
+        // already records why nothing was stored — design §3, decision #4.
         let over_total = total > cfg.total_cap.0;
+        if over_total {
+            for entry in &mut entries {
+                entry.stored = false;
+            }
+        }
         if !self.dry_run {
             std::fs::create_dir_all(&store_dir)?;
             set_700(&store_dir)?;
             for (entry, path) in entries.iter_mut().zip(kept.iter()) {
                 if entry.stored
-                    && !over_total
                     && let Some(bytes) = self.read_source(path, report)?
                 {
                     let dest = store_dir.join(format!("{}.zst", entry.path));
