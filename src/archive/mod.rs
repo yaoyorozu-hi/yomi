@@ -372,6 +372,55 @@ impl<'a> Archiver<'a> {
             }
         };
 
+        // Immediately after the manifest is read and before any write, any
+        // reconciliation and any coverage judgment. A store key is not injective
+        // — `store_key("a", "-b") == store_key("a-", "b")` — so two session
+        // directories can map to one store, and the second to arrive would
+        // otherwise claim the first's identity and overwrite its only archived
+        // copy. Refusing here is what makes the key injective *in effect*, at no
+        // migration cost: the ledger records the identity, and whoever does not
+        // match it stops.
+        if let Some(mf) = &prior {
+            match crate::scratch::identity_verdict(mf, &sc.session_dir) {
+                crate::scratch::IdentityVerdict::Proceed => {}
+                // What stops is *this* tree, not both. The one the ledger names
+                // goes on being archived and reclaimed — deliberately: a
+                // symmetric rule would let anyone able to `mkdir` under
+                // `/tmp/claude-<uid>/` freeze an existing tree's archive by
+                // choosing a colliding name, where refusing pair-wise lets an
+                // actor at that uid refuse only itself.
+                crate::scratch::IdentityVerdict::Collision => {
+                    tracing::warn!(
+                        key = %sc.key,
+                        store = %store_dir.display(),
+                        session = %sc.session_dir.display(),
+                        "two session directories map to this store key, and its \
+                         ledger belongs to the other one; leaving this tree \
+                         unarchived. Nothing is archived or removed for it until \
+                         one of the two is renamed."
+                    );
+                    return Ok(());
+                }
+                // An identity this run cannot read is not a licence to write
+                // through it. Proceeding would restamp the field with *this*
+                // tree's identity and claim a store that may well be another
+                // tree's — the overwrite the recorded identity exists to stop,
+                // reopened by a single corrupted byte.
+                crate::scratch::IdentityVerdict::Refuse => {
+                    tracing::warn!(
+                        key = %sc.key,
+                        store = %store_dir.display(),
+                        "this store's recorded tree identity cannot be read; \
+                         leaving this key untouched. Nothing is archived or \
+                         removed for it until the manifest is repaired or \
+                         removed — an identity nobody can read is not evidence \
+                         that this tree owns this store."
+                    );
+                    return Ok(());
+                }
+            }
+        }
+
         // The whole session tree, not `scratchpad/` + `tasks/*.output`: the
         // deleter removes `<slug>/<uuid>/` entire, so a live file the writer
         // never manifests is one the GC gate cannot account for, and the tree is
@@ -563,8 +612,14 @@ impl<'a> Archiver<'a> {
         }
 
         if !self.dry_run {
+            // Stamped on every write, so a store written before these fields
+            // gains its identity the first time a knowing writer touches it —
+            // and the collision refusal above starts holding for it from then on.
+            let (slug_hex, uuid_hex) = crate::scratch::identity_hex(&sc.session_dir);
             let mf = ScratchManifest {
                 key: sc.key.clone(),
+                slug_hex,
+                uuid_hex,
                 captured_at: now_iso(),
                 total_bytes: total,
                 over_total_cap: over_total,

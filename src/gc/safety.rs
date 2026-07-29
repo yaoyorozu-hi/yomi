@@ -9,7 +9,9 @@ use crate::catalog::Catalog;
 use crate::config::Env;
 use crate::gc::live;
 use crate::gc::{PassedChecks, ProtectReason, SkipReason, Verdict, policy};
-use crate::scratch::{ScratchEntry, ScratchManifest, ScratchRel, StoreDir, read_manifest};
+use crate::scratch::{
+    IdentityVerdict, ScratchEntry, ScratchManifest, ScratchRel, StoreDir, read_manifest,
+};
 use anyhow::Result;
 use std::collections::HashSet;
 use std::ffi::OsStr;
@@ -218,6 +220,22 @@ pub fn evaluate_scratch(
             ));
         }
     };
+    // Immediately after the manifest is read and before any coverage judgment.
+    // A store key is not injective, so this ledger may describe a *different*
+    // session directory that happens to map to the same key — and coverage
+    // computed from it would be coverage of another tree, which is the shape of
+    // evidence that authorizes destroying this one.
+    let identity = crate::scratch::identity_verdict(&mf, session_dir);
+    if identity != IdentityVerdict::Proceed {
+        // Two states, two operator actions: rename one of two colliding session
+        // directories, or repair a ledger whose identity cannot be read. A false
+        // reason is worse than a coarse one (D-S7), so they do not share a name.
+        let reason = match identity {
+            IdentityVerdict::Collision => SkipReason::StoreKeyCollision,
+            _ => SkipReason::UndecodableIdentity,
+        };
+        return Ok((Verdict::Unverified { reason }, bytes));
+    }
     if let Some(reason) = verify_scratch_tree(bl, session_dir, &store_dir, &mf) {
         return Ok((Verdict::Unverified { reason }, bytes));
     }
