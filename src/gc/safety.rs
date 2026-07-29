@@ -9,11 +9,10 @@ use crate::catalog::Catalog;
 use crate::config::Env;
 use crate::gc::live;
 use crate::gc::{PassedChecks, ProtectReason, SkipReason, Verdict, policy};
+use crate::scratch::{ScratchEntry, ScratchManifest, ScratchRel, read_manifest};
 use anyhow::Result;
-use serde::Deserialize;
 use std::collections::HashSet;
 use std::ffi::OsStr;
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -188,7 +187,7 @@ pub fn evaluate_scratch(
 
     let store_dir = env.archive_dir().join("_scratch").join(key);
     let manifest_path = store_dir.join("manifest.json");
-    let mf = match read_scratch_manifest(&manifest_path) {
+    let mf = match read_manifest(&manifest_path) {
         Some(m) => m,
         None => {
             return Ok((
@@ -442,29 +441,6 @@ fn tree_size_and_newest(root: &Path) -> (u64, Option<SystemTime>) {
     (total, newest)
 }
 
-#[derive(Deserialize)]
-struct ScratchManifestEntry {
-    path: String,
-    bytes: u64,
-    stored: bool,
-    /// Absent in manifests written before D2/R1 shipped — a stored entry without
-    /// these hashes is unverifiable, so the tree is skipped (safe side).
-    #[serde(default)]
-    source_sha256: Option<String>,
-    #[serde(default)]
-    content_sha256: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct ScratchManifestRead {
-    entries: Vec<ScratchManifestEntry>,
-}
-
-fn read_scratch_manifest(path: &Path) -> Option<ScratchManifestRead> {
-    let text = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&text).ok()
-}
-
 /// Upper bound on a live scratch file re-read for hashing. Stored entries are
 /// bounded by the archiver's `file_cap` (≤5MB default); a live file that has
 /// since grown past this is treated as drifted → skip, never OOM.
@@ -476,27 +452,27 @@ const MAX_SCRATCH_REHASH_BYTES: u64 = 64 * 1024 * 1024;
 fn verify_scratch_tree(
     session_dir: &Path,
     store_dir: &Path,
-    mf: &ScratchManifestRead,
+    mf: &ScratchManifest,
 ) -> Option<SkipReason> {
-    // Keyed by raw bytes, never by `to_string_lossy()`: two distinct non-UTF-8
-    // filenames both decode to the same `U+FFFD` string, so a lossy key let an
-    // UNARCHIVED file inherit an archived sibling's manifest entry and authorize
-    // the whole-tree delete. A name the manifest cannot represent losslessly now
-    // simply matches nothing, and the tree is refused (safe side).
-    let by_path: std::collections::HashMap<&[u8], &ScratchManifestEntry> =
-        mf.entries.iter().map(|e| (e.path.as_bytes(), e)).collect();
+    // Keyed by `ScratchRel` — raw bytes, never a lossy string. An entry whose
+    // recorded fields do not decode contributes no key, so it matches no live
+    // file and the tree is refused (safe side).
+    let by_rel: std::collections::HashMap<ScratchRel, &ScratchEntry> = mf
+        .entries
+        .iter()
+        .filter_map(|e| e.rel().map(|r| (r, e)))
+        .collect();
 
     for entry in WalkDir::new(session_dir).into_iter().filter_map(|e| e.ok()) {
         if !entry.file_type().is_file() {
             continue;
         }
-        let rel = match entry.path().strip_prefix(session_dir) {
-            Ok(r) => r,
-            Err(_) => return Some(SkipReason::NoCatalogRow),
+        let Some(rel) = ScratchRel::from_live(session_dir, entry.path()) else {
+            return Some(SkipReason::NoCatalogRow);
         };
         // (1) A live file absent from the manifest is unarchived data (created
         // after the last archive) — refuse the whole-tree delete.
-        let Some(e) = by_path.get(rel.as_os_str().as_bytes()) else {
+        let Some(e) = by_rel.get(&rel) else {
             return Some(SkipReason::NoCatalogRow);
         };
         let Ok(md) = entry.metadata() else {
@@ -526,7 +502,7 @@ fn verify_scratch_tree(
         }
         // (3) The stored archive must decompress to the captured content hash —
         // valid-zstd of the wrong bytes is not verification (D2).
-        let zst = store_dir.join(format!("{}.zst", e.path));
+        let zst = store_dir.join(rel.store_rel());
         let intact = std::fs::read(&zst)
             .ok()
             .and_then(|b| decompress_all(&b).ok())

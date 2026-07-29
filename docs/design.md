@@ -164,8 +164,7 @@ Frame proliferation hurts ratio slightly; **compaction** (rewrite to single fram
 | `~/.cache/claude-cli-nodejs/**/mcp-logs-*/*.jsonl` | yes | → `_mcp/`; LOW-MED |
 | `shell-snapshots/*.sh` | yes | → `_snapshots/`; **secret scan mandatory** (env dump) |
 | `paste-cache/*.txt` | yes | MEDIUM |
-| `/tmp/claude-1007/<slug>/<uuid>/scratchpad/**` | manifest **+ allowlist-under-cap store** | decision #4; see below |
-| `/tmp/claude-1007/<slug>/<uuid>/tasks/*.output` | yes | small task output — **only the `.output` extension is enumerated** |
+| `/tmp/claude-1007/<slug>/<uuid>/**` (whole tree) | manifest **+ allowlist-under-cap store** | decision #4; the enumerated set must equal what the deleter removes — see below |
 | `~/.local/share/claude/versions/` (248M) | **never** | runtime binary — not session data |
 | `.credentials.json`, `.claude.json`(+backups), `mcp-needs-auth-cache.json` | **never** | hard blacklist §4 |
 | `~/.zaibatsu/**` | **never** | 既管理 |
@@ -205,24 +204,161 @@ same rule: an allow-listed file that would have been stored individually is **no
 deleted with the rest, once the tree as a whole goes over the cap. The trade is per-tree, not
 per-file.
 
-**Scratch path identity is byte-valued, and three layers must agree on it.** The manifest is the only
-gate authorizing a whole-tree delete (§5), so the *writer* (what gets manifested), the *reader* (what
-the GC gate walks) and the *deleter* (what `remove_dir_all` removes) must enumerate the same set and
-key it the same way. They do not yet, and the gaps are recorded here rather than assumed away:
+**Scratch path identity is byte-valued, and one module owns it.** `src/scratch.rs` owns `ScratchRel`
+— the identity of one scratch file relative to its session dir — and every layer goes through it: the
+*writer* (archive), the *reader* (the GC gate), the *deleter*, `yomi read --scratch` and
+`yomi verify`. `ScratchRel` is a newtype over the **raw relative path bytes** (`OsStr` bytes, never
+`to_string_lossy`), with exactly these operations:
 
-- **Enumeration.** The writer walks `scratchpad/**` plus `tasks/*.output`; the reader walks the entire
-  `<slug>/<uuid>/` tree; the deleter removes the entire tree. Any file outside those two sets — a
-  `tasks/notes.txt`, anything dropped directly in `<uuid>/` — is unmanifested, so the reader refuses
-  and the tree is **never reclaimed**. Fail-safe, but the safety rests on the reader alone, not on the
-  three layers agreeing.
-- **Key encoding.** The manifest's `path` is a `to_string_lossy()` string while the gate keys by raw
-  bytes; a non-UTF-8 name therefore matches nothing (tree refused forever) and two distinct non-UTF-8
-  names collapse to one `U+FFFD` key, so their stored `.zst` files **overwrite each other**. The store
-  path must be derived from the raw `OsStr`, and the manifest must carry a lossless companion field
-  (`path_b64`, emitted only when the name is not valid UTF-8) so old manifests keep parsing.
+| Operation | Contract |
+|---|---|
+| `from_live(session_dir: &Path, path: &Path) -> Option<ScratchRel>` | strip `session_dir`; `None` if `path` is not a descendant |
+| `as_bytes(&self) -> &[u8]` | the **sole** identity — equality, hashing, map keys, manifest lookup |
+| `to_rel_path(&self) -> &Path` | relative path, for joining to a live session dir or a store dir |
+| `glob_subpath(&self) -> Cow<'_, str>` | the string the `[scratch]` allow/deny globs match |
+| `store_rel(&self) -> PathBuf` | `<rel>.zst`, resolved under `archive/_scratch/<key>/` |
+| `manifest_fields(&self) -> (String, Option<String>)` | `(path, path_hex)` — `path` is the lossy display form; `path_hex` is lowercase hex of the raw bytes, emitted **only** when those bytes are not valid UTF-8 |
+| `from_manifest(path: &str, path_hex: Option<&str>) -> Option<ScratchRel>` | `path_hex` wins when present, else `path`'s bytes; `None` if neither decodes |
 
-Target state: one module owns `ScratchRel` — derived from a live path, serialized to/parsed from a
-manifest entry, and resolved to a stored `.zst` path — with archive and GC both going through it.
+Hex, not base64: `util.rs` already carries a `hex` encoder for `sha256_hex` and needs only a decoder
+companion, whereas base64 would add a dependency to `cargo-deny`'s surface for a field that is emitted
+only for the pathological name. Hex has one alphabet, no padding and no URL-safe variant to confuse.
+
+`ScratchManifest` / `ScratchEntry` are defined **once**, `Serialize + Deserialize`, in that same
+module. The writer and the GC gate previously carried two independent struct definitions — one
+serialize-only in `archive`, one deserialize-only in `gc::safety` — which could drift silently. They
+cannot now.
+
+`path_hex` is additive: a manifest written before it existed has no such field, `from_manifest` falls
+back to `path`, and every ASCII/UTF-8 name (the entire real population) round-trips byte-identically.
+Two distinct non-UTF-8 names no longer collapse to one `U+FFFD` key, so their stored `.zst` can no
+longer overwrite each other and their trees are no longer refused forever.
+
+**Enumeration is the whole session dir.** The deleter removes `<slug>/<uuid>/` entire, so the writer
+must consider `<slug>/<uuid>/` entire. `scratchpad/` and `tasks/` stop being enumeration roots and
+become ordinary path prefixes: `ScratchRel` for `<uuid>/scratchpad/a.md` is `scratchpad/a.md`, for
+`<uuid>/tasks/a.output` is `tasks/a.output` — byte-identical to what the narrow writer already
+emitted, so **existing manifests stay valid with no conversion**. The widening only *adds* keys. A
+`tasks/notes.txt`, or anything dropped directly in `<uuid>/`, is now manifested (with `stored` decided
+by the allow/deny globs and the caps like any other file) instead of being unmanifested and refusing
+the tree forever. This supersedes the `tasks/*.output`-only rule in the source table above: extension
+filtering moves entirely into the `[scratch]` allow/deny globs, where it is configurable and where the
+same rules already govern `scratchpad/**`. A hardcoded second filter in the enumerator was the reason
+the three layers could disagree at all.
+
+Globs continue to match the session-relative path. `build_globs_nested` already registers `**/<p>`
+alongside each `<p>`, so the default `allow`/`deny` sets keep matching at every depth; the depth
+matrix is a required test, not an assumption.
+
+Consequence, stated because it is visible: `total_bytes` now counts the whole tree, so a tree that sat
+just under `total_cap` may go over it and become manifest-only. That is the cap measuring what will
+actually be deleted, which is what it was always meant to measure.
+
+**Store law (S) — the store dir and the manifest are one ledger.** For a scratch key `<K>`:
+
+> the set of `*.zst` under `archive/_scratch/<K>/` is **exactly** the set of `store_rel()` of the
+> manifest's `stored: true` entries, and each one decompresses to its entry's `content_sha256`.
+
+`archive` establishes S. `yomi verify` checks S. The GC gate's per-entry store re-check is a
+*consequence* of S, not an independent claim. Nothing but `archive` writes into a scratch store dir.
+
+**Reconciliation — the one delete authority `archive` holds.** Establishing S means archive removes
+`*.zst` under `archive/_scratch/<K>/` that the manifest it just wrote does not claim. The authority is
+bounded and enumerable: only `*.zst`, only under that one key's store dir, never `manifest.json`,
+never `quarantine/` (a quarantined raw original stays recoverable), never any path outside
+`archive/_scratch/`. `--dry-run` reports the removals instead of performing them, and the run report
+carries `scratch_orphans_removed` so a config change that discards stored bytes is loud, not silent.
+
+Without reconciliation the store and the manifest drift apart on any policy change, silently and
+unrecoverably-in-practice: archive under `total_cap = "1MB"`, lower it to `"1KB"`, re-archive — the
+previous run's `.zst` stay on disk while the new manifest declares `over_total_cap: true` and every
+entry `stored: false`. The store holds a faithful copy that yomi's own ledger denies. GC then deletes
+the live tree on the size-only path. The bytes survive; their **retrievability** does not, and a
+ledger that denies its own store is worse than one that stores nothing.
+
+**A vanished file keeps its archive.** Reconciliation applies policy to files that are *still live*.
+An entry whose live file is gone since the last run is **retained verbatim** — `stored`, both hashes,
+and its `.zst` — and marked `present: false` (`#[serde(default)]` → `true`, so old manifests read
+unchanged). Purging it would destroy the only remaining copy, which no cap decision authorizes: the
+caps say "do not hoard *this tree*", not "destroy what you already took". A retained entry is not part
+of the live tree, so it is excluded from `total_bytes` and from the cap. The GC gate is unaffected —
+it walks live files and looks each one up; extra manifest entries match nothing. If a file with the
+same `ScratchRel` reappears with different bytes, the size/sha check fails and the tree is refused,
+which is correct.
+
+**Over-cap, restated under S.** A tree over `total_cap` writes every *live* entry `stored: false`,
+stores no bytes, sets `over_total_cap: true`, and reconciliation removes those live entries' `.zst`.
+Retained `present: false` entries are untouched. Decision #4 is honoured for the live tree; no
+archive-only copy is destroyed by a cap change.
+
+**Why the scratch manifest does not merge its predecessor — unlike a session manifest.** A session
+manifest merges prior records because its sources are append-only and captured *incrementally*: an
+artifact untouched this run was genuinely captured in an earlier one and must keep its provenance. A
+scratch tree has no incremental capture — it is re-enumerated whole on every run — so a blanket merge
+would import stale claims about files whose policy or content has since moved, and would in fact
+*mask* the orphan drift above by keeping a `stored: true` entry alive for a `.zst` that no longer
+belongs. The asymmetry is deliberate and stays. Retention of vanished-file entries is the one narrow
+merge, and it is justified by "do not destroy the last copy", not by provenance.
+
+### Scratch is archived, not disposable: the read and verify paths
+
+GC deletes a scratch tree because the archive covers it. An archive with no retrieval path and no
+integrity check is not an archive, so the coverage claim has to be exercisable:
+
+- **`yomi read <session-or-key> --scratch`** — with no `--file`, lists the manifest (rel path, bytes,
+  `stored`, `present`, `over_total_cap`, sha8s). With `--file <rel>`, writes that entry's decompressed
+  stored bytes to stdout. Detailed in §8.
+- **`yomi verify`** — a scratch pass over every `archive/_scratch/*/`, checking law S. Detailed in §5.
+
+**Redaction non-exposure is structural, exactly as it is for the index (§6).** A scratch `.zst` holds
+`scan.redacted` as of capture: either in-place-redacted text or the opaque `‹QUARANTINED:…›` marker.
+The read path decompresses that `.zst` and emits nothing else — it never reads the live source, never
+reads `quarantine/`, and never re-derives content from anything but the stored bytes. Non-exposure
+therefore does not depend on the read path making a decision; there is no input from which a raw
+secret could reach it.
+
+**Path traversal is structural too.** `--file <rel>` is matched against the manifest's `ScratchRel`
+values; the path actually opened is derived from the **matched entry**, never by joining user input to
+the store dir. An unmatched value is "not found" — there is no code path that turns
+`--file ../../../etc/passwd` into an open.
+
+**Cross-user boundary unchanged.** Neither `read --scratch` nor the verify pass enumerates users,
+resolves foreign roots, or accepts a `--discover-all-users`-shaped flag. They operate on
+`env.archive_dir()` — the store the invocation already targets — and nothing else.
+
+**Known gap, deliberately out of this scope: scratch is not catalog-registered.** `archive_scratch`
+writes no `artifacts` row, so scratch stored bytes are absent from `status --storage`, scratch has no
+`verified_at` (the verify pass is stateless, and `status --unverified` does not cover it), and the
+secret findings computed for scratch files are tallied into the run report but never persisted — so
+`status --secrets` never lists a scratch finding even when a scratch file was quarantined. Closing
+this needs rows, and rows need a lossless key that `artifacts.source_path TEXT UNIQUE` cannot give a
+non-UTF-8 path. The queued shape is a dedicated table, keyed losslessly and additively (no migration
+mechanism required — `schema.sql` is `CREATE TABLE IF NOT EXISTS` applied on every open):
+
+```sql
+CREATE TABLE IF NOT EXISTS scratch_entries (
+    id             INTEGER PRIMARY KEY,
+    scratch_key    TEXT NOT NULL,          -- <slug>--<uuid>
+    rel_hex        TEXT NOT NULL,          -- hex(ScratchRel bytes) — lossless, ASCII, collision-free
+    rel_display    TEXT NOT NULL,          -- lossy; human-facing only, never a key
+    source_sha256  TEXT NOT NULL,
+    source_bytes   INTEGER NOT NULL,
+    stored_sha256  TEXT NOT NULL,
+    stored_bytes   INTEGER NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    redacted       INTEGER NOT NULL DEFAULT 0,
+    quarantined    INTEGER NOT NULL DEFAULT 0,
+    verified_at    TEXT,
+    updated_at     TEXT NOT NULL,
+    UNIQUE(scratch_key, rel_hex)
+);
+```
+
+No `stored_path` column: the store path is derived from `scratch_key` + `rel_hex`, and a stored
+derivation is a value that can drift from its own inputs. A separate table, not `artifacts` rows,
+because scratch identity is `(key, rel)` rather than a source path, and because scratch must stay out
+of `index_candidates()` and `gc_row_for_source()` by *construction* rather than by a role filter that
+a future role addition could quietly widen.
 
 ---
 
@@ -480,6 +616,41 @@ for a redacted one it is the sha of the redacted stored content (the browsable c
 design, so it cannot equal the raw source). The GC gate above therefore trusts `verify`, and `verify`
 proves the store is byte-exact to what capture intended.
 
+**Scratch verification is manifest-driven, because the manifest is what the gate trusts.** Scratch
+writes no catalog row, so `cat.verify_rows()` cannot reach it — and mirroring scratch into the catalog
+purely to give `verify` something to iterate would create a *third* ledger able to drift from both the
+manifest and the store. `verify` attests to the ledger the delete gate actually consumes. Its scratch
+pass walks `archive/_scratch/*/` (scoped to the matching key when a session uuid is given) and checks
+law S (§3) per store dir:
+
+1. `manifest.json` exists and parses. Missing or unparseable ⇒ failure (the gate would refuse this
+   tree; `verify` says so out loud rather than leaving it to a GC dry-run to notice).
+2. Every `stored: true` entry carries **both** `source_sha256` and `content_sha256`. A stored entry
+   without them is unverifiable — the gate already skips such a tree; `verify` reports it.
+3. Every `stored: true` entry's `.zst` exists, decompresses, and hashes to its `content_sha256`.
+4. Every `stored: false` entry has **no** `.zst` at its `store_rel()`.
+5. Every `*.zst` under the store dir is claimed by a `stored: true` entry — the orphan check, and the
+   one that catches a store/manifest drift from the outside.
+
+Checks 4 and 5 are the two halves of law S's set equality; 3 is its hash half. A failure in any of
+them is a `verify` failure (exit 2), listed by key and rel path. The pass is stateless: it persists no
+`verified_at`, because scratch has no catalog row to persist it on (§3, known gap).
+
+**GC gating: unchanged — the scratch gate does not consult law S.** An orphaned `.zst` is a store
+hygiene defect, not a coverage defect: it does not make the live tree less archived, and the gate's
+question is only ever "does the archive faithfully cover *this live tree*". Refusing on an orphan
+would let an unrelated store defect permanently block reclamation — the precise failure mode the
+over-cap fix existed to end. The scenario that *would* deserve a halt is "the archive silently failed,
+so the source was deleted anyway", and detecting that is exactly what the `verify` pass above is for;
+the answer to a ledger defect is a check that reports it, not a gate that wedges on it.
+
+Two conditions of that judgment are worth recording, because the *reason* it is safe changes once §3's
+reconciliation lands. Before: an over-cap tree could still have stored bytes sitting in an orphan
+`.zst`, so "nothing is lost" leaned on manual `zstd` recovery — which is the defect, not a rationale.
+After: an over-cap tree genuinely stores nothing, the orphan class cannot be produced by `archive` at
+all, and the position rests on ratified decision #4 alone. No gate change is needed in either state,
+and the post-fix rationale is the cleaner one.
+
 ### Live-session protection
 
 - Parse `~/.claude/sessions/<pid>.json` → active session UUIDs + cwd; confirm liveness via `/proc/<pid>`.
@@ -594,7 +765,12 @@ input** — sources are never re-read. Dry-run is the default; `--commit` mutate
   the hardened scanner, and targeted **iff the re-scan changes the stored bytes** (`scan.redacted !=
   stored`). `--session` narrows the sweep. Scratch and subagent-meta stores are out of v1 scope
   (neither is catalog-registered/indexed — not part of this index exposure surface; a separate
-  mechanism is follow-up).
+  mechanism is follow-up). This exclusion is unchanged by `read --scratch` (§3), but its consequence
+  is now visible rather than latent: a gap-era scratch `.zst` is readable through a first-class
+  command while still carrying whatever the pre-hardening scanner left in it. The exposure surface is
+  the same as before — owner-only bytes in a mode-700 store, never indexed — but a scratch sweep is
+  now a concrete follow-up with a concrete face, not a theoretical one. It needs the catalog rows of
+  §3's queued table to record which entries were rescanned.
 - **Invariant 1 — both faces cleaned.** A targeted artifact's raw secret is removed from the stored
   copy AND the index; the post-write verify proves no residual on either face.
 - **Invariant 2 — `source_sha256` is immutable.** It is the original raw's historical hash and the
@@ -688,10 +864,25 @@ yomi search  <query> [filters…]
 yomi index   [--reindex] [--session <uuid>]
 yomi rescan  [--commit] [--session <uuid>] [--fix-perms]                                                # dry-run default; retroactive re-redaction
 yomi read    <session-uuid> [--entry <uuid>] [--agents] [--grep P] [--human|--raw]
+yomi read    <session-uuid | scratch-key> --scratch [--file <rel>] [--json]                              # archived scratch
 yomi status  [--secrets] [--unverified] [--storage]
-yomi verify  [<uuid> | --all]
+yomi verify  [<uuid> | --all]                                                                           # incl. scratch store law S (§5)
 yomi config  [get|path]
 ```
+
+**`read --scratch`.** The positional argument is a session uuid or a full `<slug>--<uuid>` store key;
+a uuid resolves to the single `archive/_scratch/*--<uuid>/` that carries it (uuids are unique, so at
+most one), and an ambiguous or absent key is exit 2 with the reason. Behaviour:
+
+| Form | Output | Exit |
+|---|---|---|
+| `--scratch` | manifest listing: `rel`, `bytes`, `stored`, `present`, plus `captured_at` / `total_bytes` / `over_total_cap` for the tree. `--json` emits the same fields plus `source_sha256` / `content_sha256` | 0, or 2 if the key resolves to nothing |
+| `--scratch --file <rel>` | the entry's decompressed stored bytes, **written raw** to stdout (`write_all`, not a lossy string conversion — a scratch file may be binary). `--json` emits `{rel, bytes, encoding, content}` where `encoding` is `"utf8"` (content verbatim) or `"hex"` (content hex-encoded) — same encoder as `path_hex`, so `--json` adds no dependency and never emits invalid UTF-8 inside a JSON string | 0 |
+| `--scratch --file <rel>`, entry `stored: false` | refusal naming *why* it was not stored — over-cap, deny-listed, or over `file_cap` — never a bare "not found" | 2 |
+| `--scratch --file <rel>`, no matching entry | not found | 2 |
+
+`<rel>` is compared against `ScratchRel::as_bytes()`; the opened path comes from the matched entry
+(§3). Only stored bytes are ever read — never the live source, never `quarantine/`.
 
 **Not yet shipped** (kept here as the designed surface for their phases):
 `yomi list` (P5), `yomi import --from-codex|--from-wonka` (P4, §7), `yomi run --profile daily` (P5),
@@ -721,6 +912,7 @@ yomi/
     blacklist.rs            # compiled path denylist
     model.rs                # Entry, Session, Manifest, Finding (serde)
     lock.rs                 # advisory single-writer lock
+    scratch.rs              # ScratchRel + ScratchManifest/Entry — the one owner of scratch identity (§3)
     source/  {mod, claude, single, discover}.rs
     archive/ {mod, manifest, incremental, compress}.rs             # zstd frames
     scan/    {mod, content, rules, redact, quarantine}.rs
@@ -730,6 +922,7 @@ yomi/
     rescan/  {mod}.rs                                              # P3.5 re-redaction
     importer/{mod, codex, wonka}.rs                                # P4, not yet built
   tests/  e2e.rs · p4_gc_break.rs · p4_toctou_break.rs · p4_umask_break.rs · p4_unlink_break.rs
+          p5_scratch_cap_break.rs · p6_scratch_ledger_break.rs · p6_scratch_read_break.rs
           # fixtures are fabricated in-test under a tmpdir; no committed fixtures/ tree
 ```
 
@@ -776,6 +969,27 @@ Load-bearing fixtures: secret-scan **must** catch AKIA/PRIVATE KEY; double-archi
 - **P4 — Codex absorption + cutover.** importer, freeze codex writes, hook/shutdown rewire. **No mx changes** — codex left as frozen read-only vestige (decided §5).
   *Done:* `import --from-codex` idempotent; `mx codex archive` no longer invoked by hooks; hooks call `yomi archive`; `mx codex read/list/search` still function untouched.
 - **P5 — Ops.** `run --profile daily`, `status --storage`, senri JSON hook, documented tantivy upgrade trigger.
+- **P6 — Scratch retrieval + integrity** (§3, §5, §8). The archive-then-delete contract holds for
+  scratch only in one direction today: `archive/_scratch/` is written and gated on, but no command
+  reads it and no command verifies it, so its stored bytes are write-only and a corruption is
+  undetectable. Four units, in order:
+  1. **`src/scratch.rs`** — `ScratchRel` + the single `ScratchManifest`/`ScratchEntry` definition;
+     archive and the GC gate both go through it. Pure refactor: identity becomes lossless (`path_hex`),
+     no enumeration change, no store change, no manifest re-keying.
+  2. **Enumeration + reconciliation** — the writer walks the whole `<slug>/<uuid>/`; archive
+     establishes law S by removing unclaimed `*.zst` under the tree's own store dir; vanished-file
+     entries are retained `present: false`; `scratch_orphans_removed` in the run report, previewed
+     under `--dry-run`.
+  3. **`yomi verify` scratch pass** — law S per store dir, exit 2 on any violation.
+  4. **`yomi read --scratch`** — manifest listing and stored-bytes retrieval, stored-only by
+     construction. Independent of (3); may land in parallel.
+
+  *Done:* an archived scratch file is retrievable by `yomi read --scratch --file`, byte-identical to
+  its stored (post-redaction) content; a corrupted or orphaned scratch store fails `yomi verify`;
+  lowering `total_cap` and re-archiving leaves no `.zst` the manifest denies; a file dropped directly
+  in `<uuid>/` no longer makes its tree permanently unreclaimable; deleting a live scratch file does
+  not destroy its archived copy. Catalog registration of scratch (`scratch_entries`, §3) is
+  **not** part of P6 and stays queued.
 
 ---
 

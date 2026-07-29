@@ -7,6 +7,7 @@ use crate::catalog::{ArtifactUpsert, Catalog, SessionUpsert};
 use crate::config::Env;
 use crate::model::{ArtifactRecord, ArtifactRole, Finding, Frame, Manifest, SecretScanSummary};
 use crate::scan::{Allowlist, ContentScan, scan_content};
+use crate::scratch::{ScratchEntry, ScratchManifest, ScratchRel};
 use crate::source::claude::DiscoveredSession;
 use crate::source::single::{ScratchDir, SingleFile};
 use crate::util::{now_iso, sha256_hex};
@@ -308,30 +309,37 @@ impl<'a> Archiver<'a> {
         candidates.extend(sc.task_outputs.iter().cloned());
         candidates.sort();
 
-        let mut kept: Vec<PathBuf> = Vec::new();
+        let Some(session_dir) = scratch_session_dir(sc) else {
+            tracing::warn!(key = %sc.key, "scratch entry locates no session dir; skipped");
+            return Ok(());
+        };
+
+        let mut kept: Vec<(PathBuf, ScratchRel)> = Vec::new();
         for path in &candidates {
             if self.blacklist.is_blacklisted(path) {
                 report.blacklisted_skipped += 1;
                 continue;
             }
+            // Identity first: a candidate with no session-relative identity has
+            // no manifest key and no store path, so it cannot be archived. Both
+            // enumeration roots are children of `session_dir`, so this is
+            // unreachable; leaving it unmanifested refuses the tree, which is the
+            // safe side of an impossible case.
+            let Some(rel) = ScratchRel::from_live(&session_dir, path) else {
+                tracing::warn!(path = %path.display(), "scratch candidate escapes its session dir; skipped");
+                continue;
+            };
             let Ok(md) = std::fs::metadata(path) else {
                 continue;
             };
             let size = md.len();
             total += size;
-            let rel = scratch_rel(sc, path);
             let subpath = scratch_subpath(sc, path);
             let denied = deny.is_match(&subpath);
             let allowed = allow.is_match(&subpath);
             let store = allowed && !denied && size <= cfg.file_cap.0;
-            entries.push(ScratchEntry {
-                path: rel,
-                bytes: size,
-                stored: store,
-                source_sha256: None,
-                content_sha256: None,
-            });
-            kept.push(path.clone());
+            entries.push(ScratchEntry::new(&rel, size, store));
+            kept.push((path.clone(), rel));
         }
 
         // The cap is a property of the whole tree, so it can only be applied once
@@ -350,11 +358,11 @@ impl<'a> Archiver<'a> {
         if !self.dry_run {
             std::fs::create_dir_all(&store_dir)?;
             set_700(&store_dir)?;
-            for (entry, path) in entries.iter_mut().zip(kept.iter()) {
+            for (entry, (path, rel)) in entries.iter_mut().zip(kept.iter()) {
                 if entry.stored
                     && let Some(bytes) = self.read_source(path, report)?
                 {
-                    let dest = store_dir.join(format!("{}.zst", entry.path));
+                    let dest = store_dir.join(rel.store_rel());
                     if let Some(parent) = dest.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
@@ -750,33 +758,6 @@ impl TranscriptMeta {
     }
 }
 
-#[derive(serde::Serialize)]
-struct ScratchEntry {
-    path: String,
-    bytes: u64,
-    stored: bool,
-    /// sha256 of the live source bytes at archive time. Present only for stored
-    /// entries; GC re-hashes the live file against this to prove it is unchanged
-    /// before deleting the tree. Absent for non-stored (deny-listed) junk, which
-    /// GC verifies by presence + size only.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    source_sha256: Option<String>,
-    /// sha256 of the stored (post-scan, possibly-redacted) bytes. GC decompresses
-    /// the stored `.zst` and checks its content hash against this, so a valid-zstd
-    /// frame of the *wrong* content can never pass the scratch delete gate (D2).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    content_sha256: Option<String>,
-}
-
-#[derive(serde::Serialize)]
-struct ScratchManifest {
-    key: String,
-    captured_at: String,
-    total_bytes: u64,
-    over_total_cap: bool,
-    entries: Vec<ScratchEntry>,
-}
-
 /// Upper bound on a single source read into memory (R11). Larger sources are
 /// skipped and flagged rather than risking OOM; nothing yomi archives in P1
 /// legitimately approaches this (transcripts are MBs; the runtime is blacklisted).
@@ -863,14 +844,18 @@ fn uuid_for_scratch(sc: &ScratchDir) -> String {
     format!("_scratch--{}", sc.key)
 }
 
-/// Stored rel for a scratch file: `scratchpad/<sub>` or `tasks/<name>`.
-fn scratch_rel(sc: &ScratchDir, path: &Path) -> String {
-    if let Some(sp) = &sc.scratchpad
-        && let Ok(r) = path.strip_prefix(sp)
-    {
-        return format!("scratchpad/{}", r.to_string_lossy());
+/// The session dir (`<tmp_root>/<slug>/<uuid>`) a scratch entry describes. Both
+/// enumeration roots — `scratchpad/` and `tasks/` — are its immediate children,
+/// so either one locates it. `None` only for an entry carrying neither, which
+/// `single::scratch` does not emit.
+fn scratch_session_dir(sc: &ScratchDir) -> Option<PathBuf> {
+    if let Some(sp) = &sc.scratchpad {
+        return sp.parent().map(Path::to_path_buf);
     }
-    format!("tasks/{}", file_name(path))
+    sc.task_outputs
+        .first()
+        .and_then(|t| t.parent().and_then(Path::parent))
+        .map(Path::to_path_buf)
 }
 
 /// Tree-relative sub-path (no `scratchpad/`/`tasks/` prefix) for glob matching.
@@ -984,4 +969,149 @@ pub fn verify_stored(
         return Ok(true);
     }
     Ok(sha256_hex(&content) == expected_content_sha)
+}
+
+#[cfg(test)]
+mod glob_depth {
+    use super::build_globs_nested;
+    use crate::config::ScratchConfig;
+
+    fn set(pat: &str) -> globset::GlobSet {
+        build_globs_nested(&[pat.to_string()]).unwrap()
+    }
+
+    /// Every path shape a scratch tree can present, at every depth that matters.
+    const SUBJECTS: &[&str] = &[
+        "a.md",
+        "scratchpad/a.md",
+        "scratchpad/sub/a.md",
+        "scratchpad/sub/deeper/a.md",
+        "a/b/c/d/e/f/g/deep.md",
+        ".hidden.md",
+        "scratchpad/.hidden.md",
+        "repo/a.md",
+        "scratchpad/repo/a.md",
+        "tasks/run.output",
+        ".git/config",
+        "scratchpad/.git/config",
+        "scratchpad/repo/.git/objects/ab/cd",
+        "node_modules/x.js",
+        "scratchpad/node_modules/x.js",
+        "scratchpad/repo/node_modules/pkg/index.js",
+        "clip.mp4",
+        "scratchpad/clip.mp4",
+        "scratchpad/sub/clip.mp4",
+    ];
+
+    /// The load-bearing fact, measured rather than assumed: in `globset`, a
+    /// leading `**/` matches **zero** components as well as many. Every pattern
+    /// `build_globs_nested` registers as `**/<p>` therefore also matches `<p>` at
+    /// the tree root. If this ever changed, prefixing a subject with a directory
+    /// component would start flipping verdicts.
+    #[test]
+    fn doubleglob_prefix_matches_at_depth_zero() {
+        for (pat, subject) in [
+            ("**/*.md", "a.md"),
+            ("**/*.md", "scratchpad/a.md"),
+            ("**/*.md", "a/b/c/d/e/f/g/deep.md"),
+            ("**/.git/**", ".git/config"),
+            ("**/node_modules/**", "node_modules/x.js"),
+            ("**/*.{mp4,zip}", "clip.mp4"),
+        ] {
+            assert!(
+                globset::Glob::new(pat)
+                    .unwrap()
+                    .compile_matcher()
+                    .is_match(subject),
+                "`{pat}` no longer matches `{subject}`: a leading `**/` stopped \
+                 matching zero components, so build_globs_nested is no longer \
+                 depth-insensitive"
+            );
+        }
+    }
+
+    /// The property U2 rests on: matching a *session-relative* path
+    /// (`scratchpad/a.md`) instead of a prefix-stripped one (`a.md`) changes no
+    /// verdict, for any pattern in the shipped allow/deny sets, at any depth.
+    /// True because `build_globs_nested` always registers a `**/`-prefixed
+    /// variant and that variant matches at depth zero.
+    #[test]
+    fn a_leading_directory_component_never_flips_a_verdict() {
+        let cfg = ScratchConfig::default();
+        for pat in cfg.allow.iter().chain(cfg.deny.iter()) {
+            let gs = set(pat);
+            for s in SUBJECTS {
+                for prefix in ["scratchpad/", "tasks/", "scratchpad/nested/"] {
+                    let prefixed = format!("{prefix}{s}");
+                    assert_eq!(
+                        gs.is_match(s),
+                        gs.is_match(&prefixed),
+                        "`{pat}`: `{s}` -> {} but `{prefixed}` -> {}; moving the \
+                         glob input to session-relative paths would change this \
+                         file's storage decision",
+                        gs.is_match(s),
+                        gs.is_match(&prefixed)
+                    );
+                }
+            }
+        }
+    }
+
+    /// The full matrix for the pattern *shapes* the config admits, pinned so a
+    /// globset upgrade cannot silently redefine what gets stored.
+    #[test]
+    fn depth_matrix_is_pinned() {
+        // (pattern, subject, expected)
+        let cases: &[(&str, &str, bool)] = &[
+            // Bare extension globs: nested registration makes them match at
+            // every depth, and `*` alone never crosses a `/`.
+            ("*.md", "a.md", true),
+            ("*.md", "scratchpad/a.md", true),
+            ("*.md", "scratchpad/sub/a.md", true),
+            ("*.md", "a/b/c/d/e/f/g/deep.md", true),
+            ("*.md", "clip.mp4", false),
+            // Dotfiles are ordinary names to globset — no shell-style dot rule.
+            ("*.md", ".hidden.md", true),
+            ("*.md", "scratchpad/.hidden.md", true),
+            // An explicitly nested pattern behaves identically to the bare one.
+            ("**/*.md", "a.md", true),
+            ("**/*.md", "scratchpad/sub/deeper/a.md", true),
+            // A literal name matches that name at any depth, nothing else.
+            ("a.md", "a.md", true),
+            ("a.md", "scratchpad/sub/a.md", true),
+            ("a.md", ".hidden.md", false),
+            ("a.md", "a/b/c/d/e/f/g/deep.md", false),
+            // A multi-component pattern is depth-insensitive in the same way.
+            ("repo/a.md", "repo/a.md", true),
+            ("repo/a.md", "scratchpad/repo/a.md", true),
+            ("repo/a.md", "a.md", false),
+            ("repo/a.md", "scratchpad/a.md", false),
+            // Directory-anchored deny patterns match the directory wherever it
+            // sits, including at the tree root (W2).
+            (".git/**", ".git/config", true),
+            (".git/**", "scratchpad/.git/config", true),
+            (".git/**", "scratchpad/repo/.git/objects/ab/cd", true),
+            (".git/**", "scratchpad/a.md", false),
+            ("node_modules/**", "node_modules/x.js", true),
+            (
+                "node_modules/**",
+                "scratchpad/repo/node_modules/pkg/index.js",
+                true,
+            ),
+            ("node_modules/**", "scratchpad/a.md", false),
+            // Brace alternation is unaffected by nesting.
+            ("**/*.{mp4,zip}", "clip.mp4", true),
+            ("**/*.{mp4,zip}", "scratchpad/sub/clip.mp4", true),
+            ("**/*.{mp4,zip}", "scratchpad/a.md", false),
+            ("*.output", "tasks/run.output", true),
+            ("*.output", "scratchpad/a.md", false),
+        ];
+        for (pat, subject, expected) in cases {
+            assert_eq!(
+                set(pat).is_match(subject),
+                *expected,
+                "build_globs_nested({pat:?}) vs {subject:?}: expected {expected}"
+            );
+        }
+    }
 }

@@ -758,14 +758,46 @@ fn p4g_scratch_lossy_collision_with_distinct_content_is_caught() {
     );
 }
 
-/// Both colliding names present when the archive runs. The stored artifact path
-/// is derived from the same lossy key, so one `.zst` overwrites the other while
-/// the manifest still lists two entries. The GC must therefore NEVER reclaim
-/// this tree — half of it was never really captured.
+/// Both colliding names present when the archive runs. Scratch identity is
+/// byte-valued (`ScratchRel` in `src/scratch.rs`), so the two names key and
+/// store separately: two `.zst`, two manifest entries, no overwrite. Coverage is
+/// therefore real, and the reclaim that follows is a reclaim of archived data —
+/// both payloads are still retrievable from the store afterwards, which is the
+/// whole point of the name of this test.
+///
+/// Before that module owned the key, both names derived from the same `U+FFFD`
+/// lossy string: one `.zst` silently overwrote the other while the manifest
+/// still listed two entries, so recoverability was preserved only by the gate
+/// refusing the tree forever. The invariant asserted here is unchanged — both
+/// files stay recoverable — but it is now met by capturing both rather than by
+/// never reclaiming.
 #[test]
 fn p4g_scratch_lossy_collision_at_archive_time_keeps_both_recoverable() {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
+
+    /// Decompressed payload of every `.zst` under the scratch store.
+    fn store_payloads(root: &Path) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(p) = stack.pop() {
+            let Ok(md) = std::fs::symlink_metadata(&p) else {
+                continue;
+            };
+            if md.is_dir() {
+                for e in std::fs::read_dir(&p).unwrap().flatten() {
+                    stack.push(e.path());
+                }
+            } else if p.extension().and_then(|e| e.to_str()) == Some("zst")
+                && let Ok(raw) = std::fs::read(&p)
+                && let Ok(d) = yomi::archive::compress::decompress_all(&raw)
+            {
+                out.push(String::from_utf8_lossy(&d).to_string());
+            }
+        }
+        out.sort();
+        out
+    }
 
     let fx = Fx::new("lossy3");
     let u = "88888888-2222-3333-4444-555555555555";
@@ -783,40 +815,31 @@ fn p4g_scratch_lossy_collision_at_archive_time_keeps_both_recoverable() {
     );
     set_tree_mtime_days(&fx.scratch_session(u), 200);
 
-    // Collect the payloads the store actually holds.
-    let mut store_bytes = Vec::new();
-    let mut stack = vec![fx.yomi_home.join("archive/_scratch")];
-    while let Some(p) = stack.pop() {
-        let Ok(md) = std::fs::symlink_metadata(&p) else {
-            continue;
-        };
-        if md.is_dir() {
-            for e in std::fs::read_dir(&p).unwrap().flatten() {
-                stack.push(e.path());
-            }
-        } else if p.extension().and_then(|e| e.to_str()) == Some("zst")
-            && let Ok(raw) = std::fs::read(&p)
-            && let Ok(d) = yomi::archive::compress::decompress_all(&raw)
-        {
-            store_bytes.push(String::from_utf8_lossy(&d).to_string());
-        }
-    }
-    let joined = store_bytes.join("\n");
-    let both_captured = joined.contains("AAAA-content") && joined.contains("BBBB-content");
+    let store_root = fx.yomi_home.join("archive/_scratch");
+    let captured = store_payloads(&store_root);
+    let has_both = |v: &[String]| {
+        let j = v.join("\n");
+        j.contains("AAAA-content") && j.contains("BBBB-content")
+    };
     assert!(
-        !both_captured,
-        "the archive kept both lossy-colliding payloads; the silent-overwrite \
-         note on this test is stale"
+        has_both(&captured),
+        "one of two lossy-colliding payloads was dropped — their stored paths \
+         still collapse to a single key. The store holds {captured:?}"
     );
 
     let out = fx.run(&["gc", "--targets", "scratch", "--commit"]);
     assert!(
-        a.exists() && b.exists(),
-        "the GC reclaimed a scratch tree whose archive silently dropped one of \
-         two lossy-colliding files — the store only holds {store_bytes:?} \
-         (exit {}, stderr {:?})",
+        !fx.scratch_session(u).exists(),
+        "the tree was not reclaimed although the archive covers both colliding \
+         files (exit {}, stderr {:?})",
         code(&out),
         stderr(&out).trim()
+    );
+    let after = store_payloads(&store_root);
+    assert!(
+        has_both(&after),
+        "the live tree was reclaimed but the store no longer holds both payloads \
+         ({after:?}) — the reclaim destroyed data it claimed to have archived"
     );
 }
 
