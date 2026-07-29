@@ -285,12 +285,47 @@ any reconciliation and any coverage judgment**:
 
 This is injective *in effect* — two colliding trees can never write through one another, because the
 second one to arrive refuses — at zero migration cost, with existing store names untouched and the
-guarantee arriving by itself as each store is next archived. The price is that colliding trees are
-neither archived nor reclaimed until an operator renames one, which is the correct price: the
-alternative is a silent overwrite of the only archived copy.
+guarantee arriving by itself as each store is next archived.
+
+**The refusal is per pair, not per key, and the asymmetry is load-bearing.** The tree whose identity
+the ledger records keeps working: it archives, and the GC gate reclaims it, because its coverage is
+provably its own — the impostor refused *before writing*, so nothing of the impostor is in that store.
+Only the newcomer is refused, and it has no archive to lose. Taking a demonstrably-covered tree out of
+service because an unrelated directory happens to collide with it would be the same failure mode §5
+rejects for orphans: an unrelated defect permanently blocking reclamation. It would also be worse than
+inert — under a symmetric rule, anything able to `mkdir` under `/tmp/claude-<uid>/` could freeze an
+arbitrary existing tree's archiving and reclamation by choosing a colliding name. Under the pair-wise
+rule the newcomer is the one that stops, so a same-uid actor can only deny itself. (Pre-creating the
+store directory to claim the ledger first needs write access inside a mode-700 `~/.yomi`, which §4
+already treats as defeating every control.)
+
+The price is that the **newcomer** is neither archived nor reclaimed until an operator renames one of
+the two, which is the correct price: the alternative is a silent overwrite of the only archived copy.
+Its live tree is never deleted either — the gate refuses it too — so the state is inert, not lossy.
+
+**A ledger outlives its tree, and that is accepted.** Once the first tree is archived and GC has
+reclaimed it, the store directory and its manifest remain — that *is* the archive. A colliding tree
+arriving afterwards is refused by a ledger whose own tree no longer exists, permanently, until an
+operator renames it or deliberately removes the old store. This is the same shape as an
+`UnreconcilableKey`: fail-safe, lossless, and a state an operator has to leave rather than one the
+tool leaves by itself. No automatic exit is designed, because every candidate is worse — renaming the
+surviving store is the migration this whole design refuses, and deriving an alternate key for the
+newcomer would make `store_key` depend on what is already on disk, which is the ambiguity class the
+unit exists to end. The exit is **reporting**, so the operator can act: see D-S4.
 
 `StoreKeyCollision` is its own reason and not `ForeignStoreDir`, because the operator action differs —
 "two session directories map to one store key; rename one" versus "your store path was replaced".
+
+**A recorded identity that does not decode reads as "not recorded", and that must be reported.**
+Hand-edited or corrupted hex is not evidence of anything: comparing it to a live identity would either
+match by accident or mismatch without meaning, so it decodes to nothing and the verdict is `Proceed` —
+the same as a pre-field manifest, which is what keeps one bad byte from permanently refusing a store.
+But the two are *not* the same fact, and this design has separated absence from unreadability
+everywhere else (`Missing` versus `Unreadable`; `NoManifest` versus `UnreadableManifest`). Conflating
+them here is worse than untidy: it means a corrupt field **silently disables the collision guard** for
+that key. `verify` must say so — `UndecodableIdentity`, **unverifiable** (§5): the ledger records an
+identity that does not decode, so the guard is inactive here. Proceeding is right; proceeding in
+silence is not.
 
 **Hazard 2 — `NAME_MAX`.** A key is a single filename component, so it is bounded at 255 bytes on
 Linux. Nothing bounds it today: a deep `cwd` yields a long slug, and the `_hex--` form **doubles** the
@@ -298,9 +333,8 @@ input, so it exceeds 255 for any pair over ~124 bytes. The failure is not gracef
 returns `ENAMETOOLONG`, `archive_scratch` propagates it, and the whole `yomi archive` run aborts (the
 same containment defect described under "Per-key failures must not abort the run" below).
 
-The rule: the plain and hex forms are used only while the result is within `KEY_MAX` (**200 bytes** —
-headroom below 255 for the `_scratch--<key>` component the quarantine path builds from it, and for
-filesystems with tighter limits). Beyond that, a digest form:
+The rule: the plain and hex forms are used only while the result is within `KEY_MAX`, which is
+**255 bytes — `NAME_MAX` itself, with no margin.** Beyond that, a digest form:
 
 ```
 _h256--<sha256_hex(hex(slug) ++ "--" ++ hex(uuid))>       # 7 + 64 = 71 bytes, always legal
@@ -312,6 +346,30 @@ integrity falls before its directory naming does. The inner encoding is hex-then
 because hex contains no `-`, so the `--` is an unambiguous separator there even though it is not in
 the plain form. No existing store is renamed by this rule, because a key that exceeded `NAME_MAX`
 never successfully created a directory in the first place — there is nothing to orphan.
+
+**That last sentence is only true because `KEY_MAX` is `NAME_MAX`.** An earlier draft set it to 200
+and justified the margin two ways, both of which are now known to be worth nothing:
+
+- *"headroom for the components a quarantine path builds from a key"* — true of the superseded
+  `quarantine/_scratch--<K>/…` layout, and false since the mirror rule (§4). `<K>` is now a single
+  component in `archive/_scratch/<K>/` and a single component of the same length in
+  `quarantine/_scratch/<K>/`, and **no component of either tree is longer than `<K>` itself.** The
+  only place the old doubled form is still constructed is Q1's legacy fallback, which `stat`s it and
+  never creates it; for a key long enough to overflow there, no legacy original can exist either,
+  because the old writer could not have created that component. The `stat` simply fails and the
+  fallback finds nothing.
+- *"filesystems with tighter limits"* — a margin cannot buy this. On a filesystem bounded near 143
+  bytes, a 200-byte key fails to create exactly as a 255-byte one does; the margin only moves the
+  failure point to a number that is right nowhere. A key that a filesystem will not accept is a
+  **per-key failure**, and it belongs to D-S3's containment — `ENAMETOOLONG` becomes a refusal of that
+  key with a reason, not an aborted run — not to a guess baked into the key derivation.
+
+With the margin gone the claim is literal: every plain key a Linux filesystem could ever have created
+stays plain, and the digest form fires only where `create_dir_all` would have failed anyway. At 200 it
+was false by 55 bytes — a `cwd` past roughly 162 characters produced a key that had been creating its
+store directory happily and would now be orphaned beside a fresh digest-form one, doubling the
+footprint without losing data. Deep, but reachable, and it is precisely the population a no-migration
+guarantee is supposed to protect.
 
 #### `ScratchEntry` — the manifest's per-file record
 
@@ -663,6 +721,12 @@ on every run" cannot be seen in `--json`. **Repair:** a `scratch_keys_refused` c
 The reason set is exactly the refusal paths: `ForeignStoreDir`, `UnreadableManifest`,
 `UndecodableEntry`, `StoreKeyCollision`, `StoreWriteFailed`. Severity LOW, but it is what turns every
 other refusal in this list from silent into operable.
+
+**U6 raised this from theory to defect.** `StoreKeyCollision` was an unreachable variant in that list
+when it was written; it is now constructed by archive, by the GC gate and by `verify`. A refused
+collision is a key that will be skipped on **every** run until an operator renames a directory — the
+one refusal in the set that never clears itself — and under cron it is announced only to a discarded
+stderr. It is also the exit designed for the ledger-outlives-its-tree state (§3), which has no other.
 
 **D-S5 — a blacklisted file makes its tree permanently unreclaimable, invisibly.** A blacklisted
 candidate is skipped before it is manifested, so the GC gate's live walk finds an unmanifested file and
@@ -1261,7 +1325,8 @@ archive tree. The first and the last fail the run.
 | the store root enumerates | `UnreadableStoreRoot` — **refused key**, filed under `_scratch` |
 | the store dir classifies `Own` | `ForeignStoreDir` — **refused key**, not a violation. Nothing below is attempted; a foreign ledger must not be read at all |
 | `manifest.json` parses | **violation** — `NoManifest` or `UnreadableManifest`, kept distinct (the gate would refuse this tree either way; `verify` says which) |
-| the manifest's `slug_hex`/`uuid_hex` match this key's tree, when recorded | `StoreKeyCollision` — **refused key** |
+| the manifest's recorded identity reproduces the key it sits under, and — when a selector picked this key by name — names the session asked for | `StoreKeyCollision` — **refused key** |
+| the recorded identity decodes | `UndecodableIdentity` — **unverifiable**; the collision guard is inactive for this key |
 | every entry's identity decodes | `UndecodableEntry` — **unverifiable**, per entry — **and** `UnreconcilableKey` — **refused key**, once per key |
 | every `stored: true` entry's `.zst` exists as a regular file — **S1** | `MissingArtifact` — **violation** |
 | every `stored: false` entry has no `.zst` at its `store_rel()` — **S1** | `UnclaimedArtifact` — **violation** |
@@ -1321,11 +1386,15 @@ reconciliation refusing there transfers verbatim: that entry's `store_rel()` is 
 leftover artifact may well be its, and calling it unclaimed would be the same false accusation
 reconciliation declines to make. `UnreconcilableKey` says the true thing instead.
 
-**`StoreKeyCollision` is defined and deliberately unreachable until U6.** The `slug_hex`/`uuid_hex`
-fields it tests are queued with the store-key hardening (§3), which is why the row above is written
-"when recorded". The variant and its string exist now so that populating it later changes no output
-schema and no consumer. It is intentionally dead code until then — not an oversight, and not something
-a dead-code sweep should remove.
+**`StoreKeyCollision` is reachable as of U6, and `verify` asks a store-side form of the question.**
+The GC gate compares the recorded identity against the *live* tree; `verify` has no live tree — that is
+the gate's half — so it makes the two statements it can from the store alone. First, **the recorded
+identity must reproduce the key it sits under**: a manifest that fails that describes some other tree,
+and every finding below it would be a statement about that one. Second, **when a selector picked this
+key by name, the ledger must agree the name meant that session** — the plain form's last residual
+(§5, resolver), closed here at no extra open because the manifest is already in hand. Both were added
+by the implementation and both are adopted; the first is a check the design did not ask for and should
+have.
 
 **Symlinked *directories* inside a store dir are not descended**, by the reconciler or by `verify`
 (`WalkDir` does not follow them). Entries resolving through one therefore read as `MissingArtifact`
@@ -1593,7 +1662,9 @@ not injective (§3) — so a session directory literally named `bbbb--cccc` matc
 `-a--bbbb` and session `cccc`. This is N14 resurfacing in the resolver, reachable in pure ASCII and not
 naturally produced by Claude Code's uuids.
 
-**Under U6 the resolver still matches on the key name; the manifest only confirms.** Reading
+**Under U6 the resolver still matches on the key name; the manifest only confirms** — and confirms on
+the *chosen* key alone, which was measured: resolving one session opens exactly one `manifest.json`,
+and no other key's ledger is touched. Reading
 `uuid_hex` out of every manifest to resolve one session would make resolution cost one open per store
 and would put the identity's authority in a place the name already carries it — the plain and hex forms
 both encode `(slug, uuid)` recoverably. So: match by name as now, then read **the matched key's**
@@ -1603,6 +1674,12 @@ most likely place to encounter. The **digest form** `_h256--<sha256>` is the one
 nothing recoverable and cannot be resolved from a uuid alone, so those keys — produced only by a store
 key over `KEY_MAX`, and correspondingly rare — do require reading their manifest. The cost is bounded
 by the number of digest-form keys, not by the size of the store.
+
+A digest key whose manifest is missing or unreadable is therefore **unresolvable from a session
+name** — its key encodes nothing to match on and its ledger is the only other source. It stays
+reachable by naming the key directly, and `verify` still enumerates it and reports the missing ledger
+as a violation, so the state is visible and has an exit. Accepted: there is no third place the mapping
+could come from that is not a fourth ledger.
 
 An index over the keys was considered and rejected: it would be a **fourth ledger** beside the
 manifest, the store and the queued catalog table, with its own drift to detect. This design has
@@ -2237,7 +2314,17 @@ Load-bearing fixtures: secret-scan **must** catch AKIA/PRIVATE KEY; double-archi
      makes to a check that did not exist.
   6. **Store-key hardening** (§3, "The store key of a tree"): `slug_hex`/`uuid_hex` identity fields
      with collision refusal, and the `KEY_MAX`/`_h256--` digest form for over-long keys. No migration
-     and no renaming — that is the point of choosing detection over an injective encoding. `verify`'s
+     and no renaming — that is the point of choosing detection over an injective encoding.
+     **(implemented; in review)**
+
+     The resolver was measured to open exactly one `manifest.json` per resolution, and `verify` added a
+     store-side form of the identity check the design had only specified against a live tree. One
+     correction went the other way: `KEY_MAX` was 200, and the 55 bytes between that and `NAME_MAX`
+     were a **hole in this document's own no-migration guarantee** — plain keys of 201–255 bytes had
+     been creating their store directories successfully and would have been orphaned beside fresh
+     digest-form ones. Both justifications for the margin had expired (§3); it is `NAME_MAX`, and the
+     guarantee is now literal. A filesystem with a tighter limit is a per-key failure for D-S3's
+     containment, not a number to guess at in the key derivation. `verify`'s
      `StoreKeyCollision` variant is already defined and deliberately unreachable until this lands, so
      populating it changes no output schema; it is not dead code to be swept. Once `uuid_hex` exists,
      **session→key resolution should read it instead of parsing the key** (§5), closing the last place

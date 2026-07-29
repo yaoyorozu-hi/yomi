@@ -103,9 +103,42 @@ impl ScratchRel {
     }
 }
 
-/// Marker on a store key that had to be encoded. Chosen so the two key forms
-/// occupy disjoint namespaces — see [`store_key`].
+/// Marker on a store key that had to be encoded. Chosen so the key forms occupy
+/// disjoint namespaces — see [`store_key`].
 const HEX_KEY_PREFIX: &str = "_hex--";
+
+/// Marker on a store key too long to carry its inputs at all.
+const DIGEST_KEY_PREFIX: &str = "_h256--";
+
+/// The longest key any form may produce, in bytes.
+///
+/// A key is a single filename component, so Linux bounds it at `NAME_MAX` = 255
+/// and nothing in this module bounded it before: a deep `cwd` yields a long slug,
+/// and the `_hex--` form **doubles** its input, so any pair over ~124 bytes
+/// exceeded the limit. The failure was not graceful — `create_dir_all` returns
+/// `ENAMETOOLONG` and `archive_scratch` propagates it, ending the whole run.
+///
+/// **`NAME_MAX` exactly, with no margin below it, and the two reasons a margin
+/// was considered for are both worth less than what it costs.** What it costs is
+/// concrete: a plain key of 201..255 bytes was a legal directory name, so stores
+/// at those names exist, and a lower bound moves them to the digest form —
+/// orphaning a store that this whole approach exists to avoid renaming.
+///
+/// * *Headroom for what a quarantine path builds from a key* — there is nothing
+///   to leave room for. Since the mirror rule (§4) a key is a standalone
+///   component in `quarantine/_scratch/<K>/` exactly as it is in
+///   `archive/_scratch/<K>/`, and no component of either tree is longer. The one
+///   place the superseded `_scratch--<K>` form is still constructed is law Q's
+///   legacy fallback, which only `stat`s it — and a key of this length can have
+///   no legacy original anyway, because the writer that used that form could not
+///   create the component either.
+/// * *Filesystems with tighter limits* — a margin cannot buy this. Where the
+///   limit is 143, a 200-byte key fails exactly as a 255-byte one does; the
+///   margin only moves the failure to a different wrong number. On such a
+///   filesystem `create_dir_all` returns `ENAMETOOLONG`, which is a per-key
+///   failure and belongs to the run-containment rule (D-S3) — not to a guess
+///   baked into the key derivation.
+const KEY_MAX: usize = 255;
 
 /// The store key of one scratch tree: the name of its directory under
 /// `archive/_scratch/`, and the discriminator inside its quarantine path.
@@ -119,25 +152,64 @@ const HEX_KEY_PREFIX: &str = "_hex--";
 /// earlier one's identity and overwrites its only archived copy. Such keys are
 /// hex, which is injective on bytes.
 ///
-/// The two forms cannot be confused. The hex form always begins `_hex--`, and a
-/// plain form that would begin the same way is pushed into the hex branch, so
-/// their output spaces are disjoint. Hex carries no `-`, so the `--` inside the
-/// encoded form is an unambiguous separator even though the one in the plain
-/// form is not (a real slug contains `--`, which is why nothing parses a key —
-/// it only has to be unique).
+/// No two forms can be confused. Each encoded form has its own marker prefix, and
+/// a plain form that would begin with either marker is pushed into the encoded
+/// branch, so the three output spaces are disjoint and none can impersonate
+/// another. Hex carries no `-`, so the `--` inside an encoded form is an
+/// unambiguous separator even though the one in the plain form is not (a real
+/// slug contains `--`, which is why nothing parses a key — it only has to be
+/// unique).
 ///
-/// The result is ASCII in the encoded case and a pair of existing directory
+/// **The plain form is not injective, and that is not fixed here.**
+/// `store_key("a", "-b") == store_key("a-", "b") == "a---b"`: the string
+/// `<slug>--<uuid>` has one preimage per `--` in it, and real slugs contain `--`
+/// routinely. Every injective encoding of an arbitrary byte pair differs from
+/// `<slug>--<uuid>` on inputs that exist today, so adopting one renames *every*
+/// store directory and the migration would have to walk and match directories by
+/// the very identity that was ambiguous. The fix is instead to **record the
+/// identity and detect the collision** — [`ScratchManifest::slug_hex`] and
+/// [`ScratchManifest::uuid_hex`], checked by [`identity_verdict`] before any
+/// write. That is injective *in effect*: two colliding trees can never write
+/// through one another, because the second to arrive refuses.
+///
+/// **A key over [`KEY_MAX`] takes a digest form**, `_h256--<sha256_hex(hex(slug)
+/// ++ "--" ++ hex(uuid))>` — 71 bytes, always legal. Injective under sha256
+/// collision-resistance, which is not a new assumption: `source_sha256`,
+/// `content_sha256` and the whole GC delete gate already rest on it, and if it
+/// fails the archive's integrity falls before its directory naming does. The
+/// inner encoding is hex-then-join precisely because hex contains no `-`. No
+/// existing store is renamed by this rule: a key that exceeded `NAME_MAX` never
+/// successfully created a directory, so there is nothing to orphan.
+///
+/// The result is ASCII in the encoded cases and a pair of existing directory
 /// names in the plain case, so it is a legal filename either way: no `/`, no
-/// NUL, never `.` or `..`.
+/// NUL, never `.` or `..`, and never longer than `KEY_MAX`.
 pub fn store_key(slug: &OsStr, uuid: &OsStr) -> String {
-    if let (Some(slug), Some(uuid)) = (slug.to_str(), uuid.to_str()) {
-        let plain = format!("{slug}--{uuid}");
-        if !plain.starts_with(HEX_KEY_PREFIX) {
+    if let (Some(s), Some(u)) = (slug.to_str(), uuid.to_str()) {
+        let plain = format!("{s}--{u}");
+        if !plain.starts_with(HEX_KEY_PREFIX)
+            && !plain.starts_with(DIGEST_KEY_PREFIX)
+            && plain.len() <= KEY_MAX
+        {
             return plain;
         }
     }
+    let inner = hex_pair(slug, uuid);
+    let hex = format!("{HEX_KEY_PREFIX}{inner}");
+    if hex.len() <= KEY_MAX {
+        return hex;
+    }
     format!(
-        "{HEX_KEY_PREFIX}{}--{}",
+        "{DIGEST_KEY_PREFIX}{}",
+        crate::util::sha256_hex(inner.as_bytes())
+    )
+}
+
+/// `hex(slug) ++ "--" ++ hex(uuid)` — the inner encoding both encoded key forms
+/// are built from, and injective because hex contains no `-`.
+fn hex_pair(slug: &OsStr, uuid: &OsStr) -> String {
+    format!(
+        "{}--{}",
         crate::util::hex(slug.as_bytes()),
         crate::util::hex(uuid.as_bytes())
     )
@@ -175,6 +247,98 @@ pub fn store_key_matches_session(key: &str, uuid: &OsStr) -> bool {
     // Plain form: both halves are verbatim, so the uuid must be UTF-8 to appear.
     uuid.to_str()
         .is_some_and(|u| key.ends_with(&format!("--{u}")))
+}
+
+/// Whether the store directory named `key` is the one `selector` asks for —
+/// `selector` being either a full store key or a session directory's name.
+///
+/// **Matched by name; the ledger only confirms, and confirms later.** Reading
+/// `uuid_hex` out of every manifest to resolve one session would cost one open
+/// per store and would move the identity's authority away from the name, which
+/// already carries it recoverably in both the plain and the hex form. So the
+/// filter stays a name test, and [`confirm_selector`] runs on the *chosen* key's
+/// manifest, where the caller has already read it — one manifest open, not N. An
+/// index over the keys was considered and rejected as a fourth ledger beside the
+/// manifest, the store and the queued catalog table, with its own drift to
+/// detect.
+///
+/// The **digest form** is the one exception: `_h256--<sha256>` encodes nothing
+/// recoverable and cannot be resolved from a session name alone, so those keys do
+/// require their manifest here. They are produced only by a key over [`KEY_MAX`]
+/// and are correspondingly rare, so the cost is bounded by their number and not
+/// by the size of the store.
+pub fn select_key(root: &Path, key: &str, selector: &OsStr) -> KeySelection {
+    // A full key names its own directory.
+    if OsStr::new(key) == selector {
+        return KeySelection::Match;
+    }
+    if key.starts_with(DIGEST_KEY_PREFIX) {
+        // Nothing to match on but the ledger. No manifest at all is a miss —
+        // `NoManifest` is the vocabulary for that, and `verify` reports it — but
+        // a manifest whose identity cannot be read is not a miss: the one bridge
+        // this key has exists and is illegible.
+        return match read_manifest_at(&root.join(key).join("manifest.json")) {
+            ManifestRead::Ok(mf) => match mf.recorded_identity() {
+                RecordedIdentity::Recorded(_, uuid) if uuid == selector => KeySelection::Match,
+                RecordedIdentity::Corrupt => KeySelection::Unreadable,
+                _ => KeySelection::Miss,
+            },
+            _ => KeySelection::Miss,
+        };
+    }
+    match store_key_matches_session(key, selector) {
+        true => KeySelection::Match,
+        false => KeySelection::Miss,
+    }
+}
+
+/// What a key's name test yielded, before its ledger has been consulted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeySelection {
+    Match,
+    Miss,
+    /// Only reachable for the digest form, whose name resolves nothing on its
+    /// own: the ledger that would answer is present and illegible.
+    Unreadable,
+}
+
+/// What the chosen key's ledger says about the selector that reached it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectorConfirmation {
+    /// Recorded and agreeing, or nothing recorded — the name stands, exactly as
+    /// it did before the fields existed.
+    Confirmed,
+    /// Recorded, and naming a different session. The plain form's last residual:
+    /// a suffix test cannot tell a session directory literally named
+    /// `bbbb--cccc` from the key of slug `-a--bbbb` and session `cccc`, and the
+    /// resolver is the place most likely to meet it.
+    Collision,
+    /// Recorded and illegible.
+    ///
+    /// **Refused, like every other layer refuses it.** Reading destroys nothing,
+    /// which is why this looked like the one place a damaged identity could be
+    /// waved through — but the failure here is not destruction, it is *answering
+    /// the wrong question*: measured, one corrupted byte turns a correctly
+    /// refused `read --scratch <other session>` into a silent exit 0 serving the
+    /// other session's archived bytes. `archive`, the GC gate and `verify` all
+    /// read this state as "a claim this run cannot read"; the resolver reading it
+    /// as "no claim" gave one value two meanings across four layers.
+    Unreadable,
+}
+
+/// Whether the ledger of the key `selector` resolved to agrees that this store is
+/// that session's.
+pub fn confirm_selector(mf: &ScratchManifest, key: &str, selector: &OsStr) -> SelectorConfirmation {
+    // A full key makes no claim about a session, so there is nothing to confirm.
+    if OsStr::new(key) == selector {
+        return SelectorConfirmation::Confirmed;
+    }
+    match mf.recorded_identity() {
+        RecordedIdentity::Unrecorded => SelectorConfirmation::Confirmed,
+        RecordedIdentity::Corrupt => SelectorConfirmation::Unreadable,
+        RecordedIdentity::Recorded(_, uuid) if uuid == selector => SelectorConfirmation::Confirmed,
+        RecordedIdentity::Recorded(..) => SelectorConfirmation::Collision,
+    }
 }
 
 /// One file in a scratch tree, as recorded in `manifest.json`.
@@ -387,6 +551,21 @@ impl ScratchEntry {
 pub struct ScratchManifest {
     #[serde(default)]
     pub key: String,
+    /// Hex of the raw bytes of the slug directory's name, and of the session
+    /// directory's name — the tree's identity, recorded because its *key* cannot
+    /// carry it unambiguously (see [`store_key`]).
+    ///
+    /// Always emitted, so a store self-upgrades on first contact with a writer
+    /// that knows them; `default` (empty) so a manifest from before them parses
+    /// unchanged and reads as "not recorded" rather than as a mismatch.
+    ///
+    /// Hex, not the names: they are `OsStr` bytes and need not be UTF-8, and the
+    /// lossy form is exactly the thing this field exists to stop being used as an
+    /// identity.
+    #[serde(default)]
+    pub slug_hex: String,
+    #[serde(default)]
+    pub uuid_hex: String,
     #[serde(default)]
     pub captured_at: String,
     #[serde(default)]
@@ -394,6 +573,125 @@ pub struct ScratchManifest {
     #[serde(default)]
     pub over_total_cap: bool,
     pub entries: Vec<ScratchEntry>,
+}
+
+/// What a ledger says about the identity of the tree it describes.
+///
+/// **Three states, because two collapse a distinction that decides whether an
+/// archive is overwritten.** "Records nothing" and "records something this run
+/// cannot read" are different facts: the first ledger makes no claim, the second
+/// makes a claim nobody can check. Folding them together made a single corrupted
+/// byte reopen exactly the overwrite U6 exists to prevent — and, from the other
+/// side, made a half-written record read as a *different* session and lock a tree
+/// out of its own store, permanently, since a refused archive can never restamp
+/// the field that would repair it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordedIdentity {
+    /// Nothing recorded — a manifest written before the fields existed.
+    Unrecorded,
+    /// Recorded and readable.
+    Recorded(OsString, OsString),
+    /// Recorded and unreadable: hex that does not decode, or only one of the two
+    /// halves. Both are claims this run cannot read, not absent claims.
+    Corrupt,
+}
+
+impl ScratchManifest {
+    /// The identity this ledger records, in the three states that matter.
+    pub fn recorded_identity(&self) -> RecordedIdentity {
+        match (self.slug_hex.is_empty(), self.uuid_hex.is_empty()) {
+            (true, true) => RecordedIdentity::Unrecorded,
+            // Half a record is a damaged one, not a different session and not an
+            // absent claim.
+            (true, false) | (false, true) => RecordedIdentity::Corrupt,
+            (false, false) => {
+                match (
+                    crate::util::unhex(&self.slug_hex),
+                    crate::util::unhex(&self.uuid_hex),
+                ) {
+                    (Some(slug), Some(uuid)) => RecordedIdentity::Recorded(
+                        OsString::from_vec(slug),
+                        OsString::from_vec(uuid),
+                    ),
+                    _ => RecordedIdentity::Corrupt,
+                }
+            }
+        }
+    }
+}
+
+/// What the recorded identity says about the tree in front of the caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityVerdict {
+    /// Recorded and equal, or **not recorded at all** — a manifest written
+    /// before the fields existed has nothing to contradict, and refusing it
+    /// would turn every pre-U6 store into a refused tree. Archive stamps the
+    /// real values on its next write, so the store self-upgrades on first
+    /// contact.
+    Proceed,
+    /// Recorded and different. Two session directories map to one store key and
+    /// this manifest belongs to the other one. Refuse: archive writes nothing and
+    /// removes nothing, the GC gate returns `StoreKeyCollision`. What stops is
+    /// the newcomer — the tree the ledger names goes on being archived and
+    /// reclaimed, which is deliberate: a symmetric rule would let anyone who can
+    /// `mkdir` under `/tmp/claude-<uid>/` freeze any existing tree's archive by
+    /// choosing a colliding name, where pair-wise refusal lets an actor at that
+    /// uid only refuse itself.
+    Collision,
+    /// Recorded and unreadable. **Not a licence to proceed**: an identity this
+    /// run cannot decode is exactly the state a corrupted or hand-edited byte
+    /// produces, and proceeding through it authorizes the overwrite the recorded
+    /// identity exists to stop. The third time this series takes the same rule —
+    /// an entry the reader cannot parse is not a licence to destroy its artifact,
+    /// a prior capture that cannot be salvaged is not a licence to delete its
+    /// `.zst`, and an identity that cannot be read is not a licence to overwrite
+    /// what it names.
+    Refuse,
+}
+
+/// The rule §3 states over a recorded identity, applied by **archive and the GC
+/// gate alike, immediately after the manifest is read and before any write, any
+/// reconciliation and any coverage judgment.** Placed after, the foreign ledger
+/// has already informed the decision. `verify` reads the same three states,
+/// naming the third as `UndecodableIdentity` rather than acting on it.
+///
+/// `session_dir` is the live tree's own directory: its name is the uuid and its
+/// parent's name is the slug, which is exactly the pair [`store_key`] was built
+/// from. Comparing the *identity* rather than the recomputed key is the whole
+/// point — two colliding trees produce the same key by definition, so a key
+/// comparison could never tell them apart.
+pub fn identity_verdict(mf: &ScratchManifest, session_dir: &Path) -> IdentityVerdict {
+    match mf.recorded_identity() {
+        RecordedIdentity::Unrecorded => IdentityVerdict::Proceed,
+        RecordedIdentity::Corrupt => IdentityVerdict::Refuse,
+        RecordedIdentity::Recorded(slug, uuid) => match tree_identity(session_dir) {
+            // A tree with no derivable identity cannot be compared, and a
+            // comparison that cannot be made is not a mismatch.
+            None => IdentityVerdict::Proceed,
+            Some(live) if live == (slug, uuid) => IdentityVerdict::Proceed,
+            Some(_) => IdentityVerdict::Collision,
+        },
+    }
+}
+
+/// The `(slug, uuid)` directory names of a live scratch tree, raw.
+pub fn tree_identity(session_dir: &Path) -> Option<(OsString, OsString)> {
+    let uuid = session_dir.file_name()?.to_os_string();
+    let slug = session_dir.parent()?.file_name()?.to_os_string();
+    Some((slug, uuid))
+}
+
+/// The same identity as the two hex fields a manifest records. Empty strings
+/// when the tree has no derivable identity, which reads back as "not recorded"
+/// rather than as a false one.
+pub fn identity_hex(session_dir: &Path) -> (String, String) {
+    match tree_identity(session_dir) {
+        Some((slug, uuid)) => (
+            crate::util::hex(slug.as_bytes()),
+            crate::util::hex(uuid.as_bytes()),
+        ),
+        None => (String::new(), String::new()),
+    }
 }
 
 /// What sits at `archive/_scratch/<K>/`, as every layer that touches a scratch
@@ -489,6 +787,15 @@ pub enum StoreOpenError {
     NotFound,
     /// More than one does. Never guess between stores.
     Ambiguous(Vec<String>),
+    /// The key resolved by name, and its ledger names a different session. The
+    /// plain key form is not injective, so a name can be ambiguous; the recorded
+    /// identity is what says so.
+    KeyCollision(String),
+    /// The key resolved, and the identity its ledger records cannot be read, so
+    /// nothing can say whether the name meant this session. Its own error and not
+    /// `KeyCollision`, for the reason the GC gate keeps the two reasons apart:
+    /// the operator action differs — repair a manifest versus rename a directory.
+    UndecodableIdentity(String),
     /// The key resolved, but its store directory is not one yomi owns.
     ForeignStoreDir(String),
     NoManifest(String),
@@ -504,6 +811,8 @@ impl StoreOpenError {
             StoreOpenError::UnreadableRoot => "UnreadableStoreRoot",
             StoreOpenError::NotFound => "NotFound",
             StoreOpenError::Ambiguous(_) => "Ambiguous",
+            StoreOpenError::KeyCollision(_) => "StoreKeyCollision",
+            StoreOpenError::UndecodableIdentity(_) => "UndecodableIdentity",
             StoreOpenError::ForeignStoreDir(_) => "ForeignStoreDir",
             StoreOpenError::NoManifest(_) => "NoManifest",
             StoreOpenError::UnreadableManifest(_) => "UnreadableManifest",
@@ -526,6 +835,14 @@ impl StoreOpenError {
                 "that selector matches {} store keys ({}); name one exactly",
                 keys.len(),
                 keys.join(", ")
+            ),
+            StoreOpenError::KeyCollision(k) => format!(
+                "{k} names this session while its ledger records a different one; two \
+                 session directories map to one store key, so rename one"
+            ),
+            StoreOpenError::UndecodableIdentity(k) => format!(
+                "{k}'s recorded tree identity cannot be read, so nothing can say \
+                 whether it is this session's store; repair or remove its manifest"
             ),
             StoreOpenError::ForeignStoreDir(k) => format!(
                 "the store directory for {k} is not one this run owns; refusing to read through it"
@@ -572,17 +889,39 @@ impl ScratchStore {
         };
 
         let mut matched: Vec<String> = Vec::new();
+        let mut illegible: Vec<String> = Vec::new();
         for e in dir.flatten() {
             let key = e.file_name().to_string_lossy().into_owned();
-            // A full key names itself; a uuid names the one store carrying it.
-            // `store_key_matches_session` is the shared resolver — a suffix test
-            // cannot address a hex key, and this must not be reimplemented here.
-            if OsStr::new(&key) == selector || store_key_matches_session(&key, selector) {
-                matched.push(key);
+            // `select_key` is the shared resolver — a suffix test cannot address
+            // a hex key, and this must not be reimplemented here.
+            match select_key(&root, &key, selector) {
+                KeySelection::Match => matched.push(key),
+                KeySelection::Unreadable => illegible.push(key),
+                KeySelection::Miss => {}
             }
         }
         matched.sort();
         matched.dedup();
+        // A full key names one *directory*, not a session, so it asks nothing of
+        // any ledger — and the escape hatch has to stay open exactly when
+        // something nearby is damaged. Nothing about another store bears on it.
+        if let Some(k) = matched.iter().find(|k| OsStr::new(k) == selector).cloned() {
+            matched = vec![k];
+        }
+        // Otherwise a key whose ledger cannot be read **might be the one asked
+        // for**, and that holds whether or not something else also matched.
+        // Guarding this on `matched.is_empty()` let a legible key hide an
+        // illegible one: with both ledgers readable the resolver refuses to
+        // choose between two stores, and one damaged byte made it answer from
+        // the survivor instead — the same downgrade the ledger check itself
+        // closes, one step along. `Ambiguous` would be the wrong refusal here:
+        // it asserts that the listed keys *do* answer to this selector, which is
+        // precisely what an unreadable identity cannot say, and it sends the
+        // operator to pick one rather than to repair the ledger that would
+        // decide it.
+        else if let Some(k) = illegible.into_iter().min() {
+            return Err(StoreOpenError::UndecodableIdentity(k));
+        }
         let key = match matched.len() {
             0 => return Err(StoreOpenError::NotFound),
             1 => matched.remove(0),
@@ -598,6 +937,18 @@ impl ScratchStore {
             ManifestRead::Missing => return Err(StoreOpenError::NoManifest(key)),
             ManifestRead::Unreadable => return Err(StoreOpenError::UnreadableManifest(key)),
         };
+        // The ledger confirms what the name matched, on the manifest just read —
+        // so the identity costs no extra open. A key whose name claims this
+        // session while its ledger names another is an ambiguity, not a
+        // near-miss, and serving it would answer a question the operator did not
+        // ask.
+        match confirm_selector(&manifest, &key, selector) {
+            SelectorConfirmation::Confirmed => {}
+            SelectorConfirmation::Collision => return Err(StoreOpenError::KeyCollision(key)),
+            SelectorConfirmation::Unreadable => {
+                return Err(StoreOpenError::UndecodableIdentity(key));
+            }
+        }
         Ok(ScratchStore { key, dir, manifest })
     }
 
@@ -872,6 +1223,16 @@ pub enum ScratchIssue {
     NoContentHash,
     /// A `*.zst` that is not a regular file.
     ForeignArtifact,
+    /// The tree identity a ledger records cannot be read: hex that does not
+    /// decode, or only one of the two halves.
+    ///
+    /// **Unverifiable, not a violation** — the store may be perfectly intact;
+    /// what cannot be proven is which tree this ledger belongs to. The same
+    /// shape as `NoContentHash`, and named for the same reason: archive and the
+    /// GC gate *refuse* on this state, and a refusal nothing reports is a store
+    /// that silently stops being archived. Reporting and refusing are not
+    /// alternatives here — they are the two halves of one response.
+    UndecodableIdentity,
     /// Two entries name one identity. `read --scratch` already detects this,
     /// serves the row the store corroborates, and refers the operator to
     /// `yomi verify` — which until now could not see the defect at all, so the
@@ -900,9 +1261,9 @@ impl ScratchIssue {
             | ScratchIssue::OrphanArtifact
             | ScratchIssue::ContentMismatch
             | ScratchIssue::DuplicateIdentity => FindingClass::Violation,
-            ScratchIssue::NoContentHash | ScratchIssue::UndecodableEntry => {
-                FindingClass::Unverifiable
-            }
+            ScratchIssue::NoContentHash
+            | ScratchIssue::UndecodableEntry
+            | ScratchIssue::UndecodableIdentity => FindingClass::Unverifiable,
             ScratchIssue::ForeignArtifact => FindingClass::ForeignMatter,
         }
     }
@@ -946,6 +1307,7 @@ impl ScratchIssue {
             | ScratchIssue::UnreconcilableKey
             | ScratchIssue::NoContentHash
             | ScratchIssue::ForeignArtifact
+            | ScratchIssue::UndecodableIdentity
             | ScratchIssue::DuplicateIdentity => false,
         }
     }
@@ -966,6 +1328,7 @@ impl ScratchIssue {
             ScratchIssue::NoContentHash => "NoContentHash",
             ScratchIssue::ForeignArtifact => "ForeignArtifact",
             ScratchIssue::DuplicateIdentity => "DuplicateIdentity",
+            ScratchIssue::UndecodableIdentity => "UndecodableIdentity",
         }
     }
 }
@@ -1124,23 +1487,32 @@ pub fn verify_stores(
     let mut keys: Vec<(String, PathBuf)> = Vec::new();
     for e in dir.flatten() {
         let key = e.file_name().to_string_lossy().into_owned();
-        // A uuid selects the one store dir carrying it; keys are unique per
-        // session, so at most one matches.
-        if session.is_some_and(|u| !store_key_matches_session(&key, u)) {
-            continue;
+        // A session name selects the one store dir carrying it. `select_key` is
+        // the shared resolver — a suffix test cannot address a hex key. Where the
+        // name is ambiguous the recorded identity settles it, below, on the
+        // manifest this pass reads anyway.
+        // `Unreadable` is kept rather than filtered out: `verify_one_store`
+        // names it, and a key dropped here would be a key this pass silently
+        // failed to mention.
+        if session.is_none_or(|u| select_key(&root, &key, u) != KeySelection::Miss) {
+            keys.push((key, e.path()));
         }
-        keys.push((key, e.path()));
     }
     keys.sort();
 
     for (key, store_dir) in keys {
         report.keys += 1;
-        verify_one_store(&mut report, &key, &store_dir);
+        verify_one_store(&mut report, &key, &store_dir, session);
     }
     report
 }
 
-fn verify_one_store(report: &mut ScratchVerifyReport, key: &str, store_dir: &Path) {
+fn verify_one_store(
+    report: &mut ScratchVerifyReport,
+    key: &str,
+    store_dir: &Path,
+    session: Option<&OsStr>,
+) {
     // A store path that is not a directory yomi owns may point anywhere, and
     // every fact drawn through it is foreign. The fourth caller of the one
     // predicate the writer, the reconciler and the GC gate already share.
@@ -1165,6 +1537,32 @@ fn verify_one_store(report: &mut ScratchVerifyReport, key: &str, store_dir: &Pat
             return;
         }
     };
+
+    // Immediately after the manifest is read and before any judgment drawn from
+    // it. `verify` has no live tree to compare against — that is the GC gate's
+    // half — so it makes the two store-side statements it can:
+    //
+    // * the identity a ledger records must be the identity that produces the key
+    //   it sits under. A manifest that fails it describes some other tree, and
+    //   every finding below would be a statement about that one;
+    // * and when a selector picked this key by name, the ledger must agree that
+    //   the name meant this session — the plain form's last residual, closed
+    //   here at no extra open because the manifest is already in hand.
+    let recorded = mf.recorded_identity();
+    if recorded == RecordedIdentity::Corrupt {
+        // Named, not acted on: the entries beside it are still checkable, and
+        // this says what the ledger cannot prove about the tree as a whole.
+        report.push(key, "", ScratchIssue::UndecodableIdentity);
+    }
+    let key_disagrees =
+        matches!(&recorded, RecordedIdentity::Recorded(s, u) if store_key(s, u) != key);
+    let selector_disagrees = session
+        .is_some_and(|sel| confirm_selector(&mf, key, sel) == SelectorConfirmation::Collision);
+    if key_disagrees || selector_disagrees {
+        report.push(key, "", ScratchIssue::StoreKeyCollision);
+        report.unexamine(&quarantine_subtree);
+        return;
+    }
 
     // Everything artifact-shaped in the store, split by what S1 can speak about.
     let mut regular: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
@@ -1501,6 +1899,269 @@ mod tests {
             store_key(OsStr::new("_he"), OsStr::new("x--y")),
             "_he--x--y"
         );
+
+        // The third namespace is disjoint from the other two for the same
+        // reason: a plain pair that would begin `_h256--` is encoded instead.
+        let digest_impostor = store_key(OsStr::new("_h256"), OsStr::new("deadbeef"));
+        assert!(digest_impostor.starts_with(HEX_KEY_PREFIX));
+        assert!(!digest_impostor.starts_with(DIGEST_KEY_PREFIX));
+    }
+
+    /// A key over `KEY_MAX` takes the digest form, and the digest is over the
+    /// hex-joined pair — hex carries no `-`, so the `--` inside it is an
+    /// unambiguous separator even though the one in the plain form is not.
+    #[test]
+    fn an_over_long_key_takes_the_digest_form() {
+        let long = "-".repeat(400);
+        let k = store_key(OsStr::new(&long), OsStr::new("uuid-1"));
+        assert!(k.starts_with(DIGEST_KEY_PREFIX), "{k}");
+        assert_eq!(k.len(), DIGEST_KEY_PREFIX.len() + 64, "{k}");
+        assert!(
+            k[DIGEST_KEY_PREFIX.len()..]
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit())
+        );
+
+        // Injective where the plain form is not: the two pairs that collide on
+        // `a---b` differ under the digest, because the inner encoding separates
+        // them before hashing.
+        let a = store_key(&os(&[b'a'; 300]), OsStr::new("-b"));
+        let b = store_key(&os(&[b'a'; 299]), OsStr::new("b"));
+        assert!(a.starts_with(DIGEST_KEY_PREFIX) && b.starts_with(DIGEST_KEY_PREFIX));
+        assert_ne!(a, b, "the digest form merged two distinct pairs");
+
+        // And it is reached only when the shorter forms cannot be used: one byte
+        // under the bound is still the plain form, verbatim.
+        let fits = "x".repeat(KEY_MAX - "--u".len());
+        let plain = store_key(OsStr::new(&fits), OsStr::new("u"));
+        assert_eq!(plain, format!("{fits}--u"));
+        assert_eq!(plain.len(), KEY_MAX);
+    }
+
+    /// The hazard the recorded identity exists for: two distinct trees whose
+    /// plain keys are equal. The key cannot tell them apart — that is the defect
+    /// — so the ledger must, and whoever does not match it refuses.
+    #[test]
+    fn a_recorded_identity_separates_two_trees_that_share_a_key() {
+        assert_eq!(
+            store_key(OsStr::new("a"), OsStr::new("-b")),
+            store_key(OsStr::new("a-"), OsStr::new("b")),
+            "fixture is not a key collision; the test proves nothing"
+        );
+
+        let mut mf = ScratchManifest {
+            key: "a---b".into(),
+            slug_hex: crate::util::hex(b"a"),
+            uuid_hex: crate::util::hex(b"-b"),
+            captured_at: String::new(),
+            total_bytes: 0,
+            over_total_cap: false,
+            entries: Vec::new(),
+        };
+        assert_eq!(
+            identity_verdict(&mf, Path::new("/tmp/a/-b")),
+            IdentityVerdict::Proceed,
+            "a tree was refused its own ledger"
+        );
+        assert_eq!(
+            identity_verdict(&mf, Path::new("/tmp/a-/b")),
+            IdentityVerdict::Collision,
+            "the second tree wrote through the first's ledger"
+        );
+
+        // A manifest from before the fields has nothing to contradict, so every
+        // pre-U6 store proceeds and is stamped on the next write rather than
+        // being refused forever.
+        let pre_u6 = ScratchManifest {
+            slug_hex: String::new(),
+            uuid_hex: String::new(),
+            ..mf.clone()
+        };
+        assert_eq!(pre_u6.recorded_identity(), RecordedIdentity::Unrecorded);
+        assert_eq!(
+            identity_verdict(&pre_u6, Path::new("/tmp/a-/b")),
+            IdentityVerdict::Proceed
+        );
+
+        // A record this run cannot read is a *third* state. Folding it into
+        // "records nothing" let one corrupted byte turn the check off and hand
+        // the other tree the overwrite; folding it into "records something else"
+        // locked the owner out of its own store, permanently, because a refused
+        // archive can never restamp the field that would repair it.
+        for (slug_hex, uuid_hex, why) in [
+            ("zz".to_string(), crate::util::hex(b"-b"), "undecodable hex"),
+            (crate::util::hex(b"a"), String::new(), "half recorded"),
+            (String::new(), crate::util::hex(b"-b"), "half recorded"),
+        ] {
+            let broken = ScratchManifest {
+                slug_hex,
+                uuid_hex,
+                ..mf.clone()
+            };
+            assert_eq!(
+                broken.recorded_identity(),
+                RecordedIdentity::Corrupt,
+                "{why} read as an absent or a readable claim"
+            );
+            // Refused against *either* tree — including the one that owns it,
+            // which is the point: nothing here can be shown to describe any
+            // tree.
+            for live in ["/tmp/a/-b", "/tmp/a-/b"] {
+                assert_eq!(
+                    identity_verdict(&broken, Path::new(live)),
+                    IdentityVerdict::Refuse,
+                    "{why} authorized a write to {live}"
+                );
+            }
+        }
+
+        // And the state is *named*, not merely acted on — refusing and reporting
+        // are the two halves of one response.
+        assert_eq!(
+            ScratchIssue::UndecodableIdentity.class(),
+            FindingClass::Unverifiable
+        );
+        mf.slug_hex = "zz".into();
+        assert_eq!(mf.recorded_identity(), RecordedIdentity::Corrupt);
+    }
+
+    /// **No existing store is renamed.** The promise the whole approach rests on
+    /// — detection was chosen over an injective encoding precisely because any
+    /// injective encoding renames every store directory — so it is pinned
+    /// against the derivation as it stood before `KEY_MAX` and the digest form
+    /// existed, over every shape a real store holds.
+    #[test]
+    fn key_derivation_is_byte_identical_for_every_existing_store() {
+        /// The derivation at 79390e0, verbatim.
+        fn before(slug: &OsStr, uuid: &OsStr) -> String {
+            if let (Some(slug), Some(uuid)) = (slug.to_str(), uuid.to_str()) {
+                let plain = format!("{slug}--{uuid}");
+                if !plain.starts_with(HEX_KEY_PREFIX) {
+                    return plain;
+                }
+            }
+            format!(
+                "{HEX_KEY_PREFIX}{}--{}",
+                crate::util::hex(slug.as_bytes()),
+                crate::util::hex(uuid.as_bytes())
+            )
+        }
+
+        let deep = format!("-home-yhi-{}", "code-".repeat(12));
+        let cases: &[(&OsStr, &OsStr)] = &[
+            // The real population: a cwd with `/`->`-`, and a session uuid.
+            (
+                OsStr::new("-home-yhi"),
+                OsStr::new("2ec0a278-9fcf-4b22-99b8-9f1310c50e8f"),
+            ),
+            (OsStr::new("-home-test"), OsStr::new("s1")),
+            // A slug that already contains `--`, which is routine.
+            (OsStr::new("-home-yhi-code--x"), OsStr::new("uuid-1")),
+            // Deep, but still inside the bound.
+            (OsStr::new(&deep), OsStr::new("uuid-1")),
+            // The encoded form, unchanged for names that are not UTF-8.
+            (&os(b"slug-\xff"), &os(b"sess-\xfe")),
+            (OsStr::new("_hex--a"), OsStr::new("b")),
+        ];
+        for (slug, uuid) in cases {
+            let now = store_key(slug, uuid);
+            assert_eq!(
+                now,
+                before(slug, uuid),
+                "the key of {slug:?}/{uuid:?} moved, so its store directory would \
+                 have to be renamed"
+            );
+            assert!(now.len() <= KEY_MAX, "fixture exceeds the bound: {now}");
+        }
+    }
+
+    /// The resolver's residual, closed by the ledger: a session directory
+    /// literally named `bbbb--cccc` matches the *name* of the key of slug
+    /// `-a--bbbb` and session `cccc`. Pure ASCII, and not a miss — an ambiguity.
+    #[test]
+    fn a_name_ambiguous_key_is_a_collision_not_a_match() {
+        let key = store_key(OsStr::new("-a--bbbb"), OsStr::new("cccc"));
+        assert_eq!(key, "-a--bbbb--cccc");
+        // The name test alone cannot tell the two apart — that is the residual.
+        assert!(store_key_matches_session(&key, OsStr::new("cccc")));
+        assert!(store_key_matches_session(&key, OsStr::new("bbbb--cccc")));
+
+        // The filter stays a name test — it opens nothing, which is what keeps
+        // resolution at one manifest open rather than one per store.
+        let root = Path::new("/nonexistent-store-root");
+        let sel = |s: &str| select_key(root, &key, OsStr::new(s));
+        assert_eq!(sel("cccc"), KeySelection::Match);
+        assert_eq!(sel("bbbb--cccc"), KeySelection::Match);
+        assert_eq!(sel("nope"), KeySelection::Miss);
+        // A full key names its own directory, whatever its form.
+        assert_eq!(sel(&key), KeySelection::Match);
+
+        // The ledger is what separates the two, on the manifest the caller has
+        // already read.
+        let mf = |uuid: &[u8]| ScratchManifest {
+            key: key.clone(),
+            slug_hex: crate::util::hex(b"-a--bbbb"),
+            uuid_hex: crate::util::hex(uuid),
+            captured_at: String::new(),
+            total_bytes: 0,
+            over_total_cap: false,
+            entries: Vec::new(),
+        };
+        assert_eq!(
+            confirm_selector(&mf(b"cccc"), &key, OsStr::new("cccc")),
+            SelectorConfirmation::Confirmed
+        );
+        assert_eq!(
+            confirm_selector(&mf(b"cccc"), &key, OsStr::new("bbbb--cccc")),
+            SelectorConfirmation::Collision,
+            "a name-ambiguous key was served as the session it does not hold"
+        );
+        // A full key still makes no claim about a session, so nothing confirms.
+        assert_eq!(
+            confirm_selector(&mf(b"cccc"), &key, OsStr::new(&key)),
+            SelectorConfirmation::Confirmed
+        );
+        // And a pre-U6 ledger confirms whatever the name matched, as before.
+        let mut old = mf(b"cccc");
+        old.slug_hex = String::new();
+        old.uuid_hex = String::new();
+        assert_eq!(
+            confirm_selector(&old, &key, OsStr::new("bbbb--cccc")),
+            SelectorConfirmation::Confirmed
+        );
+
+        // **The fourth layer reads the third state as the other three do.** A
+        // ledger this run cannot decode is a claim it cannot read, not an absent
+        // one — and here the cost of the other reading is not a lost byte but a
+        // wrong answer: one corrupted byte turned a correctly refused question
+        // into exit 0 serving another session's archived bytes.
+        let mut damaged = mf(b"cccc");
+        damaged.slug_hex = "zz".into();
+        assert_eq!(damaged.recorded_identity(), RecordedIdentity::Corrupt);
+        for asked in ["cccc", "bbbb--cccc"] {
+            assert_eq!(
+                confirm_selector(&damaged, &key, OsStr::new(asked)),
+                SelectorConfirmation::Unreadable,
+                "a damaged ledger answered for {asked}"
+            );
+        }
+        // Naming the directory itself still works: it asks nothing of the ledger.
+        assert_eq!(
+            confirm_selector(&damaged, &key, OsStr::new(&key)),
+            SelectorConfirmation::Confirmed
+        );
+
+        // A digest-form key encodes nothing recoverable, so with no ledger to
+        // read it resolves to nothing rather than guessing.
+        let digest = store_key(OsStr::new(&"-".repeat(400)), OsStr::new("uuid-1"));
+        assert_eq!(
+            select_key(root, &digest, OsStr::new("uuid-1")),
+            KeySelection::Miss
+        );
+        assert_eq!(
+            select_key(root, &digest, OsStr::new(&digest)),
+            KeySelection::Match
+        );
     }
 
     /// A suffix test cannot address a hex key, and the failure is silent: zero
@@ -1564,6 +2225,7 @@ mod tests {
             UnreconcilableKey,
             NoContentHash,
             ForeignArtifact,
+            UndecodableIdentity,
             // The strongest case of all: archive cannot produce one at all, so
             // it cannot produce one transiently either.
             DuplicateIdentity,
@@ -1609,10 +2271,14 @@ mod tests {
     /// `archive/_scratch/` and inside a quarantine path.
     #[test]
     fn store_key_is_always_a_legal_filename() {
+        let long = "-".repeat(400);
         let keys = [
             store_key(OsStr::new("-home-test"), OsStr::new("uuid-1")),
             store_key(&os(b"slug-\xff"), &os(b"sess-\xfe")),
             store_key(OsStr::new("_hex--a"), OsStr::new("b")),
+            // A deep `cwd` yields a long slug, and the hex form doubles it.
+            store_key(OsStr::new(&long), OsStr::new("uuid-1")),
+            store_key(&os(&vec![0xffu8; 300]), OsStr::new("uuid-1")),
         ];
         for k in keys {
             assert!(!k.is_empty());
@@ -1620,6 +2286,15 @@ mod tests {
             assert!(!k.contains('\0'), "{k} carries an interior NUL");
             assert_ne!(k, ".");
             assert_ne!(k, "..");
+            // A key is one filename component, so `NAME_MAX` bounds it. Nothing
+            // bounded it before, and the failure was `ENAMETOOLONG` out of
+            // `create_dir_all` — which `archive_scratch` propagated, ending the
+            // whole run.
+            assert!(
+                k.len() <= KEY_MAX,
+                "key is {} bytes, over KEY_MAX: {k}",
+                k.len()
+            );
         }
     }
 

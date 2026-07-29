@@ -116,6 +116,17 @@ pub enum SkipReason {
     /// `gc.log`: "never archived" and "your store path was replaced" call for
     /// different operator actions.
     ForeignStoreDir,
+    /// Two session directories map to this store key, and its ledger records the
+    /// *other* one's identity. Nothing here describes this tree, so nothing here
+    /// may authorize deleting it. Its own reason rather than `ForeignStoreDir`
+    /// because the operator action differs: "rename one of two colliding session
+    /// directories" versus "your store path was replaced".
+    StoreKeyCollision,
+    /// This store's recorded tree identity cannot be read — hex that does not
+    /// decode, or only one of its two halves. Nothing here can be shown to
+    /// describe this tree, so nothing here may authorize deleting it, and the
+    /// operator action is to repair the ledger rather than to rename anything.
+    UndecodableIdentity,
 }
 
 impl SkipReason {
@@ -129,6 +140,8 @@ impl SkipReason {
             SkipReason::Blacklisted => "Blacklisted",
             SkipReason::OpenFailed => "OpenFailed",
             SkipReason::ForeignStoreDir => "ForeignStoreDir",
+            SkipReason::StoreKeyCollision => "StoreKeyCollision",
+            SkipReason::UndecodableIdentity => "UndecodableIdentity",
         }
     }
 }
