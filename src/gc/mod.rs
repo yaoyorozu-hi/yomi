@@ -110,6 +110,12 @@ pub enum SkipReason {
     NotIndexed,
     Blacklisted,
     OpenFailed,
+    /// This key's `archive/_scratch/<K>/` is not a directory yomi owns — a
+    /// symlink, a regular file, or a path this run cannot stat. Nothing read
+    /// through it may authorize a delete, and the distinct reason matters in
+    /// `gc.log`: "never archived" and "your store path was replaced" call for
+    /// different operator actions.
+    ForeignStoreDir,
 }
 
 impl SkipReason {
@@ -122,6 +128,7 @@ impl SkipReason {
             SkipReason::NotIndexed => "NotIndexed",
             SkipReason::Blacklisted => "Blacklisted",
             SkipReason::OpenFailed => "OpenFailed",
+            SkipReason::ForeignStoreDir => "ForeignStoreDir",
         }
     }
 }
@@ -229,17 +236,17 @@ fn candidates(roots: &SourceRoots, env: &Env, target: Target) -> Result<Vec<Cand
         }
         Target::Scratch => {
             for sc in single::scratch(roots)? {
-                let session_dir = scratch_session_dir(&sc, roots);
                 // The session uuid is the tree's own directory name
                 // (`tmp_root/<slug>/<uuid>`), read directly rather than parsed
                 // out of the store key — real project slugs contain `--`, so
                 // splitting the key on `--` yields the wrong half and defeats the
                 // live-session guard (D1).
-                let uuid = session_dir
+                let uuid = sc
+                    .session_dir
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string());
                 out.push(Candidate {
-                    source: session_dir,
+                    source: sc.session_dir,
                     target,
                     kind: CandidateKind::ScratchTree,
                     session_uuid: uuid,
@@ -277,25 +284,6 @@ fn file_candidate(source: PathBuf, target: Target) -> Candidate {
     }
 }
 
-/// Reconstruct a scratch session dir (`tmp_root/<slug>/<uuid>`) from its entry.
-fn scratch_session_dir(sc: &single::ScratchDir, roots: &SourceRoots) -> PathBuf {
-    if let Some(sp) = &sc.scratchpad {
-        return sp
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| sp.clone());
-    }
-    if let Some(t) = sc.task_outputs.first() {
-        // .../tasks/<name> → .../
-        return t
-            .parent()
-            .and_then(Path::parent)
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| roots.tmp_root.clone());
-    }
-    roots.tmp_root.clone()
-}
-
 /// Evaluate one candidate through the appropriate gate path.
 fn evaluate_candidate(
     env: &Env,
@@ -323,6 +311,7 @@ fn evaluate_candidate(
         ),
         CandidateKind::ScratchTree => safety::evaluate_scratch(
             env,
+            bl,
             cand.scratch_key.as_deref().unwrap_or_default(),
             &cand.source,
             cand.session_uuid.as_deref(),

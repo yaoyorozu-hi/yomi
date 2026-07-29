@@ -9,7 +9,7 @@ use crate::catalog::Catalog;
 use crate::config::Env;
 use crate::gc::live;
 use crate::gc::{PassedChecks, ProtectReason, SkipReason, Verdict, policy};
-use crate::scratch::{ScratchEntry, ScratchManifest, ScratchRel, read_manifest};
+use crate::scratch::{ScratchEntry, ScratchManifest, ScratchRel, StoreDir, read_manifest};
 use anyhow::Result;
 use std::collections::HashSet;
 use std::ffi::OsStr;
@@ -175,6 +175,7 @@ pub fn evaluate_file(
 #[allow(clippy::too_many_arguments)]
 pub fn evaluate_scratch(
     env: &Env,
+    bl: &Blacklist,
     key: &str,
     session_dir: &Path,
     session_uuid: Option<&str>,
@@ -186,6 +187,19 @@ pub fn evaluate_scratch(
     let (bytes, newest) = tree_size_and_newest(session_dir);
 
     let store_dir = env.archive_dir().join("_scratch").join(key);
+    // Before anything is read through it. A store path that is not a real
+    // directory may point anywhere, and every fact this gate would draw from it —
+    // the manifest, the `.zst` — becomes foreign evidence authorizing the delete
+    // of a live tree. The writer and the reconciler refuse the same path; the
+    // gate's stake is the largest of the three, because its output is a deletion.
+    if crate::scratch::classify_store_dir(&store_dir) == StoreDir::Foreign {
+        return Ok((
+            Verdict::Unverified {
+                reason: SkipReason::ForeignStoreDir,
+            },
+            bytes,
+        ));
+    }
     let manifest_path = store_dir.join("manifest.json");
     let mf = match read_manifest(&manifest_path) {
         Some(m) => m,
@@ -198,7 +212,7 @@ pub fn evaluate_scratch(
             ));
         }
     };
-    if let Some(reason) = verify_scratch_tree(session_dir, &store_dir, &mf) {
+    if let Some(reason) = verify_scratch_tree(bl, session_dir, &store_dir, &mf) {
         return Ok((Verdict::Unverified { reason }, bytes));
     }
 
@@ -450,6 +464,7 @@ const MAX_SCRATCH_REHASH_BYTES: u64 = 64 * 1024 * 1024;
 /// `Some(reason)` on the first failure (→ skip the tree, do not delete), `None`
 /// when every live file is accounted for and every stored archive re-verifies.
 fn verify_scratch_tree(
+    bl: &Blacklist,
     session_dir: &Path,
     store_dir: &Path,
     mf: &ScratchManifest,
@@ -478,6 +493,15 @@ fn verify_scratch_tree(
         let Ok(md) = entry.metadata() else {
             return Some(SkipReason::OpenFailed);
         };
+        // The archiver meant to store this file and could not read it, so no
+        // byte of its content was ever captured. That is not the deliberate
+        // non-storage a bare `stored: false` records, and presence + size
+        // assures nothing about content nobody read — refuse the tree rather
+        // than delete a file yomi intended to archive. Transient by
+        // construction: the first archive that can read the file clears it.
+        if e.capture_failed {
+            return Some(SkipReason::OpenFailed);
+        }
         if !e.stored {
             // (4) Deny-listed junk carries no archive; presence + size is the
             // most we can assert, and a size drift means the manifest is stale.
@@ -490,13 +514,30 @@ fn verify_scratch_tree(
         let (Some(src_sha), Some(content_sha)) = (&e.source_sha256, &e.content_sha256) else {
             return Some(SkipReason::StoreReverifyFailed);
         };
-        // (2) Live bytes must still hash to what was captured. Size first, so a
-        // drifted/huge file is rejected without an unbounded read.
-        if md.len() != e.bytes || md.len() > MAX_SCRATCH_REHASH_BYTES {
+        // (2) Live bytes must still hash to what was captured — read through the
+        // denylist, exactly as `evaluate_file`'s Gate 0 does. This was the one
+        // read in yomi that opened a live file by name and slurped it with no
+        // guard, so a credential hardlinked over an archived entry's path (with
+        // its size matched) had its bytes pulled into this process. The check is
+        // on the *opened fd's* inode, not the name, because the name is what the
+        // attacker controls.
+        //
+        // U2 made the window permanent rather than racy: before it, a denylisted
+        // path had no manifest entry to match — the writer skipped it — so the
+        // lookup above refused first. Retention now keeps an entry alive for a
+        // name whose inode has since been swapped.
+        let (mut live, fd_md) = match bl.open_guarded(entry.path()) {
+            Ok(GuardOutcome::Opened(f, md)) => (f, md),
+            Ok(GuardOutcome::Denied) => return Some(SkipReason::Blacklisted),
+            Ok(GuardOutcome::Unreadable) | Err(_) => return Some(SkipReason::OpenFailed),
+        };
+        // Sized from the pinned fd rather than the walked path, and before a
+        // single byte is read, so a drifted or huge file costs nothing.
+        if fd_md.len() != e.bytes || fd_md.len() > MAX_SCRATCH_REHASH_BYTES {
             return Some(SkipReason::ShaMismatch);
         }
-        match std::fs::read(entry.path()) {
-            Ok(live) if &crate::util::sha256_hex(&live) == src_sha => {}
+        match crate::util::sha256_stream(&mut live) {
+            Ok(sha) if &sha == src_sha => {}
             Ok(_) => return Some(SkipReason::ShaMismatch),
             Err(_) => return Some(SkipReason::OpenFailed),
         }

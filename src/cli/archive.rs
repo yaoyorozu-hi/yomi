@@ -153,6 +153,7 @@ fn emit(r: &Report, dry_run: bool, json: bool) {
             "flagged": r.flagged,
             "blacklisted_skipped": r.blacklisted_skipped,
             "oversize_skipped": r.oversize_skipped,
+            "scratch_orphans_removed": r.scratch_orphans_removed,
         });
         println!("{}", serde_json::to_string(&v).unwrap_or_default());
         return;
@@ -176,5 +177,13 @@ fn emit(r: &Report, dry_run: bool, json: bool) {
     }
     if r.oversize_skipped > 0 {
         println!("{prefix}{} oversized sources skipped.", r.oversize_skipped);
+    }
+    if r.scratch_orphans_removed > 0 {
+        let verb = if dry_run { "would be" } else { "were" };
+        println!(
+            "{prefix}{} stored scratch artifacts {verb} removed: the current \
+             [scratch] policy no longer stores them.",
+            r.scratch_orphans_removed
+        );
     }
 }
