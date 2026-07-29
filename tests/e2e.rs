@@ -203,8 +203,16 @@ impl Fixture {
         std::fs::write(dest, bytes).unwrap();
     }
 
+    /// Quarantine mirrors the archive: `quarantine/<X>` holds the unredacted
+    /// original of `archive/<X>.zst`, so a session artifact's originals sit
+    /// under the same `<slug>/<uuid>` this fixture's store uses. The `<uuid>`
+    /// level of the old layout is gone — the archive already partitions by
+    /// session, so repeating it was what let archive and rescan disagree.
     fn quarantine_dir(&self) -> PathBuf {
-        self.yomi_home.join("quarantine").join(&self.uuid)
+        self.yomi_home
+            .join("quarantine")
+            .join(&self.slug)
+            .join(&self.uuid)
     }
 
     fn catalog_path(&self) -> PathBuf {
@@ -399,9 +407,12 @@ fn secret_high_redacts_and_quarantines() {
     );
     assert!(stored_str.contains("REDACTED:bearer"));
 
-    // Quarantine holds the unredacted original.
-    let qdir = fx.yomi_home.join("quarantine").join(&fx.uuid);
-    let found = std::fs::read_dir(&qdir)
+    // Quarantine holds the unredacted original, at the mirror of the store path.
+    assert!(
+        fx.quarantine_dir().join("transcript.jsonl").is_file(),
+        "quarantine does not mirror the store path"
+    );
+    let found = std::fs::read_dir(fx.quarantine_dir())
         .unwrap()
         .filter_map(Result::ok)
         .any(|e| String::from_utf8_lossy(&std::fs::read(e.path()).unwrap()).contains(FIXTURE_AKIA));
@@ -1814,6 +1825,10 @@ fn p2_gc_scratch_new_unarchived_file_blocks_delete() {
 /// also permanently blocks GC (live sha != recorded source sha → ShaMismatch).
 /// The blacklisted file is named `_skip.env` so it sorts BEFORE the kept files
 /// and thus triggers the mispair; `blacklist_add` makes it hard-denied.
+///
+/// The denied candidate is now manifested (D-S5), stamped after the retained
+/// tail rather than pushed into the live set — which is what keeps `entries` and
+/// `kept` in the index correspondence this test exists to defend.
 #[test]
 fn p2_scratch_archive_pairs_entries_after_blacklist_skip() {
     let fx = Fixture::new("scratchpair");
@@ -1870,14 +1885,19 @@ fn p2_scratch_archive_pairs_entries_after_blacklist_skip() {
     assert_eq!(src_sha("scratchpad/a.md"), yomi::util::sha256_hex(a));
     assert_eq!(src_sha("scratchpad/b.md"), yomi::util::sha256_hex(b));
 
-    // The blacklisted candidate never became an entry and its bytes never landed
-    // in the store (guarded twice: skip here + read_source re-guard).
-    assert!(
-        !entries
-            .iter()
-            .any(|e| e["path"].as_str().unwrap().contains("_skip.env")),
-        "blacklisted file leaked into the manifest"
-    );
+    // The blacklisted candidate is manifested — otherwise its tree is refused
+    // forever with no reason given (D-S5) — but nothing about the denied inode
+    // is: `bytes: 0`, never stat'd, never opened, no hashes, nothing stored
+    // (guarded twice: skip here + read_source re-guard).
+    let skipped = entries
+        .iter()
+        .find(|e| e["path"].as_str().unwrap().contains("_skip.env"))
+        .expect("blacklisted candidate not recorded in the manifest");
+    assert_eq!(skipped["blacklisted"], true, "not stamped: {skipped}");
+    assert_eq!(skipped["bytes"], 0, "denied inode was stat'd: {skipped}");
+    assert_eq!(skipped["stored"], false, "{skipped}");
+    assert!(skipped["source_sha256"].is_null(), "{skipped}");
+    assert!(skipped["content_sha256"].is_null(), "{skipped}");
     assert!(!walk_contains(&store, "SECRET=leak"));
 }
 

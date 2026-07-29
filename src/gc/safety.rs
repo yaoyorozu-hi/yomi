@@ -496,6 +496,14 @@ fn verify_scratch_tree(
         let Some(e) = by_rel.get(&rel) else {
             return Some(SkipReason::NoCatalogRow);
         };
+        // A denylisted inode occupies this name. Refusing the tree is correct —
+        // `remove_tree_guarded` would abort on it anyway — but doing so with a
+        // reason is the point: it used to be unmanifested, so the gate reported
+        // only `NoCatalogRow` and a benign denylist hit produced a permanent,
+        // unexplained refusal.
+        if e.blacklisted {
+            return Some(SkipReason::Blacklisted);
+        }
         let Ok(md) = entry.metadata() else {
             return Some(SkipReason::OpenFailed);
         };

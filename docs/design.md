@@ -665,12 +665,45 @@ other refusal in this list from silent into operable.
 candidate is skipped before it is manifested, so the GC gate's live walk finds an unmanifested file and
 refuses the tree forever, reported only as `NoCatalogRow`. Refusing to delete a tree containing a
 credential hardlink is correct; doing it without ever saying so is not, and a merely *benign* denylist
-hit produces the same permanent, unexplained refusal. **Repair:** manifest it, as `capture_failed`'s
-sibling — an entry with `stored: false`, a new `blacklisted: true` flag, and **`bytes: 0` with no
-`stat`**, so nothing about the denied inode (not even its size) is recorded. The gate refuses on the
-flag with its own reason, and `read --scratch` lists it. Purely diagnostic: `remove_tree_guarded`
-already aborts a whole-tree removal on a blacklisted inode, so safety is unchanged. Severity MEDIUM
+hit produces the same permanent, unexplained refusal. **Repair:** record it, as `capture_failed`'s
+sibling — `blacklisted: true`, with **`bytes: 0` and no `stat`**, so nothing about the denied inode
+(not even its size) is recorded. The gate refuses on the flag with its own reason (`SkipReason::
+Blacklisted`, which already exists for the file path), checked immediately after the entry lookup and
+before any size or hash comparison. `read --scratch` lists it. Purely diagnostic: `remove_tree_guarded`
+already aborts a whole-tree removal on a denylisted inode, so safety is unchanged. Severity MEDIUM
 (permanently unreclaimable, with zero diagnosability).
+
+**How it is recorded matters more than that it is.** The obvious implementation — push the candidate
+into the live set with `stored: false` — **destroys an archive**, and the mechanism is the salvage
+defect wearing new clothes. A live entry is not a retention candidate, so the prior ledger's record for
+that identity is dropped; being `stored: false` it is not in the expected set either; so reconciliation
+finds its `.zst` unclaimed and removes it. A credential hardlinked over `scratchpad/a.md` would delete
+the archive of the file it displaced. `p7_credential_hardlink_swapped_in_after_the_walk_captures_
+nothing` catches exactly this.
+
+The two facts are orthogonal and were coupled only by the accident that manifesting an entry meant
+entering the live set:
+
+1. this identity has an archived copy from an earlier run — **retain it**, the `.zst` is the last copy;
+2. this identity is currently occupied by a denylisted inode — **refuse the tree, and say why**.
+
+So: a denylisted candidate **stays out of the live set** (retention is untouched, and no salvage
+extension is needed), and `blacklisted: true` is stamped **after** the prior tail is assembled — onto
+the retained entry if one carries that identity, or onto a fresh `bytes: 0` entry appended alongside
+the tail if none does. Stamping rather than appending is what keeps this from manufacturing the
+duplicate identity §5 reports.
+
+`present` is unchanged by the stamp. §3 already rules that a file which "merely became unreadable or
+blacklisted during this run is treated as gone, and its archive is retained" — `present: false` is that
+conservative reading, deliberately not a claim about whether the *name* is occupied, and
+`blacklisted: true` is what answers that. The existing test expectation therefore stands; it gains an
+assertion, it does not change one.
+
+One structural note for the implementer: `entries` and `kept` are two parallel vectors held in
+correspondence **by index** (the store pass zips them). Any entry that is manifested but has no
+live file to read breaks that alignment, which is why the stamp happens after the tail rather than
+inside the candidate loop. If a future change needs to manifest more such entries, make the
+correspondence explicit rather than positional.
 
 **D-S6 — an empty session tree is a permanently `Protected` scratch candidate.** With every session
 dir enumerated, a tree with no files yields `newest: None`, which falls through to `age = 0` and so is
@@ -712,6 +745,14 @@ The read path decompresses that `.zst` and emits nothing else — it never reads
 reads `quarantine/`, and never re-derives content from anything but the stored bytes. Non-exposure
 therefore does not depend on the read path making a decision; there is no input from which a raw
 secret could reach it.
+
+`read` never opens `quarantine/` at all. `verify` does not either, except under an explicit
+`--quarantine`, and the exception is drawn exactly there because the guarantee changes character at
+that boundary: over the store it is *structural* (every reachable byte is post-redaction, so a bug
+that echoed content could not leak a secret), while over `quarantine/` the bytes **are** the secret
+and the same bug would. What the default path keeps is the stronger property — the unattended nightly
+command never opens a file containing a raw secret — and law Q is split so that the checks which catch
+the defect that actually occurred are the ones that need no reads at all (§4).
 
 **Path traversal is structural too.** `--file <rel>` is matched against the manifest's `ScratchRel`
 values; the path actually opened is derived from the **matched entry**, never by joining user input to
@@ -884,6 +925,122 @@ they are documented rather than shipped half-built:
 - **Allowlist** `[scan.allow]` (regexes / secret-sha8s of known-benign, e.g. doc example keys) suppresses a finding entirely.
 
 Raw secrets **never** reach the index or `conversation.md` — those derive from the already-redacted stored artifact.
+
+### Quarantine identity, and law Q
+
+Quarantine holds **unredacted originals**, and for a source GC has since deleted it holds the only
+copy that exists anywhere. Everything below follows from that one fact.
+
+Until now the tree had **no identity rule at all** — three call sites each built a path their own way,
+and because nothing was ever asserted about the result, nothing could be violated and nothing was
+checked. That is the failure mode this document has hit three times: **a concept with no owner
+accumulates defects.** The consequences it accumulated:
+
+- **A scratch original is keyed by the lossy display name.** The path is built from `ScratchEntry.path`,
+  so two non-UTF-8 names collide at `U+FFFD` and **one quarantined original overwrites the other** —
+  the exact class `ScratchRel` exists to eliminate, surviving in the one place where the lost object
+  has no other copy.
+- **The key is doubled**: `quarantine/_scratch--<K>/<K>/<rel>`, once as the synthetic session uuid and
+  once as a path component.
+- **Archive and rescan disagree about the same artifact.** Archive uses the *session*-relative stored
+  rel (`transcript.jsonl`), rescan the *archive*-relative stored path
+  (`<slug>/<uuid>/transcript.jsonl`). Both land under `quarantine/<uuid>/`, so nothing is lost — but
+  one artifact can have originals at two paths and neither is canonical.
+
+**The rule: quarantine mirrors the archive.**
+
+> `quarantine/<X>` holds the unredacted original of `archive/<X>.zst`.
+
+The quarantine path is the artifact's **archive-relative stored path**, with the compression suffix
+removed, and nothing else. One derivation, used by every writer. It needs no naming scheme of its own,
+and that is the point: an original is named by the identity of the artifact it is the original of, so
+it inherits the store's uniqueness and its losslessness rather than restating them.
+
+| Artifact | Store | Quarantine |
+|---|---|---|
+| transcript | `archive/<slug>/<uuid>/transcript.jsonl.zst` | `quarantine/<slug>/<uuid>/transcript.jsonl` |
+| subagent meta (uncompressed) | `archive/<slug>/<uuid>/subagents/<x>.meta.json` | `quarantine/<slug>/<uuid>/subagents/<x>.meta.json` |
+| scratch file | `archive/_scratch/<K>/<rel>.zst` | `quarantine/_scratch/<K>/<rel>` |
+
+Three properties, each load-bearing:
+
+- **Injective.** Store paths are unique by construction, and stripping the suffix does not merge any
+  two of them: every *compressed* artifact's store path is its logical path with exactly one `.zst`
+  appended, so removing it is that map's inverse; the only *uncompressed* artifacts are subagent metas,
+  whose names end `.meta.json` and so are disjoint from the stripped set. Two originals can no longer
+  land on one path, which is the whole defect.
+- **Lossless.** A scratch store path is derived from raw `ScratchRel` bytes (§3), so the quarantine
+  path is too — provided the path is carried as `Path`/`OsStr` end to end. The current sanitizer takes
+  `&str`, which is where the bytes are lost; it must take a path.
+- **The `<session-uuid>` level disappears.** The archive layout already partitions by session, so
+  re-partitioning by uuid was redundant — and it is the source of both the doubled `<K>` and the
+  archive/rescan divergence, since the two call sites differed only in how much of the path they had
+  already spent on that level.
+
+**Every directory level under `quarantine/` is chmod 700 explicitly.** Today only the first level is,
+which was sufficient while the layout was two deep and a mutating command's umask covered the rest. The
+mirrored layout is deeper, and `Archiver` is a library type that a caller can use without
+`ensure_layout` ever having tightened the umask. Do not rely on inherited modes for a directory tree of
+raw secrets.
+
+**Existing quarantine trees are never renamed, moved or removed.** They may hold the only copy of an
+original, and no naming improvement is worth transposing such a tree. The new rule governs **writes**;
+the legacy layouts stay exactly where they are. This costs nothing today because **nothing reads
+`quarantine/`** — there is no consumer to confuse — and it is the same choice §3 makes for store keys:
+record and detect rather than rename.
+
+Recovering an original therefore needs a reader that knows all three layouts (current, `quarantine/
+<uuid>/<session-rel>`, and `quarantine/_scratch--<K>/<K>/<lossy-rel>`). That reader is deliberately
+**not** part of this work: a command that emits unredacted originals is a new exposure surface and
+deserves its own design, not a corner of a path-naming fix.
+
+#### Law Q — what is asserted about the quarantine tree, and who checks it
+
+Q is stated in four parts because they do not cost the same thing to check, and the difference decides
+who may check them.
+
+| | Assertion | Cost |
+|---|---|---|
+| **Q0 — injectivity** | no two artifacts map to one quarantine path | ledger only, opens nothing |
+| **Q1 — existence** | every artifact recorded `quarantined` has a file at its quarantine path | `stat` only |
+| **Q2 — no strays** | every file under `quarantine/` is claimed by some artifact | `readdir` only |
+| **Q3 — integrity** | the original hashes to the artifact's `source_sha256` | **opens a raw secret** |
+
+Q3 is checkable with no new field: the bytes handed to quarantine are exactly the bytes
+`source_sha256` describes, at every call site, for both session artifacts and scratch.
+
+**Q0 is the one that catches the collision, and it opens nothing.** Q1 does not: when two artifacts
+collided onto one path, that path exists, so existence is satisfied for both while one original is
+gone. Detecting that damage — past and future — is a pure computation over the ledger: derive every
+quarantined artifact's expected path and look for a repeat. The most valuable check here is also the
+cheapest and the safest.
+
+**`yomi verify` owns Q0, Q1 and Q2, and does not open `quarantine/`.** This is a narrower guarantee
+than the one it makes about the store, deliberately. The store's non-exposure is structural because
+every reachable byte is post-redaction, so even a bug that echoed content could not leak a secret. In
+`quarantine/` the bytes **are** the secret, so the same bug would. The routine, unattended, nightly
+command must therefore keep the property that it never opens a file containing a raw secret — worth
+more than nightly bit-rot detection over a small tree, and precisely the property the rest of §4 leans
+on. Q0/Q1/Q2 need only the ledger, `stat` and `readdir`, and they cover the defect class that actually
+occurred.
+
+**Q3 lives behind an explicit `verify --quarantine`.** Attended, deliberate, never in cron. It hashes
+and drops, exactly as §5's store pass does — the finding names a path and a mismatch and never carries
+content — but the flag is what keeps that discipline out of the default path, where discipline is the
+wrong kind of guarantee.
+
+**Q2 must recognise the legacy layouts.** With no migration, every original written before this rule
+sits at a path the current derivation does not produce, and reporting each as a stray would bury the
+signal in exactly the stores with the most history. A file matching a known legacy layout is reported
+as **legacy layout** — advisory, non-failing, and doubling as the inventory an operator would need to
+reconcile the tree by hand. Anything matching neither is a stray, also advisory: like foreign matter in
+a store dir (§5), it is something only an operator can resolve.
+
+**Scratch needs one field before Q applies to it.** `ScratchEntry` records no `quarantined` flag, so
+for a scratch file the ledger does not say an original was ever written and Q0/Q1 cannot even be
+asked. The addition is the same additive shape as `present`, `capture_failed` and `not_stored`
+(§3) — default false, emitted only when true. Session artifacts already carry the flag, in both the
+manifest and the catalog.
 
 ### Permission model
 
@@ -1062,6 +1219,7 @@ archive tree. The first and the last fail the run.
 | every regular-file `*.zst` in the store dir is claimed by a `stored: true` entry — **S1** | `OrphanArtifact` — **violation** (the orphan check; catches drift from outside) |
 | each claimed artifact decompresses to its `content_sha256` — **S2** | `ContentMismatch` — **violation** *only if* the entry has a `content_sha256`; otherwise `NoContentHash` — **unverifiable**, never a violation |
 | every `*.zst` that is **not** a regular file | `ForeignArtifact` — **foreign matter**; archive will neither claim nor remove it |
+| no two entries name the same identity | `DuplicateIdentity` — **violation**, once per duplicated identity |
 
 Exit 2 on any `violation`, and on any `refused key`. `unverifiable` and `foreign matter` are reported
 and do **not** by themselves fail the run: a legacy store full of pre-D2/R1 entries is not broken, and
@@ -1124,6 +1282,58 @@ a dead-code sweep should remove.
 (`WalkDir` does not follow them). Entries resolving through one therefore read as `MissingArtifact`
 and their contents are never opened. That is the safe direction, and one more thing only an operator
 can clear.
+
+**`DuplicateIdentity` is a violation, not a refused key.** `read --scratch` already detects two rows
+naming one identity, serves the row the store corroborates, and tells the operator to run
+`yomi verify` — which until now could not see the defect at all, so the referral went nowhere.
+
+A refused key means *the key was not examined*: its ledger could not be trusted to be read, or reading
+it would have meant trusting something foreign. A duplicate prevents none of that. Both rows decode,
+both are checkable against S1 and S2, and — because they name one identity they name one artifact path
+— the orphan sweep stays sound (the path is accounted once) and reconciliation stays enabled (it
+refuses only on an identity that will not decode, and these do). Everything remains examinable, so what
+is broken is the ledger, and a broken ledger with an intact store is a **violation**.
+
+Like `UndecodableEntry`, this is not a population: the live pass yields one entry per walked path and
+the tail skips identities already live, so `archive` cannot produce one. Unlike `UndecodableEntry`, it
+also does not self-correct — two prior rows sharing an identity are both carried forward as vanished
+on every subsequent run. **`prior_tail` should collapse retained entries by identity**, so archive
+cannot propagate a duplicate any more than it can create one; the manual repair remains the remedy for
+one already on disk.
+
+**It does not require exclusion.** It is a property of the manifest alone, which is read atomically
+(temp-write + rename), and it compares nothing against the store — the same category as
+`UndecodableEntry`, `UnreadableManifest` and `NoContentHash`. A concurrent `archive` cannot produce one
+transiently, because it cannot produce one at all.
+
+Report it **once per duplicated identity**, and account the artifact once: two rows on one path must
+not double-count `verified`, nor draw both a `verified` and a `ContentMismatch`.
+
+#### The quarantine pass — law Q
+
+`verify` also attests to the quarantine tree, under the split §4 defines: **Q0** (no two artifacts map
+to one quarantine path — ledger only), **Q1** (every artifact recorded `quarantined` has a file at its
+path — `stat` only), **Q2** (every file under `quarantine/` is claimed by an artifact — `readdir`
+only). None of them opens a file, which is the property that lets them run in cron over a tree of raw
+secrets.
+
+| Finding | Class |
+|---|---|
+| `QuarantineCollision` — two artifacts derive one quarantine path (**Q0**) | **violation** — one original has overwritten another |
+| `QuarantineMissing` — an artifact recorded `quarantined` has no file at its path (**Q1**) | **violation** |
+| `QuarantineLegacyLayout` — a file at a path a superseded derivation produced (**Q2**) | **foreign matter** — advisory; also the inventory for a by-hand reconciliation |
+| `QuarantineStray` — a file matching no derivation, current or legacy (**Q2**) | **foreign matter** — advisory |
+
+Q0 is the check that catches the collision, and Q1 is not: when two originals collided onto one path
+that path exists, so existence holds for both while one original is gone. Q0 also finds the damage
+retrospectively, from the ledger alone.
+
+**Q3 — the original hashes to the artifact's `source_sha256` — runs only under `verify --quarantine`.**
+It hashes and drops, exactly as the store pass does, so no finding carries content; the flag exists so
+that opening raw secrets is an attended decision rather than a nightly habit (§4).
+
+Scope: session artifacts come from the catalog (`quarantined`, `stored_path`, `source_sha256`); scratch
+comes from its manifest and needs the `quarantined` flag §4 specifies before Q applies to it at all.
 
 **Three checks `verify` must *not* attempt.** Each looks reasonable and each is wrong:
 
@@ -1550,7 +1760,7 @@ yomi rescan  [--commit] [--session <uuid>] [--fix-perms]                        
 yomi read    <session-uuid> [--entry <uuid>] [--agents] [--grep P] [--human|--raw]
 yomi read    <session-uuid | scratch-key> --scratch [--file <rel>] [--json]                              # archived scratch
 yomi status  [--secrets] [--unverified] [--storage]
-yomi verify  [<uuid> | --all]                                                                           # incl. scratch store law S (§5)
+yomi verify  [<uuid> | --all] [--quarantine]                                                            # scratch law S + quarantine law Q (§5)
 yomi config  [get|path]
 ```
 
@@ -1677,6 +1887,10 @@ per-candidate GC doubt. What it must never be is invisible, which is what it is 
 each finding a `{key, rel, issue, class}`. `rel` is the lossy display path and is empty for key-level
 findings; it is never an identity (§3). The human form prints the same, one labelled block per class,
 so a reader can see the class of every finding without consulting this document.
+
+A `quarantine` section reports law Q (§5) beside the `scratch` section: `checked`, and the same four
+finding lists. `--quarantine` adds **Q3**, the only check that opens a file under `quarantine/` — it is
+a flag rather than a default precisely so that reading raw secrets stays an attended decision (§4).
 
 `--all` is an explicit alias for "no session", not an independent mode: the two are mutually exclusive
 and omitting both is the same as `--all`. The flag is currently never read — the positional alone
@@ -1866,6 +2080,25 @@ Load-bearing fixtures: secret-scan **must** catch AKIA/PRIVATE KEY; double-archi
      - **`--file-hex <HEX>`, and a marker in the human listing** for an entry whose `rel` is
        undisplayable (§8) — the last step of making the non-UTF-8 population addressable rather than
        merely visible.
+
+     **U5-B1 — quarantine identity** (§4). One derivation owning the quarantine path, taken by all
+     three writers (session capture, meta capture, rescan) from the artifact's archive-relative stored
+     path: `quarantine/<X>` is the original of `archive/<X>.zst`. Carried as `Path`/`OsStr` end to end
+     so scratch's raw bytes survive the sanitizer, which currently takes `&str`. The redundant
+     `<session-uuid>` level goes, taking the doubled `<K>` and the archive/rescan divergence with it.
+     Adds `ScratchEntry.quarantined` (the ledger has to say an original exists before anything can
+     check that it does) and chmods **every** created directory level 700 rather than only the first.
+     No migration: existing trees may hold the only copy of an original and are never renamed, moved or
+     removed. D-S5's `blacklisted` write belongs here too, in the stamping form §3 specifies — the
+     obvious form deletes an archive.
+
+     **U5-B2 — law Q in `verify`** (§4, §5). Q0/Q1/Q2 by default, opening nothing; Q3 under
+     `--quarantine`. Depends on B1 for the derivation and the flag. Same shape as U2→U3: one unit stops
+     producing the defect, the next detects it, including retrospectively.
+
+     **`DuplicateIdentity` in `verify`** (§5) — a violation, and `prior_tail` collapsing retained
+     entries by identity so archive cannot propagate one. Closes the referral `read --scratch` already
+     makes to a check that did not exist.
   6. **Store-key hardening** (§3, "The store key of a tree"): `slug_hex`/`uuid_hex` identity fields
      with collision refusal, and the `KEY_MAX`/`_h256--` digest form for over-long keys. No migration
      and no renaming — that is the point of choosing detection over an injective encoding. `verify`'s

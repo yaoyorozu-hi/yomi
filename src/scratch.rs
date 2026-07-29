@@ -263,6 +263,15 @@ pub struct ScratchEntry {
     /// *nothing was read*, where `not_stored` says *we decided not to keep it*.
     #[serde(default, skip_serializing_if = "is_false")]
     pub blacklisted: bool,
+    /// This entry's unredacted original was written to `quarantine/`, at the
+    /// mirror of its store path.
+    ///
+    /// Session artifacts record this in both the manifest and the catalog;
+    /// scratch recorded it nowhere, so the ledger could not even be *asked*
+    /// whether an original exists — which is what law Q's existence and stray
+    /// checks are stated over.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub quarantined: bool,
 }
 
 /// The policy rule that declined to store a file — exactly the three causes
@@ -282,6 +291,15 @@ pub enum NotStored {
 }
 
 impl NotStored {
+    /// The token as it appears in the manifest.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NotStored::NotAllowed => "not_allowed",
+            NotStored::Denied => "denied",
+            NotStored::FileCap => "file_cap",
+        }
+    }
+
     /// Phrased so every variant names the rule set an operator would edit, and
     /// the parenthetical names which half of it decided.
     pub fn reason(self) -> &'static str {
@@ -335,7 +353,21 @@ impl ScratchEntry {
             capture_failed: false,
             not_stored,
             blacklisted: false,
+            quarantined: false,
         }
+    }
+
+    /// A denylisted candidate, manifested so its tree's refusal is diagnosable.
+    ///
+    /// `bytes: 0` and never stat'd: nothing about the denied inode is recorded,
+    /// not even its size. §4 forbids opening a blacklisted path for read or
+    /// delete, and this records that it was refused without learning anything
+    /// from it.
+    pub fn blacklisted(rel: &ScratchRel) -> Self {
+        let mut e = ScratchEntry::new(rel, 0, None);
+        e.stored = false;
+        e.blacklisted = true;
+        e
     }
 
     /// This entry's identity. `None` for an entry whose recorded fields do not
