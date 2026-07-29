@@ -34,13 +34,30 @@ pub fn sha256_stream<R: std::io::Read>(reader: &mut R) -> std::io::Result<String
     Ok(hex(&h.finalize()))
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
         use std::fmt::Write;
         let _ = write!(s, "{b:02x}");
     }
     s
+}
+
+/// Decoder companion to [`hex`], for the manifest's `path_hex` field. `None` on
+/// an odd length or any non-hex digit — a malformed value must refuse, never
+/// decode to something plausible.
+pub(crate) fn unhex(s: &str) -> Option<Vec<u8>> {
+    let b = s.as_bytes();
+    if !b.len().is_multiple_of(2) {
+        return None;
+    }
+    b.chunks_exact(2)
+        .map(|pair| {
+            let hi = (pair[0] as char).to_digit(16)?;
+            let lo = (pair[1] as char).to_digit(16)?;
+            Some((hi * 16 + lo) as u8)
+        })
+        .collect()
 }
 
 /// Resolve the user's home directory from `$HOME`.
