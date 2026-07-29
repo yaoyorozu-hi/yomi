@@ -77,8 +77,7 @@ impl<'a> Archiver<'a> {
             .env
             .session_dir(&session.project_slug, &session.session_uuid);
         if !self.dry_run {
-            std::fs::create_dir_all(&session_dir)?;
-            set_700(&session_dir)?;
+            self.store_dirs(&session_dir)?;
         }
 
         let mut outs: Vec<CaptureOut> = Vec::new();
@@ -227,7 +226,11 @@ impl<'a> Archiver<'a> {
             manifest.incremental.prior_capture = prior_manifest.map(|m| m.captured_at);
         }
         manifest.artifacts = artifacts;
-        manifest::write(&manifest_path, &manifest)?;
+        manifest::write(
+            &self.env.archive_dir(),
+            self.store_rel(&manifest_path)?,
+            &manifest,
+        )?;
         Ok(())
     }
 
@@ -243,8 +246,7 @@ impl<'a> Archiver<'a> {
             None => self.env.archive_dir().join(sf.category),
         };
         if !self.dry_run {
-            std::fs::create_dir_all(&category_dir)?;
-            set_700(&category_dir)?;
+            self.store_dirs(&category_dir)?;
         }
         let stem = if appendable {
             "history.jsonl.zst".to_string()
@@ -325,11 +327,11 @@ impl<'a> Archiver<'a> {
         }
         let store_dir = root.join(&sc.key);
 
-        // `create_dir_all`, `set_700` and `atomic_write` all follow a symlink, so
-        // a store dir that is not a real directory would take this key's manifest
-        // and artifacts outside the archive tree and rewrite an unrelated
-        // directory's mode to 700. Checked before the manifest is read, so a
-        // foreign ledger never informs a decision either.
+        // The writes below descend fd by fd and would refuse this on their own;
+        // the classification is here for the *other* half — checked before the
+        // manifest is read, so a foreign ledger never informs a decision. It also
+        // makes the refusal a named per-key skip rather than an I/O error out of
+        // the descent, which is what keeps one bad key from ending the run.
         //
         // Refused, not repaired — unlike the lock file, whose symlink is
         // self-healed. That file holds nothing, so removing a link node there
@@ -514,16 +516,12 @@ impl<'a> Archiver<'a> {
             .unwrap_or_default();
 
         if !self.dry_run {
-            std::fs::create_dir_all(&store_dir)?;
-            // The scratch root as well as the key. `create_dir_all` creates both
-            // when neither exists, and the creator is what asserts the mode:
-            // `ensure_layout` does not cover `archive/_scratch/` (it is one
-            // artifact family's root, not the store's), and `Archiver` is a
-            // library type a caller can use without ever having tightened the
-            // umask — the same reason §4 gives for chmodding every level of a
-            // quarantine path rather than inheriting.
-            set_700(&crate::scratch::store_root(&self.env.archive_dir()))?;
-            set_700(&store_dir)?;
+            // Every level, including `archive/_scratch/` itself: the descent
+            // modes each directory it opens, and the creator is what asserts the
+            // mode. `ensure_layout` does not cover `_scratch` (it is one artifact
+            // family's root, not the store's), and `Archiver` is a library type a
+            // caller can use without ever having tightened the umask.
+            self.store_dirs(&store_dir)?;
             for (entry, (path, rel)) in entries.iter_mut().zip(kept.iter()) {
                 if !entry.stored {
                     continue;
@@ -543,9 +541,6 @@ impl<'a> Archiver<'a> {
                     continue;
                 };
                 let dest = store_dir.join(rel.store_rel());
-                if let Some(parent) = dest.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
                 let scan = self.scan_bytes(&bytes, false);
                 self.tally(report, &scan);
                 if scan.needs_quarantine {
@@ -571,8 +566,7 @@ impl<'a> Archiver<'a> {
                     }
                     entry.quarantined = true;
                 }
-                atomic_write(&dest, &compress_frame(&scan.redacted)?)?;
-                set_600(&dest)?;
+                self.store_write(&dest, &compress_frame(&scan.redacted)?)?;
                 report.bytes_stored += std::fs::metadata(&dest)?.len();
                 entry.source_sha256 = Some(sha256_hex(&bytes));
                 entry.content_sha256 = Some(sha256_hex(&scan.redacted));
@@ -634,8 +628,7 @@ impl<'a> Archiver<'a> {
                 entries,
             };
             let mfp = store_dir.join("manifest.json");
-            atomic_write(&mfp, (serde_json::to_string_pretty(&mf)? + "\n").as_bytes())?;
-            set_600(&mfp)?;
+            self.store_write(&mfp, (serde_json::to_string_pretty(&mf)? + "\n").as_bytes())?;
             // Manifest first, then reconcile: a crash between them leaves a store
             // holding *more* than the ledger claims, which the GC gate ignores and
             // the next run cleans up. The reverse order would leave a ledger
@@ -820,19 +813,15 @@ impl<'a> Archiver<'a> {
             let frame = compress_frame(&scan.redacted)?;
             (sha256_hex(&frame), frame.len() as u64)
         } else {
-            if let Some(parent) = dest.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
             match append_from {
                 Some(prior_len) => {
                     let remainder = &scan.redacted[prior_len..];
                     if !remainder.is_empty() {
-                        append_frame(&dest, remainder)?;
+                        self.store_append(&dest, &compress_frame(remainder)?)?;
                     }
                 }
-                None => atomic_write(&dest, &compress_frame(&scan.redacted)?)?,
+                None => self.store_write(&dest, &compress_frame(&scan.redacted)?)?,
             }
-            set_600(&dest)?;
             let stored = std::fs::read(&dest)?;
             report.bytes_stored += stored.len() as u64;
             (sha256_hex(&stored), stored.len() as u64)
@@ -911,11 +900,7 @@ impl<'a> Archiver<'a> {
         let (stored_sha, stored_bytes) = if self.dry_run {
             (sha256_hex(&scan.redacted), scan.redacted.len() as u64)
         } else {
-            if let Some(parent) = dest.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            atomic_write(&dest, &scan.redacted)?;
-            set_600(&dest)?;
+            self.store_write(&dest, &scan.redacted)?;
             report.bytes_stored += scan.redacted.len() as u64;
             (sha256_hex(&scan.redacted), scan.redacted.len() as u64)
         };
@@ -947,6 +932,37 @@ impl<'a> Archiver<'a> {
             stored_archive_rel,
             findings: scan.findings,
         }))
+    }
+
+    /// Where `dest` sits relative to `archive/`.
+    ///
+    /// A hard error rather than a fallback: every store path is built by joining
+    /// onto the archive root, so one that is not under it is a bug — and writing
+    /// it anyway is the thing this module is trying to stop.
+    fn store_rel<'p>(&self, dest: &'p Path) -> Result<&'p Path> {
+        dest.strip_prefix(self.env.archive_dir())
+            .with_context(|| format!("{} is not inside the archive root", dest.display()))
+    }
+
+    /// Create every directory of `dir` under `archive/`, descending fd by fd.
+    fn store_dirs(&self, dir: &Path) -> Result<()> {
+        crate::safefs::make_dirs(&self.env.archive_dir(), self.store_rel(dir)?)?;
+        Ok(())
+    }
+
+    /// Replace the artifact at `dest`, descending fd by fd from `archive/`.
+    ///
+    /// Every level is opened `O_NOFOLLOW` from its parent's descriptor and the
+    /// file is created the same way, so nothing planted at an intermediate level
+    /// can redirect the write or collect a `chmod` — the property the quarantine
+    /// writer has had since the mirror rule landed, and which the store lacked.
+    fn store_write(&self, dest: &Path, bytes: &[u8]) -> Result<()> {
+        crate::safefs::write_under(&self.env.archive_dir(), self.store_rel(dest)?, bytes)
+    }
+
+    /// Append a frame to the artifact at `dest`, under the same guarantee.
+    fn store_append(&self, dest: &Path, bytes: &[u8]) -> Result<()> {
+        crate::safefs::append_under(&self.env.archive_dir(), self.store_rel(dest)?, bytes)
     }
 
     /// Add a scan's actionable tallies to the run report (Allowed excluded, N5).
@@ -1342,20 +1358,6 @@ fn archive_rel(env: &Env, dest: &Path) -> String {
         .to_string()
 }
 
-/// Write `bytes` to `dest` via a temp file + rename, so a crash can never leave
-/// a half-written store (B3a).
-fn atomic_write(dest: &Path, bytes: &[u8]) -> Result<()> {
-    let tmp = dest.with_extension(format!(
-        "tmp-{}-{}",
-        std::process::id(),
-        now_iso().replace([':', '.'], "")
-    ));
-    std::fs::write(&tmp, bytes)?;
-    set_600(&tmp)?;
-    std::fs::rename(&tmp, dest)?;
-    Ok(())
-}
-
 fn file_name(p: &Path) -> String {
     p.file_name()
         .and_then(|s| s.to_str())
@@ -1368,26 +1370,6 @@ fn file_stem(p: &Path) -> String {
         .and_then(|s| s.to_str())
         .unwrap_or("unnamed")
         .to_string()
-}
-
-fn append_frame(dest: &Path, slice: &[u8]) -> Result<()> {
-    use std::io::Write;
-    let frame = compress_frame(slice)?;
-    let mut f = std::fs::OpenOptions::new().append(true).open(dest)?;
-    f.write_all(&frame)?;
-    Ok(())
-}
-
-fn set_700(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
-    Ok(())
-}
-
-fn set_600(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    Ok(())
 }
 
 /// Verify a stored artifact against the catalog: the compressed bytes must hash

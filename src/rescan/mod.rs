@@ -19,6 +19,7 @@ use crate::catalog::{Catalog, IndexCandidate};
 use crate::config::Env;
 use crate::index::{self, IndexMode};
 use crate::model::{FindingAction, Frame};
+use crate::safefs;
 use crate::scan::quarantine::quarantine_original;
 use crate::scan::{
     Allowlist, ContentScan, ScanOpts, scan_content_with, stored_is_whole_quarantine,
@@ -26,8 +27,7 @@ use crate::scan::{
 use crate::util::{now_iso, sha256_hex};
 use anyhow::Result;
 use std::collections::BTreeMap;
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// The three shapes a hardened re-scan can take on an old browsable artifact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,9 +208,16 @@ pub fn commit(
         }
 
         // Write the new stored frame to a temp sibling (not yet renamed).
-        let dest = archive_dir.join(&c.stored_path);
-        let tmp = match write_temp(&dest, &rr.new_frame) {
-            Ok(t) => t,
+        //
+        // Staged through a directory descended fd by fd from the archive root, so
+        // neither the temp write nor the rename that follows can be redirected by
+        // something planted at an intermediate level. The rename is `renameat`
+        // from and to that same pinned descriptor — still a same-directory
+        // rename, so the atomicity this crash-safety argument rests on is
+        // unchanged. The `Staged` unlinks itself on drop, so every `continue`
+        // below leaves no temp behind.
+        let staged = match stage_stored(&archive_dir, &c.stored_path, &rr.new_frame) {
+            Ok(st) => st,
             Err(e) => {
                 report
                     .failed
@@ -251,7 +258,6 @@ pub fn commit(
         let purged = match txn {
             Ok(p) => p,
             Err(e) => {
-                let _ = std::fs::remove_file(&tmp);
                 report
                     .failed
                     .push(fail_label(c, &format!("catalog transaction failed: {e}")));
@@ -272,8 +278,7 @@ pub fn commit(
         }
 
         // Atomic stored swap — after the DB commit.
-        if let Err(e) = std::fs::rename(&tmp, &dest) {
-            let _ = std::fs::remove_file(&tmp);
+        if let Err(e) = staged.commit() {
             report
                 .failed
                 .push(fail_label(c, &format!("stored rename failed: {e}")));
@@ -421,7 +426,8 @@ fn update_session_manifest(env: &Env, c: &IndexCandidate, rr: &Reredaction, quar
     let Some(slug) = c.project_slug.as_deref() else {
         return;
     };
-    let path = env.session_dir(slug, &c.session_uuid).join("manifest.json");
+    let rel = Path::new(slug).join(&c.session_uuid).join("manifest.json");
+    let path = env.archive_dir().join(&rel);
     let Ok(mut m) = manifest::read(&path) else {
         return;
     };
@@ -446,7 +452,7 @@ fn update_session_manifest(env: &Env, c: &IndexCandidate, rr: &Reredaction, quar
         captured_at: now_iso(),
     }];
     m.secret_scan = summarize_records(&m.artifacts);
-    let _ = manifest::write(&path, &m);
+    let _ = manifest::write(&env.archive_dir(), &rel, &m);
 }
 
 fn candidates(cat: &Catalog, session: Option<&str>) -> Result<Vec<IndexCandidate>> {
@@ -491,15 +497,13 @@ fn fail_label(c: &IndexCandidate, reason: &str) -> String {
     )
 }
 
-fn write_temp(dest: &Path, bytes: &[u8]) -> Result<PathBuf> {
-    let tmp = dest.with_extension(format!(
-        "rescan-tmp-{}-{}",
-        std::process::id(),
-        now_iso().replace([':', '.'], "")
-    ));
-    std::fs::write(&tmp, bytes)?;
-    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-    Ok(tmp)
+/// Stage the re-redacted frame beside its artifact, under a directory this run
+/// descended fd by fd rather than a path it re-resolved.
+fn stage_stored(archive_dir: &Path, stored_path: &str, bytes: &[u8]) -> Result<safefs::Staged> {
+    let (dirs, name) = safefs::split(Path::new(stored_path))?;
+    safefs::Dir::open_root(archive_dir)?
+        .descend(&dirs, safefs::DIR_MODE)?
+        .stage(&name, bytes, safefs::FILE_MODE)
 }
 
 /// Test-only fault seam (see the crash-safety note at module top). Compiled only
