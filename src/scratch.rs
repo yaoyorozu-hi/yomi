@@ -143,6 +143,40 @@ pub fn store_key(slug: &OsStr, uuid: &OsStr) -> String {
     )
 }
 
+/// The scratch store root's name under `archive/`. Also the `key` a root-level
+/// finding is filed under — no store key can collide with it, since every key
+/// contains `--`.
+pub const SCRATCH_ROOT: &str = "_scratch";
+
+/// `archive/_scratch/` — the directory every scratch store key sits in.
+pub fn store_root(archive_dir: &Path) -> PathBuf {
+    archive_dir.join(SCRATCH_ROOT)
+}
+
+/// Whether `key` is the store key of the session directory named `uuid`.
+///
+/// A suffix test does not do this. A key is `<slug>--<uuid>` only in the *plain*
+/// form; a session whose directory name is not valid UTF-8 is encoded
+/// `_hex--<hex(slug)>--<hex(uuid)>`, which no `ends_with("--<uuid>")` can ever
+/// match. For a verification tool the resulting failure is the worst kind —
+/// **zero keys matched, exit 0**, indistinguishable by exit code from "checked
+/// it, all clean".
+///
+/// The two forms are dispatched on, never both tried: hex output is `[0-9a-f]`
+/// and carries no `-`, so stripping the marker leaves a remainder that splits on
+/// `--` into exactly two fields. That unambiguity is the property the plain form
+/// lacks, and the reason the two namespaces were made disjoint.
+pub fn store_key_matches_session(key: &str, uuid: &OsStr) -> bool {
+    if let Some(rest) = key.strip_prefix(HEX_KEY_PREFIX) {
+        let fields: Vec<&str> = rest.split("--").collect();
+        return fields.len() == 2
+            && crate::util::unhex(fields[1]).is_some_and(|raw| raw == uuid.as_bytes());
+    }
+    // Plain form: both halves are verbatim, so the uuid must be UTF-8 to appear.
+    uuid.to_str()
+        .is_some_and(|u| key.ends_with(&format!("--{u}")))
+}
+
 /// One file in a scratch tree, as recorded in `manifest.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScratchEntry {
@@ -328,6 +362,411 @@ pub fn read_manifest(path: &Path) -> Option<ScratchManifest> {
         ManifestRead::Ok(mf) => Some(mf),
         ManifestRead::Missing | ManifestRead::Unreadable => None,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Store law S — what `yomi verify`'s scratch pass checks (design §3, §5).
+// ---------------------------------------------------------------------------
+
+/// Which of the three vocabularies a finding speaks in. Only [`Violation`] and
+/// [`RefusedKey`] fail the run.
+///
+/// [`Violation`]: ScratchClass::Violation
+/// [`RefusedKey`]: ScratchClass::RefusedKey
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScratchClass {
+    /// S1 broken, or S2 broken where S2 applies — a defect of the store.
+    Violation,
+    /// S2 inapplicable (the entry carries no `content_sha256`), or an identity
+    /// that does not decode. A statement about what the ledger *can prove*, not
+    /// a defect: every manifest written before D2/R1 is full of these, and a
+    /// verify that fails on them nightly is a verify that gets ignored.
+    Unverifiable,
+    /// An artifact-shaped object archive will neither claim nor remove — S1's
+    /// left side is regular files only, and reconciliation deliberately does not
+    /// widen past "the artifacts we stored". Only an operator can resolve it.
+    ForeignMatter,
+    /// The key was not examined: its ledger could not be trusted to be read, or
+    /// reading it would have meant trusting something outside the archive tree.
+    RefusedKey,
+}
+
+impl ScratchClass {
+    /// Whether a finding of this class makes the run exit non-zero.
+    pub fn fails_the_run(self) -> bool {
+        matches!(self, ScratchClass::Violation | ScratchClass::RefusedKey)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ScratchClass::Violation => "violation",
+            ScratchClass::Unverifiable => "unverifiable",
+            ScratchClass::ForeignMatter => "foreign matter",
+            ScratchClass::RefusedKey => "refused key",
+        }
+    }
+}
+
+/// What `verify` found. One variant per row of the §5 contract table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScratchIssue {
+    /// The store path is not a directory yomi owns. Nothing below is attempted:
+    /// a foreign ledger must not be read at all. Also reported against the key
+    /// `_scratch` when the store *root* itself is foreign — the rule applies to
+    /// the root as much as to a key, and `read_dir` follows a symlink there.
+    ForeignStoreDir,
+    /// `archive/_scratch/` exists and could not be enumerated. A refusal of this
+    /// pass, not of the command: the catalog pass attests to a different ledger
+    /// and neither is a precondition of the other.
+    UnreadableStoreRoot,
+    /// The manifest's recorded identity does not match the tree this key names.
+    /// **Not reachable yet** — it needs the `slug_hex`/`uuid_hex` fields, which
+    /// are queued separately. Defined so the reported vocabulary is already the
+    /// one the design specifies and populating it changes no output schema.
+    StoreKeyCollision,
+    /// A store directory with no `manifest.json` at all.
+    NoManifest,
+    /// A `manifest.json` that exists but does not parse.
+    UnreadableManifest,
+    /// An entry whose identity does not decode. Its `store_rel()` is
+    /// *unknowable*, so it can be tested against neither half of S — which is a
+    /// statement about what the ledger can prove, not a defect of the store.
+    UndecodableEntry,
+    /// The key-level consequence of the above: reconciliation refuses here on
+    /// every future run, so the ledger stays incomplete and stale artifacts
+    /// accumulate with no correction. This is a state an operator has to leave,
+    /// not one the tool leaves by itself (§3), so it is named at key level and
+    /// fails the run.
+    UnreconcilableKey,
+    /// S1: a `stored: true` entry with no regular-file `.zst` at its `store_rel()`.
+    MissingArtifact,
+    /// S1: a `stored: false` entry that nonetheless has a `.zst` at its
+    /// `store_rel()` — the ledger disclaims bytes the store holds.
+    UnclaimedArtifact,
+    /// S1: a regular-file `*.zst` no `stored: true` entry claims. Catches drift
+    /// introduced from outside the tool.
+    OrphanArtifact,
+    /// S2: the artifact does not decompress to its entry's `content_sha256`.
+    ContentMismatch,
+    /// S2 does not apply: the entry carries no `content_sha256`. Every manifest
+    /// written before D2/R1 looks like this, and salvage preserves them.
+    NoContentHash,
+    /// A `*.zst` that is not a regular file.
+    ForeignArtifact,
+}
+
+impl ScratchIssue {
+    pub fn class(self) -> ScratchClass {
+        match self {
+            ScratchIssue::ForeignStoreDir
+            | ScratchIssue::UnreadableStoreRoot
+            | ScratchIssue::StoreKeyCollision
+            | ScratchIssue::UnreconcilableKey => ScratchClass::RefusedKey,
+            ScratchIssue::NoManifest
+            | ScratchIssue::UnreadableManifest
+            | ScratchIssue::MissingArtifact
+            | ScratchIssue::UnclaimedArtifact
+            | ScratchIssue::OrphanArtifact
+            | ScratchIssue::ContentMismatch => ScratchClass::Violation,
+            ScratchIssue::NoContentHash | ScratchIssue::UndecodableEntry => {
+                ScratchClass::Unverifiable
+            }
+            ScratchIssue::ForeignArtifact => ScratchClass::ForeignMatter,
+        }
+    }
+
+    /// Whether this finding compares the ledger against the store, and so cannot
+    /// stand unless the two were a consistent snapshot.
+    ///
+    /// The rule is one principle, not a list: **without exclusion the pair
+    /// (manifest, store) is not a consistent snapshot, so no finding that
+    /// compares one against the other may stand.** Archive writes artifacts
+    /// *before* the manifest and reconciles *after* it, so for the whole store
+    /// pass a new `.zst` sits under a manifest that predates it and a rewritten
+    /// `.zst` sits under an entry whose `content_sha256` describes the previous
+    /// content. Every one of these would then be a true-looking accusation about
+    /// a healthy store.
+    ///
+    /// The rest stand: each depends on a single atomically-replaced object (the
+    /// manifest is temp-write + rename, so a reader sees old or new, never torn)
+    /// or on the store path's classification, and archive never transiently
+    /// produces them.
+    pub fn requires_exclusion(self) -> bool {
+        matches!(
+            self,
+            ScratchIssue::NoManifest
+                | ScratchIssue::MissingArtifact
+                | ScratchIssue::UnclaimedArtifact
+                | ScratchIssue::OrphanArtifact
+                | ScratchIssue::ContentMismatch
+        )
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ScratchIssue::ForeignStoreDir => "ForeignStoreDir",
+            ScratchIssue::UnreadableStoreRoot => "UnreadableStoreRoot",
+            ScratchIssue::StoreKeyCollision => "StoreKeyCollision",
+            ScratchIssue::NoManifest => "NoManifest",
+            ScratchIssue::UnreadableManifest => "UnreadableManifest",
+            ScratchIssue::UndecodableEntry => "UndecodableEntry",
+            ScratchIssue::UnreconcilableKey => "UnreconcilableKey",
+            ScratchIssue::MissingArtifact => "MissingArtifact",
+            ScratchIssue::UnclaimedArtifact => "UnclaimedArtifact",
+            ScratchIssue::OrphanArtifact => "OrphanArtifact",
+            ScratchIssue::ContentMismatch => "ContentMismatch",
+            ScratchIssue::NoContentHash => "NoContentHash",
+            ScratchIssue::ForeignArtifact => "ForeignArtifact",
+        }
+    }
+}
+
+/// One finding, naming the key and — for entry- and artifact-level issues — the
+/// store-relative path it concerns.
+#[derive(Debug, Clone)]
+pub struct ScratchFinding {
+    pub key: String,
+    /// Store-relative path, lossy, for display only. Empty for key-level issues.
+    pub rel: String,
+    pub issue: ScratchIssue,
+    /// The class this finding was filed under. Equal to `issue.class()` except
+    /// where a comparative finding was downgraded for want of exclusion — the
+    /// issue name never changes, only where it lands.
+    pub class: ScratchClass,
+}
+
+/// The scratch pass's result. Findings are partitioned by class so a caller
+/// cannot accidentally fail the run on an `unverifiable`.
+#[derive(Debug)]
+pub struct ScratchVerifyReport {
+    /// Whether the write lock was held for the pass. When false, no finding that
+    /// compares the ledger against the store may stand, and the ones that would
+    /// have are filed as `unverifiable` instead. A scheduled `verify` that is
+    /// *never* exclusive has never checked S1 or S2 — that, not any individual
+    /// downgraded finding, is the condition worth alerting on.
+    pub exclusive: bool,
+    /// Store directories examined, refusals included.
+    pub keys: u64,
+    /// Artifacts that decompressed to their `content_sha256`. Sound in either
+    /// condition: an artifact that matched its entry is a true statement about
+    /// that pair even if both change a moment later. Positives survive the
+    /// downgrade; accusations do not.
+    pub verified: u64,
+    pub violations: Vec<ScratchFinding>,
+    pub unverifiable: Vec<ScratchFinding>,
+    pub foreign_matter: Vec<ScratchFinding>,
+    pub refused: Vec<ScratchFinding>,
+}
+
+impl ScratchVerifyReport {
+    fn new(exclusive: bool) -> Self {
+        ScratchVerifyReport {
+            exclusive,
+            keys: 0,
+            verified: 0,
+            violations: Vec::new(),
+            unverifiable: Vec::new(),
+            foreign_matter: Vec::new(),
+            refused: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, key: &str, rel: &str, issue: ScratchIssue) {
+        let class = if !self.exclusive && issue.requires_exclusion() {
+            ScratchClass::Unverifiable
+        } else {
+            issue.class()
+        };
+        let f = ScratchFinding {
+            key: key.to_string(),
+            rel: rel.to_string(),
+            issue,
+            class,
+        };
+        match class {
+            ScratchClass::Violation => self.violations.push(f),
+            ScratchClass::Unverifiable => self.unverifiable.push(f),
+            ScratchClass::ForeignMatter => self.foreign_matter.push(f),
+            ScratchClass::RefusedKey => self.refused.push(f),
+        }
+    }
+
+    /// Exit 2 on any violation and on any refused key. `unverifiable` and
+    /// `foreign matter` are reported and do not by themselves fail the run.
+    pub fn failed(&self) -> bool {
+        !self.violations.is_empty() || !self.refused.is_empty()
+    }
+}
+
+/// Check store law S over `archive/_scratch/*/`, scoped to the key carrying
+/// `session` when one is given.
+///
+/// **Manifest-driven, because the manifest is what the delete gate trusts.**
+/// Scratch writes no catalog row; mirroring it into the catalog purely to give
+/// `verify` something to iterate would create a third ledger able to drift from
+/// both the manifest and the store.
+///
+/// **Redaction non-exposure is structural.** The only things this reads are
+/// `manifest.json` and the store's own `*.zst`. It never opens the live tree and
+/// never opens `quarantine/`, so no un-redacted byte is reachable from here; and
+/// decompressed bytes are hashed and dropped inside the loop below — no finding
+/// carries content, so there is no path from a stored byte to the output.
+/// **Cannot fail the command.** The catalog pass and this one attest to
+/// different ledgers and neither is a precondition of the other, so a scratch
+/// root that will not enumerate is a refusal of *this* pass — reported, with the
+/// catalog results still emitted. Per-pass doubt degrades; only global doubt
+/// aborts, the rule §5 already applies to the GC commit loop.
+pub fn verify_stores(
+    archive_dir: &Path,
+    session: Option<&OsStr>,
+    exclusive: bool,
+) -> ScratchVerifyReport {
+    let mut report = ScratchVerifyReport::new(exclusive);
+    let root = store_root(archive_dir);
+    // The root gets the same classification a key does. `read_dir` follows a
+    // symlink, so without this the whole store could be read from outside the
+    // archive tree — and every finding below would be drawn from a foreign
+    // ledger. "A foreign ledger must not be read at all" is not a rule about
+    // keys; it is a rule about store paths, and the root is one.
+    match classify_store_dir(&root) {
+        // A store that has never archived scratch is not a defect (W1/R8).
+        StoreDir::Absent => return report,
+        StoreDir::Foreign => {
+            report.push(SCRATCH_ROOT, "", ScratchIssue::ForeignStoreDir);
+            return report;
+        }
+        StoreDir::Own => {}
+    }
+    let Ok(dir) = std::fs::read_dir(&root) else {
+        report.push(SCRATCH_ROOT, "", ScratchIssue::UnreadableStoreRoot);
+        return report;
+    };
+
+    let mut keys: Vec<(String, PathBuf)> = Vec::new();
+    for e in dir.flatten() {
+        let key = e.file_name().to_string_lossy().into_owned();
+        // A uuid selects the one store dir carrying it; keys are unique per
+        // session, so at most one matches.
+        if session.is_some_and(|u| !store_key_matches_session(&key, u)) {
+            continue;
+        }
+        keys.push((key, e.path()));
+    }
+    keys.sort();
+
+    for (key, store_dir) in keys {
+        report.keys += 1;
+        verify_one_store(&mut report, &key, &store_dir);
+    }
+    report
+}
+
+fn verify_one_store(report: &mut ScratchVerifyReport, key: &str, store_dir: &Path) {
+    // A store path that is not a directory yomi owns may point anywhere, and
+    // every fact drawn through it is foreign. The fourth caller of the one
+    // predicate the writer, the reconciler and the GC gate already share.
+    if classify_store_dir(store_dir) != StoreDir::Own {
+        report.push(key, "", ScratchIssue::ForeignStoreDir);
+        return;
+    }
+    let mf = match read_manifest_at(&store_dir.join("manifest.json")) {
+        ManifestRead::Ok(mf) => mf,
+        ManifestRead::Missing => {
+            report.push(key, "", ScratchIssue::NoManifest);
+            return;
+        }
+        ManifestRead::Unreadable => {
+            report.push(key, "", ScratchIssue::UnreadableManifest);
+            return;
+        }
+    };
+
+    // Everything artifact-shaped in the store, split by what S1 can speak about.
+    let mut regular: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    for e in walkdir::WalkDir::new(store_dir)
+        .into_iter()
+        .filter_map(std::result::Result::ok)
+    {
+        if e.path().extension().and_then(|x| x.to_str()) != Some("zst") {
+            continue;
+        }
+        if e.file_type().is_file() {
+            regular.insert(e.path().to_path_buf());
+        } else {
+            report.push(
+                key,
+                &store_rel_display(store_dir, e.path()),
+                ScratchIssue::ForeignArtifact,
+            );
+        }
+    }
+
+    // Artifacts some entry explains, whether by claiming them or by disclaiming
+    // them. The orphan sweep below reports what is left, so one object never
+    // draws two names: an artifact a `stored: false` entry sits on is reported
+    // once, as the more specific `UnclaimedArtifact`.
+    let mut accounted: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let mut undecodable = false;
+    for entry in &mf.entries {
+        let Some(rel) = entry.rel() else {
+            undecodable = true;
+            report.push(key, &entry.path, ScratchIssue::UndecodableEntry);
+            continue;
+        };
+        let artifact = store_dir.join(rel.store_rel());
+        if !entry.stored {
+            // S1, the other direction: the ledger disclaims bytes the store holds.
+            if regular.contains(&artifact) {
+                accounted.insert(artifact);
+                report.push(key, &entry.path, ScratchIssue::UnclaimedArtifact);
+            }
+            continue;
+        }
+        if !regular.contains(&artifact) {
+            report.push(key, &entry.path, ScratchIssue::MissingArtifact);
+            continue;
+        }
+        accounted.insert(artifact.clone());
+        let Some(content_sha) = &entry.content_sha256 else {
+            // S2 does not apply. Not a defect — the pre-D2/R1 population.
+            report.push(key, &entry.path, ScratchIssue::NoContentHash);
+            continue;
+        };
+        // Decompressed here, hashed, and dropped: no finding carries content.
+        let intact = std::fs::read(&artifact)
+            .ok()
+            .and_then(|raw| crate::archive::compress::decompress_all(&raw).ok())
+            .is_some_and(|plain| &crate::util::sha256_hex(&plain) == content_sha);
+        if intact {
+            report.verified += 1;
+        } else {
+            report.push(key, &entry.path, ScratchIssue::ContentMismatch);
+        }
+    }
+
+    // The orphan sweep is only sound when every artifact *can* be named. An
+    // undecodable entry's `store_rel()` is unknowable, so an artifact left over
+    // here may well be that entry's — and calling it unclaimed would be the very
+    // mistake reconciliation refuses to make when it declines to prune such a
+    // key. The key-level refusal below says so instead.
+    if undecodable {
+        report.push(key, "", ScratchIssue::UnreconcilableKey);
+    } else {
+        for orphan in regular.difference(&accounted) {
+            report.push(
+                key,
+                &store_rel_display(store_dir, orphan),
+                ScratchIssue::OrphanArtifact,
+            );
+        }
+    }
+}
+
+fn store_rel_display(store_dir: &Path, path: &Path) -> String {
+    path.strip_prefix(store_dir)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .into_owned()
 }
 
 #[cfg(test)]
@@ -525,6 +964,105 @@ mod tests {
         assert_eq!(
             store_key(OsStr::new("_he"), OsStr::new("x--y")),
             "_he--x--y"
+        );
+    }
+
+    /// A suffix test cannot address a hex key, and the failure is silent: zero
+    /// keys matched, exit 0, indistinguishable from a clean check.
+    #[test]
+    fn session_resolver_addresses_both_key_forms() {
+        let uuid = OsStr::new("aaaa1111-2222-3333-4444-555555555555");
+        let plain = store_key(OsStr::new("-home-test"), uuid);
+        assert!(store_key_matches_session(&plain, uuid));
+
+        // The hex form the old `ends_with("--<uuid>")` could never match.
+        let hexed = store_key(&os(b"-proj-\xff"), uuid);
+        assert!(hexed.starts_with(HEX_KEY_PREFIX), "{hexed} is not encoded");
+        assert!(
+            store_key_matches_session(&hexed, uuid),
+            "a hex-encoded key could not be addressed by its real uuid: {hexed}"
+        );
+
+        // A non-UTF-8 *uuid* is likewise addressable, by its bytes.
+        let odd_uuid = os(b"sess-\xfe");
+        let both_hexed = store_key(&os(b"-proj-\xff"), &odd_uuid);
+        assert!(store_key_matches_session(&both_hexed, &odd_uuid));
+        assert!(!store_key_matches_session(&both_hexed, &os(b"sess-\xff")));
+    }
+
+    /// Dispatch on the key's form rather than trying both, or a plain uuid that
+    /// happens to spell a hex field would address the wrong session.
+    #[test]
+    fn session_resolver_does_not_confuse_the_two_forms() {
+        // `hex("11") == "3131"`, so this key's *real* uuid is `11`.
+        let key = store_key(&os(b"\xff"), OsStr::new("11"));
+        assert_eq!(key, "_hex--ff--3131");
+        assert!(store_key_matches_session(&key, OsStr::new("11")));
+        assert!(
+            !store_key_matches_session(&key, OsStr::new("3131")),
+            "a plain uuid matched a hex field it merely looks like"
+        );
+        // And a plain key is never parsed as hex.
+        let plain = store_key(OsStr::new("-s"), OsStr::new("u"));
+        assert!(store_key_matches_session(&plain, OsStr::new("u")));
+        assert!(!store_key_matches_session(&plain, OsStr::new("-s")));
+    }
+
+    /// Only comparative findings move, and only their class moves.
+    #[test]
+    fn exclusion_downgrades_exactly_the_comparative_findings() {
+        use ScratchIssue::*;
+        let comparative = [
+            NoManifest,
+            MissingArtifact,
+            UnclaimedArtifact,
+            OrphanArtifact,
+            ContentMismatch,
+        ];
+        let standing = [
+            ForeignStoreDir,
+            UnreadableStoreRoot,
+            StoreKeyCollision,
+            UnreadableManifest,
+            UndecodableEntry,
+            UnreconcilableKey,
+            NoContentHash,
+            ForeignArtifact,
+        ];
+        for i in comparative {
+            assert!(i.requires_exclusion(), "{} must downgrade", i.as_str());
+            assert_eq!(i.class(), ScratchClass::Violation);
+        }
+        for i in standing {
+            assert!(
+                !i.requires_exclusion(),
+                "{} must stand without the lock",
+                i.as_str()
+            );
+        }
+
+        // A downgraded finding keeps its issue name and stops failing the run.
+        let mut r = ScratchVerifyReport::new(false);
+        r.push("k", "a.md", OrphanArtifact);
+        assert!(r.violations.is_empty());
+        assert_eq!(r.unverifiable.len(), 1);
+        assert_eq!(r.unverifiable[0].issue.as_str(), "OrphanArtifact");
+        assert_eq!(r.unverifiable[0].class, ScratchClass::Unverifiable);
+        assert!(!r.failed(), "a downgraded finding failed the run");
+
+        // Under exclusion the same finding is a violation.
+        let mut r = ScratchVerifyReport::new(true);
+        r.push("k", "a.md", OrphanArtifact);
+        assert_eq!(r.violations.len(), 1);
+        assert!(r.failed());
+
+        // A standing finding fails the run in either condition.
+        let mut r = ScratchVerifyReport::new(false);
+        r.push("k", "", ForeignStoreDir);
+        assert_eq!(r.refused.len(), 1);
+        assert!(
+            r.failed(),
+            "a refusal stopped failing the run without the lock"
         );
     }
 

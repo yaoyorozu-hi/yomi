@@ -186,13 +186,19 @@ pub fn evaluate_scratch(
 ) -> Result<(Verdict, u64)> {
     let (bytes, newest) = tree_size_and_newest(session_dir);
 
-    let store_dir = env.archive_dir().join("_scratch").join(key);
     // Before anything is read through it. A store path that is not a real
     // directory may point anywhere, and every fact this gate would draw from it —
     // the manifest, the `.zst` — becomes foreign evidence authorizing the delete
     // of a live tree. The writer and the reconciler refuse the same path; the
     // gate's stake is the largest of the three, because its output is a deletion.
-    if crate::scratch::classify_store_dir(&store_dir) == StoreDir::Foreign {
+    //
+    // Both levels, because a key resolved through a foreign root is foreign even
+    // when the key directory itself classifies `Own`.
+    let root = crate::scratch::store_root(&env.archive_dir());
+    let store_dir = root.join(key);
+    if crate::scratch::classify_store_dir(&root) == StoreDir::Foreign
+        || crate::scratch::classify_store_dir(&store_dir) == StoreDir::Foreign
+    {
         return Ok((
             Verdict::Unverified {
                 reason: SkipReason::ForeignStoreDir,

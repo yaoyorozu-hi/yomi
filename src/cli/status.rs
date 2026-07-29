@@ -21,10 +21,12 @@ pub struct StatusArgs {
 
 #[derive(clap::Args)]
 pub struct VerifyArgs {
-    /// Verify one session UUID.
+    /// Verify one session UUID. Omitting it verifies everything.
     pub session: Option<String>,
-    /// Verify every stored artifact.
-    #[arg(long)]
+    /// Verify every stored artifact — an explicit alias for omitting <SESSION>,
+    /// not an independent mode. Passing both is a usage error rather than a
+    /// silently ignored flag.
+    #[arg(long, conflicts_with = "session")]
     pub all: bool,
 }
 
@@ -142,11 +144,33 @@ pub fn run_verify(env: &Env, args: &VerifyArgs, json: bool) -> Result<i32> {
         }
     }
 
+    // Scratch has no catalog row, so `verify_rows()` cannot reach it. Its pass is
+    // manifest-driven — the manifest is the ledger the delete gate consumes, and
+    // attesting to anything else would be attesting to the wrong thing (§5).
+    //
+    // The lock this command already takes for `verified_at` is also what makes
+    // (manifest, store) a consistent snapshot. Without it the pass can confirm
+    // but not accuse, so comparative findings downgrade — see `exclusive`.
+    let scratch = crate::scratch::verify_stores(
+        &archive_dir,
+        args.session.as_deref().map(std::ffi::OsStr::new),
+        lock.is_some(),
+    );
+
     if json {
         let v = serde_json::json!({
             "verified": ok,
             "failed": failed.len(),
             "failures": failed,
+            "scratch": {
+                "exclusive": scratch.exclusive,
+                "keys": scratch.keys,
+                "verified": scratch.verified,
+                "violations": findings_json(&scratch.violations),
+                "unverifiable": findings_json(&scratch.unverifiable),
+                "foreign_matter": findings_json(&scratch.foreign_matter),
+                "refused": findings_json(&scratch.refused),
+            },
         });
         println!("{}", serde_json::to_string_pretty(&v)?);
     } else {
@@ -157,10 +181,52 @@ pub fn run_verify(env: &Env, args: &VerifyArgs, json: bool) -> Result<i32> {
                 println!("  {f}");
             }
         }
+        println!(
+            "Scratch: {} store dirs, {} artifacts verified.",
+            scratch.keys, scratch.verified
+        );
+        if !scratch.exclusive {
+            println!(
+                "  not exclusive: the write lock was unavailable, so a concurrent \
+                 archive may be mid-write. Findings that compare the ledger against \
+                 the store are reported as unverifiable rather than as defects."
+            );
+        }
+        // Only violations and refusals are defects; the other two sections say
+        // what the ledger cannot prove and what only an operator can clear.
+        emit_findings("VIOLATIONS", &scratch.violations);
+        emit_findings("refused keys", &scratch.refused);
+        emit_findings("unverifiable", &scratch.unverifiable);
+        emit_findings("foreign matter", &scratch.foreign_matter);
     }
-    Ok(if failed.is_empty() {
+    Ok(if failed.is_empty() && !scratch.failed() {
         EXIT_OK
     } else {
         EXIT_PARTIAL
     })
+}
+
+fn findings_json(v: &[crate::scratch::ScratchFinding]) -> Vec<serde_json::Value> {
+    v.iter()
+        .map(|f| {
+            serde_json::json!({
+                "key": f.key, "rel": f.rel, "issue": f.issue.as_str(),
+                "class": f.class.as_str(),
+            })
+        })
+        .collect()
+}
+
+fn emit_findings(label: &str, v: &[crate::scratch::ScratchFinding]) {
+    if v.is_empty() {
+        return;
+    }
+    println!("  {label} ({}):", v.len());
+    for f in v {
+        if f.rel.is_empty() {
+            println!("    {} — {}", f.key, f.issue.as_str());
+        } else {
+            println!("    {} {} — {}", f.key, f.rel, f.issue.as_str());
+        }
+    }
 }
