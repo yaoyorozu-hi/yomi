@@ -232,6 +232,74 @@ pub struct ScratchEntry {
     /// as it did.
     #[serde(default, skip_serializing_if = "is_false")]
     pub capture_failed: bool,
+    /// Which policy rule declined to store this file, recorded rather than
+    /// reconstructed.
+    ///
+    /// The manifest used to record only the outcome, so a reader explaining a
+    /// `stored: false` entry had to infer the cause from the config in force
+    /// *now* — which is not the one that produced the entry. Widen `file_cap`
+    /// after the fact and an entry rejected at capture for exceeding the old cap
+    /// is thereafter explained as "the globs did not admit it": a confident,
+    /// wrong answer. A retained entry makes it worse still, since it carries a
+    /// decision taken under a config several changes old. Recorded here, the
+    /// explanation travels with the entry and stays true.
+    ///
+    /// `over_total_cap` and `capture_failed` are deliberately **not** in this
+    /// set: the first is a property of the tree and lives on the manifest, and
+    /// the second answers a different question — *nothing was read*, rather than
+    /// *we decided not to keep it*.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_stored: Option<NotStored>,
+    /// The candidate's inode was on the denylist, so it was never opened —
+    /// §4 forbids opening a blacklisted path for read or delete.
+    ///
+    /// Manifested (with `bytes: 0` and no `stat`, so nothing about the denied
+    /// inode is recorded) purely so the tree's refusal is diagnosable: an
+    /// unmanifested file made the GC gate refuse forever, reported only as
+    /// `NoCatalogRow`. Safety is unchanged — `remove_tree_guarded` already
+    /// aborts a whole-tree removal on a denylisted inode.
+    ///
+    /// It belongs beside `capture_failed`, not inside `not_stored`: both say
+    /// *nothing was read*, where `not_stored` says *we decided not to keep it*.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub blacklisted: bool,
+}
+
+/// The policy rule that declined to store a file — exactly the three causes
+/// `store = allow.is_match && !deny.is_match && size <= file_cap` can produce.
+///
+/// `NotAllowed` and `Denied` are kept apart because they call for different
+/// configuration edits: adding an allow pattern versus removing a deny one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotStored {
+    /// No `[scratch] allow` glob matched.
+    NotAllowed,
+    /// A `[scratch] deny` glob matched.
+    Denied,
+    /// Larger than `[scratch] file_cap` as it stood at capture.
+    FileCap,
+}
+
+impl NotStored {
+    /// Phrased so every variant names the rule set an operator would edit, and
+    /// the parenthetical names which half of it decided.
+    pub fn reason(self) -> &'static str {
+        match self {
+            NotStored::NotAllowed => {
+                "the [scratch] allow/deny globs did not admit it (no allow glob matched)"
+            }
+            NotStored::Denied => {
+                "the [scratch] allow/deny globs did not admit it (a deny glob matched)"
+            }
+            // Deliberately without the cap's value: that would come from the
+            // config in force now, and the whole point of recording the cause is
+            // that the explanation does not move when the config does.
+            NotStored::FileCap => {
+                "it was over the [scratch] file_cap in force when it was captured"
+            }
+        }
+    }
 }
 
 fn present_default() -> bool {
@@ -249,17 +317,24 @@ fn is_false(flag: &bool) -> bool {
 impl ScratchEntry {
     /// A fresh entry for `rel`, with no hashes yet — the writer fills those in
     /// only after the bytes are actually stored.
-    pub fn new(rel: &ScratchRel, bytes: u64, stored: bool) -> Self {
+    ///
+    /// `stored` is derived from `not_stored` rather than passed alongside it, so
+    /// the two cannot be written into contradiction. (The tree cap flips
+    /// `stored` afterwards without a policy cause; `stored: true` still implies
+    /// `not_stored: None`.)
+    pub fn new(rel: &ScratchRel, bytes: u64, not_stored: Option<NotStored>) -> Self {
         let (path, path_hex) = rel.manifest_fields();
         ScratchEntry {
             path,
             path_hex,
             bytes,
-            stored,
+            stored: not_stored.is_none(),
             source_sha256: None,
             content_sha256: None,
             present: true,
             capture_failed: false,
+            not_stored,
+            blacklisted: false,
         }
     }
 
@@ -510,16 +585,44 @@ impl ScratchStore {
     /// path that is eventually opened is derived from the manifest and never from
     /// user input.
     pub fn find(&self, wanted: &OsStr) -> Option<StoredEntry<'_>> {
-        self.manifest.entries.iter().find_map(|entry| {
-            let rel = entry.rel()?;
-            if rel.as_bytes() != wanted.as_bytes() {
-                return None;
-            }
-            Some(StoredEntry {
-                store: self,
-                entry,
-                rel,
+        let matched: Vec<(&ScratchEntry, ScratchRel)> = self
+            .manifest
+            .entries
+            .iter()
+            .filter_map(|entry| {
+                let rel = entry.rel()?;
+                if rel.as_bytes() != wanted.as_bytes() {
+                    return None;
+                }
+                Some((entry, rel))
             })
+            .collect();
+        if matched.len() > 1 {
+            // A damaged ledger, and the one moment retrieval matters most. Every
+            // row here names the same identity and therefore the same artifact
+            // path, so choosing between them cannot answer about the wrong file
+            // — unlike an ambiguous *key*, where guessing would read a different
+            // session. Refusing would deny bytes that are demonstrably on disk
+            // and add nothing to safety, since reading destroys nothing: "a
+            // ledger yomi cannot read is a reason to refuse to *destroy*", not a
+            // reason to withhold. Prefer the row the store corroborates, and say
+            // the ledger is damaged rather than resolve it silently.
+            tracing::warn!(
+                key = %self.key,
+                rel = %String::from_utf8_lossy(wanted.as_bytes()),
+                rows = matched.len(),
+                "the ledger holds more than one entry for this identity; serving the \
+                 one the store corroborates. Run `yomi verify` and repair the manifest."
+            );
+        }
+        let (entry, rel) = matched
+            .iter()
+            .find(|(e, _)| e.stored)
+            .or_else(|| matched.first())?;
+        Some(StoredEntry {
+            store: self,
+            entry,
+            rel: rel.clone(),
         })
     }
 }
@@ -1408,7 +1511,7 @@ mod tests {
     #[test]
     fn utf8_entry_serializes_without_the_hex_field() {
         let rel = live("/tmp/s/uuid", b"scratchpad/a.md").unwrap();
-        let mut e = ScratchEntry::new(&rel, 7, true);
+        let mut e = ScratchEntry::new(&rel, 7, None);
         e.source_sha256 = Some("aa".into());
         e.content_sha256 = Some("bb".into());
         assert_eq!(
@@ -1416,11 +1519,14 @@ mod tests {
             r#"{"path":"scratchpad/a.md","bytes":7,"stored":true,"source_sha256":"aa","content_sha256":"bb"}"#
         );
 
+        // A non-stored entry carries the recorded cause and nothing else; the
+        // pre-`not_stored` shape is what an *unknown* cause still serializes to,
+        // which is what keeps an old manifest readable unchanged.
         let odd = live("/tmp/s/uuid", b"scratchpad/n-\xff.md").unwrap();
-        let e = ScratchEntry::new(&odd, 3, false);
+        let e = ScratchEntry::new(&odd, 3, Some(NotStored::Denied));
         assert_eq!(
             serde_json::to_string(&e).unwrap(),
-            r#"{"path":"scratchpad/n-\u{fffd}.md","path_hex":"736372617463687061642f6e2dff2e6d64","bytes":3,"stored":false}"#
+            r#"{"path":"scratchpad/n-\u{fffd}.md","path_hex":"736372617463687061642f6e2dff2e6d64","bytes":3,"stored":false,"not_stored":"denied"}"#
                 .replace("\\u{fffd}", "\u{fffd}")
         );
         assert_eq!(e.rel().unwrap(), odd);

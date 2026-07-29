@@ -46,7 +46,7 @@ jobs:
         run: cargo build --locked
 
       - name: cargo test
-        run: cargo test --locked
+        run: cargo test --locked --no-fail-fast
 
   lint:
     # Pinned to the MSRV so the gate is deterministic: a new clippy release can
