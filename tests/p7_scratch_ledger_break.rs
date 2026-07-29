@@ -744,6 +744,15 @@ fn p7_credential_hardlink_swapped_in_after_the_walk_captures_nothing() {
         "the displaced file's entry was neither retained nor marked uncaptured; \
          it is being treated as an ordinary live file: {e}"
     );
+    // `present: false` is the conservative "treat it as gone" reading, not a
+    // claim about whether the *name* is occupied. `blacklisted: true` is what
+    // answers that, stamped onto the retained entry after the tail — which is
+    // why retention above is untouched by it (D-S5).
+    assert_eq!(
+        e["blacklisted"], true,
+        "the denylisted inode occupying this name is recorded nowhere, so the \
+         tree's permanent refusal has no stated reason: {e}"
+    );
     assert!(
         zst_under(&fx.store_dir())
             .iter()

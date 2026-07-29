@@ -334,6 +334,12 @@ mod scratch {
         v
     }
 
+    /// `quarantined` is deliberately not among these fields. This command's
+    /// non-exposure boundary is that it never opens, names, or points at
+    /// `quarantine/`, and under the mirror rule (§4) an entry's quarantine path
+    /// is derivable from its own identity — so a per-entry "an original is over
+    /// there" flag is a pointer at the tree. The stored bytes already answer the
+    /// reader's question: a quarantined entry reads back as the opaque marker.
     fn entry_json(e: &ScratchEntry) -> serde_json::Value {
         let mut v = serde_json::json!({
             "rel": e.path,
@@ -341,6 +347,8 @@ mod scratch {
             "stored": e.stored,
             "present": e.present,
             "capture_failed": e.capture_failed,
+            "blacklisted": e.blacklisted,
+            "not_stored": e.not_stored.map(|c| c.as_str()),
             "source_sha256": e.source_sha256,
             "content_sha256": e.content_sha256,
         });
@@ -387,6 +395,12 @@ mod scratch {
             }
             if e.capture_failed {
                 flags.push("capture failed");
+            }
+            // Named here because a denylisted name is why its tree is refused
+            // forever, and the refusal was otherwise reported nowhere a human
+            // looks (D-S5).
+            if e.blacklisted {
+                flags.push("denylisted");
             }
             println!("  {:>10}  {}  [{}]", e.bytes, e.path, flags.join(", "));
         }

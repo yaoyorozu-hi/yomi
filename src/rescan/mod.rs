@@ -193,8 +193,12 @@ pub fn commit(
         // (Deliberate ordering: the security invariant is DB-commit-before-rename,
         // which this respects; moving quarantine earlier only guards recoverability.)
         if rr.transition != Transition::InPlaceRedact {
-            let qrel = c.stored_path.strip_suffix(".zst").unwrap_or(&c.stored_path);
-            if let Err(e) = quarantine_original(&quarantine_dir, &c.session_uuid, qrel, &stored) {
+            // The artifact's archive-relative stored path, which is what the
+            // mirror rule is stated over — archive and rescan now derive the
+            // same quarantine path for the same artifact instead of differing by
+            // how much of it the `<uuid>` level had already consumed.
+            let stored_rel = Path::new(&c.stored_path);
+            if let Err(e) = quarantine_original(&quarantine_dir, stored_rel, &stored) {
                 report.failed.push(fail_label(
                     c,
                     &format!("quarantine of raw original failed: {e}"),

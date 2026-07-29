@@ -153,6 +153,7 @@ fn emit(r: &Report, dry_run: bool, json: bool) {
             "flagged": r.flagged,
             "blacklisted_skipped": r.blacklisted_skipped,
             "oversize_skipped": r.oversize_skipped,
+            "quarantine_refused": r.quarantine_refused,
             "scratch_orphans_removed": r.scratch_orphans_removed,
         });
         println!("{}", serde_json::to_string(&v).unwrap_or_default());
@@ -177,6 +178,16 @@ fn emit(r: &Report, dry_run: bool, json: bool) {
     }
     if r.oversize_skipped > 0 {
         println!("{prefix}{} oversized sources skipped.", r.oversize_skipped);
+    }
+    // Loud, because the artifact is simply absent from the store until an
+    // operator acts, and nothing else in the run says so.
+    if r.quarantine_refused > 0 {
+        println!(
+            "{prefix}{} artifacts left unarchived: the unredacted original could not \
+             be written under quarantine/. Nothing was stored for them, and the \
+             sources are untouched.",
+            r.quarantine_refused
+        );
     }
     if r.scratch_orphans_removed > 0 {
         let verb = if dry_run { "would be" } else { "were" };

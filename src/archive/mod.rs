@@ -31,6 +31,11 @@ pub struct Report {
     pub flagged: u64,
     pub blacklisted_skipped: u64,
     pub oversize_skipped: u64,
+    /// Artifacts left unarchived because their unredacted original could not be
+    /// written to `quarantine/`. Counted, not merely logged: the artifact is
+    /// silently absent from the store until the cause is fixed, and stderr is
+    /// discarded under cron.
+    pub quarantine_refused: u64,
     /// Stored scratch artifacts the new manifest no longer claims, removed to
     /// keep the store dir and the manifest one ledger. Counted (not performed)
     /// under `--dry-run`. Surfaced because a config change that discards stored
@@ -98,7 +103,6 @@ impl<'a> Archiver<'a> {
                 &bytes,
                 &session_dir,
                 "transcript.jsonl.zst",
-                &session.session_uuid,
                 prior_frames(&prior_manifest, &session.transcript),
                 report,
             )? {
@@ -118,7 +122,6 @@ impl<'a> Archiver<'a> {
                     &bytes,
                     &session_dir,
                     &rel,
-                    &session.session_uuid,
                     prior_frames(&prior_manifest, sub),
                     report,
                 )? {
@@ -136,7 +139,6 @@ impl<'a> Archiver<'a> {
                     &bytes,
                     &session_dir,
                     &rel,
-                    &session.session_uuid,
                     report,
                 )? {
                     outs.push(out);
@@ -156,7 +158,6 @@ impl<'a> Archiver<'a> {
                     &bytes,
                     &session_dir,
                     &rel,
-                    &session.session_uuid,
                     Vec::new(),
                     report,
                 )? {
@@ -265,7 +266,6 @@ impl<'a> Archiver<'a> {
             &bytes,
             &self.env.archive_dir(),
             &rel,
-            &uuid,
             prior_frames,
             report,
         )?;
@@ -386,10 +386,22 @@ impl<'a> Archiver<'a> {
 
         let mut entries: Vec<ScratchEntry> = Vec::new();
         let mut kept: Vec<(PathBuf, ScratchRel)> = Vec::new();
+        let mut denied: Vec<ScratchRel> = Vec::new();
         let mut total: u64 = 0;
         for path in &candidates {
             if self.blacklist.is_blacklisted(path) {
                 report.blacklisted_skipped += 1;
+                // Collected, not manifested here. Two facts are in play and they
+                // are orthogonal: this identity may hold a prior run's archived
+                // copy (keep it — that `.zst` is the last copy), and its name is
+                // now occupied by a denylisted inode (refuse the tree, and say
+                // why). They were coupled only by the accident that manifesting
+                // an entry put it in the live set, which cost the first fact.
+                // Staying out of the live set leaves retention untouched; the
+                // flag is stamped after the tail is assembled.
+                if let Some(rel) = ScratchRel::from_live(&sc.session_dir, path) {
+                    denied.push(rel);
+                }
                 continue;
             }
             // Identity first: a candidate with no session-relative identity has
@@ -462,53 +474,12 @@ impl<'a> Archiver<'a> {
                 // Policy said to store this file and the read then refused it:
                 // a blacklisted inode swapped in after the walk, an I/O or
                 // permission error, or a file that outgrew the read bound
-                // between stat and read. Nothing was captured, so the entry must
-                // not go on claiming otherwise — `stored: true` with no hashes
-                // is a manifest that lies, and the gate reads it as a corrupt
-                // archive (the #9 failure mode, reached through another door).
-                //
-                // `capture_failed` keeps this apart from the bare `stored:
-                // false` that policy writes. That one means "we declined to
-                // hoard these bytes", and presence + size is then the intended
-                // assurance; this one means nothing about the content was ever
-                // read, so presence + size assures nothing and the gate refuses
-                // the tree rather than delete a file yomi meant to archive and
-                // could not.
-                //
-                // An earlier run's capture is carried forward verbatim. The live
-                // bytes are unreadable *now*; that `.zst` is the last copy of
-                // them, and dropping the claim would make reconciliation treat
-                // it as unclaimed and delete it — losing a good archive over a
-                // permission bit. Same law as a vanished file: never destroy
-                // what was already taken.
-                //
-                // The claim is grounded in the artifact actually being on disk,
-                // not in the prior ledger's word for it. Hashes are deliberately
-                // *not* required: a manifest written before D2/R1 carries none,
-                // and refusing to salvage those forfeited a real, valid archive
-                // — an entry that cannot be salvaged is no more a licence to
-                // destroy its artifact than one that cannot be parsed. Their
-                // absence is carried across too, so the gate keeps treating the
-                // artifact as unverifiable rather than gaining a claim it cannot
-                // check.
+                // between stat and read.
                 let Some(bytes) = self.read_source(path, report)? else {
-                    entry.capture_failed = true;
-                    let salvaged = prior_by_rel.get(rel).filter(|p| {
-                        p.stored
-                            && std::fs::symlink_metadata(store_dir.join(rel.store_rel()))
-                                .is_ok_and(|md| md.is_file())
-                    });
-                    match salvaged {
-                        Some(p) => {
-                            entry.stored = true;
-                            entry.source_sha256.clone_from(&p.source_sha256);
-                            entry.content_sha256.clone_from(&p.content_sha256);
-                        }
-                        None => entry.stored = false,
-                    }
+                    let salvaged = salvage(entry, rel, &prior_by_rel, &store_dir);
                     tracing::warn!(
                         path = %path.display(),
-                        kept_earlier_capture = salvaged.is_some(),
+                        kept_earlier_capture = salvaged,
                         "scratch source could not be captured; this tree will not be \
                          reclaimed until it can be read"
                     );
@@ -521,8 +492,27 @@ impl<'a> Archiver<'a> {
                 let scan = self.scan_bytes(&bytes, false);
                 self.tally(report, &scan);
                 if scan.needs_quarantine {
-                    let qrel = format!("{}/{}", sc.key, entry.path);
-                    self.quarantine(&uuid_for_scratch(sc), &qrel, &bytes, report)?;
+                    // Nothing of this file may enter the store while its
+                    // unredacted original is unpreserved — the store copy is
+                    // redacted or an opaque marker, so writing it and losing the
+                    // original leaves the secret-bearing bytes only in the live
+                    // file, which the gate would then let GC reclaim. The fourth
+                    // path to `capture_failed`, and it records the same single
+                    // ledger fact as the three source-read refusals: not one byte
+                    // of this file's content was captured.
+                    if let Err(e) = self.quarantine(&dest, &bytes, report) {
+                        report.quarantine_refused += 1;
+                        let salvaged = salvage(entry, rel, &prior_by_rel, &store_dir);
+                        tracing::warn!(
+                            path = %path.display(),
+                            error = %e,
+                            kept_earlier_capture = salvaged,
+                            "the unredacted original could not be quarantined; this file \
+                             is left unarchived and its tree will not be reclaimed"
+                        );
+                        continue;
+                    }
+                    entry.quarantined = true;
                 }
                 atomic_write(&dest, &compress_frame(&scan.redacted)?)?;
                 set_600(&dest)?;
@@ -542,6 +532,24 @@ impl<'a> Archiver<'a> {
             None => (Vec::new(), true),
         };
         entries.extend(tail);
+
+        // After the tail, so a retained entry carrying this identity is already
+        // present to receive the flag. Stamping rather than appending is what
+        // keeps this from manufacturing the duplicate identity §5 reports, and
+        // doing it here rather than in the candidate loop is what keeps
+        // `entries` and `kept` — parallel vectors the store pass zips by index —
+        // in correspondence: an entry with no live file to read would break it.
+        //
+        // `present` is untouched. A file that became denylisted this run is
+        // treated as gone and its archive retained; `present: false` is that
+        // conservative reading and deliberately not a claim about whether the
+        // *name* is occupied. `blacklisted: true` is what answers that.
+        for rel in &denied {
+            match entries.iter_mut().find(|e| e.rel().as_ref() == Some(rel)) {
+                Some(e) => e.blacklisted = true,
+                None => entries.push(ScratchEntry::blacklisted(rel)),
+            }
+        }
 
         if !ledger_complete {
             tracing::warn!(
@@ -656,7 +664,6 @@ impl<'a> Archiver<'a> {
         source_bytes: &[u8],
         base_dir: &Path,
         rel: &str,
-        session_uuid: &str,
         prior_frames_vec: Vec<Frame>,
         report: &mut Report,
     ) -> Result<Option<CaptureOut>> {
@@ -721,6 +728,31 @@ impl<'a> Archiver<'a> {
             }],
         };
 
+        // The original goes to quarantine **before** the store is touched, and a
+        // failure there abandons the artifact rather than storing it anyway.
+        // Storing the redacted copy while the raw original is lost is the one
+        // ordering that destroys data: nothing downstream re-checks that the
+        // original exists, so the catalog row would let GC delete the source and
+        // the unredacted bytes would then exist nowhere. Skipping instead leaves
+        // the source untouched and the next run re-captures it — the same
+        // fail-closed shape `rescan::commit` already uses at its own quarantine
+        // step, and the same asymmetry §3 rests on: refusing wrongly is repaired
+        // by a later run, deleting wrongly is not.
+        if needs_q {
+            if self.dry_run {
+                report.quarantined += 1;
+            } else if let Err(e) = self.quarantine(&dest, full, report) {
+                report.quarantine_refused += 1;
+                tracing::warn!(
+                    source = %source.display(),
+                    error = %e,
+                    "the unredacted original could not be quarantined; this artifact \
+                     is left unarchived so the source stays the only copy of it"
+                );
+                return Ok(None);
+            }
+        }
+
         let (stored_sha, stored_bytes) = if self.dry_run {
             let frame = compress_frame(&scan.redacted)?;
             (sha256_hex(&frame), frame.len() as u64)
@@ -743,13 +775,6 @@ impl<'a> Archiver<'a> {
             (sha256_hex(&stored), stored.len() as u64)
         };
 
-        if needs_q {
-            if self.dry_run {
-                report.quarantined += 1;
-            } else {
-                self.quarantine(session_uuid, &quarantine_rel(rel), full, report)?;
-            }
-        }
         self.tally(report, &scan);
 
         let redacted_any = scan.was_redacted || self.catalog.artifact_redacted(&source_path)?;
@@ -786,7 +811,6 @@ impl<'a> Archiver<'a> {
         source_bytes: &[u8],
         base_dir: &Path,
         rel: &str,
-        session_uuid: &str,
         report: &mut Report,
     ) -> Result<Option<CaptureOut>> {
         let source_path = canonical_key(source);
@@ -804,6 +828,23 @@ impl<'a> Archiver<'a> {
         let parsed_meta = serde_json::from_slice::<serde_json::Value>(&scan.redacted).ok();
         let content_sha = sha256_hex(&scan.redacted);
 
+        // Before the store write, and abandoning the artifact on failure — see
+        // the same step in `capture`.
+        if needs_q {
+            if self.dry_run {
+                report.quarantined += 1;
+            } else if let Err(e) = self.quarantine(&dest, source_bytes, report) {
+                report.quarantine_refused += 1;
+                tracing::warn!(
+                    source = %source.display(),
+                    error = %e,
+                    "the unredacted original could not be quarantined; this artifact \
+                     is left unarchived so the source stays the only copy of it"
+                );
+                return Ok(None);
+            }
+        }
+
         let (stored_sha, stored_bytes) = if self.dry_run {
             (sha256_hex(&scan.redacted), scan.redacted.len() as u64)
         } else {
@@ -816,13 +857,6 @@ impl<'a> Archiver<'a> {
             (sha256_hex(&scan.redacted), scan.redacted.len() as u64)
         };
 
-        if needs_q {
-            if self.dry_run {
-                report.quarantined += 1;
-            } else {
-                self.quarantine(session_uuid, &quarantine_rel(rel), source_bytes, report)?;
-            }
-        }
         self.tally(report, &scan);
 
         report.artifacts_written += 1;
@@ -863,17 +897,17 @@ impl<'a> Archiver<'a> {
         report.flagged += scan.flagged as u64;
     }
 
-    fn quarantine(
-        &self,
-        session_uuid: &str,
-        rel: &str,
-        original: &[u8],
-        report: &mut Report,
-    ) -> Result<()> {
+    /// Quarantine the raw original of the artifact stored at `dest`.
+    ///
+    /// Takes the **store path** rather than a hand-built rel, so the mirror rule
+    /// — `quarantine/<X>` holds the original of `archive/<X>.zst` — is derived
+    /// from the artifact's own identity at every call site instead of being
+    /// restated three ways.
+    fn quarantine(&self, dest: &Path, original: &[u8], report: &mut Report) -> Result<()> {
+        let stored_rel = dest.strip_prefix(self.env.archive_dir()).unwrap_or(dest);
         crate::scan::quarantine::quarantine_original(
             &self.env.quarantine_dir(),
-            session_uuid,
-            rel,
+            stored_rel,
             original,
         )?;
         report.quarantined += 1;
@@ -972,12 +1006,6 @@ pub fn canonical_key(source: &Path) -> String {
         .to_string()
 }
 
-/// Quarantine sub-path for an artifact's raw original: its stored rel minus the
-/// `.zst` suffix, preserving directory structure for uniqueness (R10).
-fn quarantine_rel(rel: &str) -> String {
-    rel.strip_suffix(".zst").unwrap_or(rel).to_string()
-}
-
 /// Per-artifact scan tally for the manifest, so a merged summary folds cleanly.
 pub fn artifact_scan(scan: &crate::scan::ContentScan) -> crate::model::ArtifactScan {
     crate::model::ArtifactScan {
@@ -1025,10 +1053,6 @@ fn role_for_category(cat: &str) -> ArtifactRole {
         "_paste" => ArtifactRole::Paste,
         _ => ArtifactRole::ToolResult,
     }
-}
-
-fn uuid_for_scratch(sc: &ScratchDir) -> String {
-    format!("_scratch--{}", sc.key)
 }
 
 /// The tail a prior manifest contributes to the new one, and whether that prior
@@ -1080,6 +1104,65 @@ fn prior_tail(
     let mut out: Vec<ScratchEntry> = vanished.into_iter().map(|(_, e)| e).collect();
     out.extend(undecodable);
     (out, complete)
+}
+
+/// Record that nothing of this file's content reached the store this run, and
+/// carry an earlier run's capture forward if one is still on disk. Returns
+/// whether it was.
+///
+/// Nothing was captured, so the entry must not go on claiming otherwise —
+/// `stored: true` with no hashes is a manifest that lies, and the gate reads it
+/// as a corrupt archive (the #9 failure mode, reached through another door).
+///
+/// `capture_failed` keeps this apart from the bare `stored: false` that policy
+/// writes. That one means "we declined to hoard these bytes", and presence +
+/// size is then the intended assurance; this one means nothing of the content
+/// was captured, so presence + size assures nothing and the gate refuses the
+/// tree rather than delete a file yomi meant to archive and could not.
+///
+/// An earlier run's capture is carried forward verbatim. The live bytes are
+/// uncapturable *now*; that `.zst` is the last copy of them, and dropping the
+/// claim would make reconciliation treat it as unclaimed and delete it — losing
+/// a good archive over a permission bit. Same law as a vanished file: never
+/// destroy what was already taken.
+///
+/// The claim is grounded in the artifact actually being on disk, not in the
+/// prior ledger's word for it. Hashes are deliberately *not* required: a
+/// manifest written before D2/R1 carries none, and refusing to salvage those
+/// forfeited a real, valid archive — an entry that cannot be salvaged is no more
+/// a licence to destroy its artifact than one that cannot be parsed. Their
+/// absence is carried across too, so the gate keeps treating the artifact as
+/// unverifiable rather than gaining a claim it cannot check.
+fn salvage(
+    entry: &mut ScratchEntry,
+    rel: &ScratchRel,
+    prior_by_rel: &std::collections::HashMap<ScratchRel, &ScratchEntry>,
+    store_dir: &Path,
+) -> bool {
+    entry.capture_failed = true;
+    let prior = prior_by_rel.get(rel).filter(|p| {
+        p.stored
+            && std::fs::symlink_metadata(store_dir.join(rel.store_rel()))
+                .is_ok_and(|md| md.is_file())
+    });
+    match prior {
+        Some(p) => {
+            entry.stored = true;
+            entry.source_sha256.clone_from(&p.source_sha256);
+            entry.content_sha256.clone_from(&p.content_sha256);
+            // The carried claim is about that same `.zst`, and so is its
+            // original: the file under `quarantine/` is the unredacted source of
+            // the capture being salvaged, at the mirror of the store path this
+            // entry keeps. Drop the flag and the ledger denies an original that
+            // is still there — which law Q reads as a stray.
+            entry.quarantined = p.quarantined;
+            true
+        }
+        None => {
+            entry.stored = false;
+            false
+        }
+    }
 }
 
 /// Establish store law S for one scratch key: the `*.zst` under
