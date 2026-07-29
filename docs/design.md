@@ -330,6 +330,29 @@ never successfully created a directory in the first place — there is nothing t
 all-live tree serializes byte-identically to the pre-field schema and no manifest is rewritten merely
 by upgrading.
 
+**The manifest must record *why* an entry was not stored, not only that it was not.** It currently
+records the outcome alone, so a reader explaining a `stored: false` entry has to reconstruct the cause
+from the **current** config — and the config is not the one that produced the entry. Widen `file_cap`
+after the fact and an entry rejected at capture for exceeding the old cap is thereafter explained as
+"the allow/deny globs did not admit it": a confident, wrong answer, of the same family as reporting a
+permission bit as a replaced store path. Retained entries make it worse, since `present: false` records
+carry a decision taken under a config that may be several changes old.
+
+The addition is one entry-level field, emitted only when it applies, in the same additive shape as
+`present` and `capture_failed`:
+
+```
+not_stored: "not_allowed" | "denied" | "file_cap"
+```
+
+Exactly the three policy causes `store = allow.is_match && !deny.is_match && size <= file_cap` can
+produce, kept apart because "no allow pattern matched" and "a deny pattern matched" are different
+configuration edits. The two remaining causes already speak for themselves and take precedence in any
+explanation: `over_total_cap` is a property of the tree and lives on the manifest, and `capture_failed`
+answers a different question entirely — *nothing was read*, rather than *we decided not to keep it*.
+Recording rather than reconstructing also makes a retained entry's explanation stay true forever,
+because the field travels with the entry.
+
 **`capture_failed` exists because `stored: false` was carrying two incompatible claims.** One is
 *policy declined to hoard these bytes* — a deny glob, an over-cap tree — and there presence + size is
 the intended assurance and the tree is reclaimable (decision #4). The other is *nothing was ever
@@ -1246,9 +1269,22 @@ disjoint, the form is known from the key alone and there is never a reason to gu
 **One residual, which U6 closes for free.** The plain branch is a suffix test, and `<slug>--<uuid>` is
 not injective (§3) — so a session directory literally named `bbbb--cccc` matches the key of slug
 `-a--bbbb` and session `cccc`. This is N14 resurfacing in the resolver, reachable in pure ASCII and not
-naturally produced by Claude Code's uuids. Once the store-key hardening records `uuid_hex` in the
-manifest, **session resolution should read that field instead of parsing the key** — the manifest
-states the identity, so nothing has to be inferred from a name that cannot carry it unambiguously.
+naturally produced by Claude Code's uuids.
+
+**Under U6 the resolver still matches on the key name; the manifest only confirms.** Reading
+`uuid_hex` out of every manifest to resolve one session would make resolution cost one open per store
+and would put the identity's authority in a place the name already carries it — the plain and hex forms
+both encode `(slug, uuid)` recoverably. So: match by name as now, then read **the matched key's**
+manifest and compare `uuid_hex`. One manifest open, not N. A disagreement is not a miss but a
+`StoreKeyCollision`, which is exactly the condition U6 defines and which the resolver is otherwise the
+most likely place to encounter. The **digest form** `_h256--<sha256>` is the one exception: it encodes
+nothing recoverable and cannot be resolved from a uuid alone, so those keys — produced only by a store
+key over `KEY_MAX`, and correspondingly rare — do require reading their manifest. The cost is bounded
+by the number of digest-form keys, not by the size of the store.
+
+An index over the keys was considered and rejected: it would be a **fourth ledger** beside the
+manifest, the store and the queued catalog table, with its own drift to detect. This design has
+declined that twice already.
 
 The resolver belongs to whichever unit lands first and is **reused**, not reimplemented, by the other:
 U3 ships before U4, so U3 carries it. Shipping U3 with the suffix test and repairing it in U4 would
@@ -1524,8 +1560,8 @@ most one), and an ambiguous or absent key is exit 2 with the reason. Behaviour:
 
 | Form | Output | Exit |
 |---|---|---|
-| `--scratch` | manifest listing: `rel`, `bytes`, `stored`, `present`, plus `captured_at` / `total_bytes` / `over_total_cap` for the tree. `--json` emits the same fields plus `source_sha256` / `content_sha256` | 0, or 2 if the key resolves to nothing |
-| `--scratch --file <rel>` | the entry's decompressed stored bytes, **written raw** to stdout (`write_all`, not a lossy string conversion — a scratch file may be binary). `--json` emits `{rel, bytes, encoding, content}` where `encoding` is `"utf8"` (content verbatim) or `"hex"` (content hex-encoded) — same encoder as `path_hex`, so `--json` adds no dependency and never emits invalid UTF-8 inside a JSON string | 0 |
+| `--scratch` | manifest listing: `rel`, `rel_hex`, `bytes`, `stored`, `present`, `capture_failed`, plus `captured_at` / `total_bytes` / `over_total_cap` for the tree. `--json` adds `source_sha256` / `content_sha256` | 0, or 2 if the key resolves to nothing |
+| `--scratch --file <rel>` | the entry's decompressed stored bytes, **written raw** to stdout (`write_all`, not a lossy string conversion — a scratch file may be binary). `--json` emits `{rel, rel_hex, content_bytes, encoding, content}` where `encoding` is `"utf8"` (content verbatim) or `"hex"` (content hex-encoded) — same encoder as `path_hex`, so `--json` adds no dependency and never emits invalid UTF-8 inside a JSON string | 0 |
 | `--scratch --file <rel>`, entry `stored: false` | refusal naming *why* it was not stored — over-cap, deny-listed, over `file_cap`, or `capture_failed` (nothing was ever read) — never a bare "not found" | 2 |
 | `--scratch --file <rel>`, no matching entry | not found | 2 |
 
@@ -1534,10 +1570,89 @@ most one), and an ambiguous or absent key is exit 2 with the reason. Behaviour:
 classified before anything under it is opened, exactly as the other layers do: a `Foreign` store is
 exit 2 with its own reason, never read through.
 
+**Non-exposure and traversal are unrepresentable, not defended.** The one type that names a scratch
+store has a single constructor, which classifies the root and then the key **before** it opens
+anything beneath either — so holding the value *is* the proof that the classification happened. The
+entry handle it hands out has no public constructor of its own and its read method takes **no
+arguments**: there is no function anywhere that turns a path or a string into stored bytes. A `--file`
+value is compared against each entry's `ScratchRel::as_bytes()` and discarded; what is opened is the
+*matched entry's* identity, and a `ScratchRel` cannot hold `..` or an absolute path (§3). The
+guarantees §3 states for the read path are therefore properties of the type, not of the caller's care.
+
+**Every output field a user is expected to pass back carries the lossless form.** `rel` is the lossy
+display value and can never be handed to `--file`; `rel_hex` accompanies it whenever the name is not
+valid UTF-8. Without it a non-UTF-8 entry can be *listed but not fetched* — a hole in retrieval for the
+exact population `path_hex` exists to serve. Two gaps remain and are queued (§9 P6.5): the human
+listing shows no hint that an entry's `rel` is undisplayable, and there is no `--file-hex <HEX>` to
+pass the identity back without shell byte-escaping.
+
+**`bytes` means one thing in this command.** The listing's `bytes` is the manifest's value — the live
+source size at capture, **before** redaction. The retrieved payload's length is therefore a *different
+quantity* whenever an entry was redacted, and it is emitted under a different name, `content_bytes`.
+Reusing `bytes` for both would put two claims behind one name in two outputs of one command, which is
+the defect `capture_failed` split out of `stored: false`, and the defect `NoCatalogRow` still carries
+on the scratch path. If the manifest value is ever wanted alongside the payload, it goes as
+`source_bytes` — the name §2 already uses for exactly that quantity.
+
+**The positional accepts hyphen-leading values, and must.** Every real store key begins with `-`: a
+key is `<slug>--<uuid>` and a slug is a cwd with its separators replaced, so it starts `-home-…`.
+Without `allow_hyphen_values` the documented "or a full store key" form is unusable for **every key
+that exists** — the argument parser reads it as an unknown flag. The `--` end-of-options escape
+remains available and equivalent; this only removes the requirement to know it. `--scratch` is not
+swallowed as the positional's value when the positional is omitted (that is a required-argument
+error), and a mistyped flag becomes a selector that resolves to nothing rather than a silent success.
+
+**`--scratch` conflicts with `--entry`, `--agents`, `--grep` and `--raw`; `--file` requires
+`--scratch`.** They read a different ledger, and accepting one alongside the other while silently
+honouring only one is the failure mode `--all` had. Same standard as `verify --all`.
+
+**Refusals carry a stable code beside the prose.** `--json` emits `{"error": "<code>", "reason":
+"<prose>"}` so a caller branches on the code and never parses the sentence — the same two-layer shape
+`gc.log` uses for its skip reasons. Codes: `NoScratchStore`, `ForeignStoreRoot`, `UnreadableStoreRoot`,
+`NotFound`, `Ambiguous`, `ForeignStoreDir`, `NoManifest`, `UnreadableManifest`, `NotStored`. `NotFound`
+(no such entry) and `NotStored` (the entry exists, its bytes do not) are deliberately distinct: the
+questions differ and so do the remedies. An `Ambiguous` selector is never guessed between.
+
+**`ForeignStoreRoot` and `ForeignStoreDir` are distinct, and `verify` must adopt the same split.**
+§8's rule for `archive` — a root refusal and a key refusal do not share a field, because one skips
+every tree and the other skips one — is a rule about *names* for the same reason it is a rule about
+fields. `verify` currently reports both as `ForeignStoreDir`, distinguished only by filing the root's
+finding under the key `_scratch`. The `_scratch` filing convention is right and stays; the shared issue
+name is not, and splitting it makes the two commands describe one condition one way (§9 P6.5).
+
+**One selector grammar, one implementation.** `read --scratch` accepts a session uuid **or** a full
+store key; `verify` accepts only a uuid, and its positional does not allow hyphen-leading values — so
+`yomi verify <full-key>` cannot even be typed, and if escaped it matches nothing and reports "0 store
+dirs, exit 0". That is the same false-negative shape as the hex-key resolver defect (§5), in the same
+command, one round later. Both halves of the question — "is this key named by this selector?" — belong
+in a single `store_key_selected_by(key, selector)` in `src/scratch.rs`, used by both commands, with
+`verify`'s positional taking `allow_hyphen_values` too. A selector that matches no store must be an
+explicit outcome in `verify`, not silence (§9 P6.5).
+
 The listing shows `present: false` and `capture_failed: true` explicitly rather than folding them into
 `stored`, because those are the two states where a reader's natural question ("why can I not get these
 bytes?") has a different answer and a different remedy: an archive-only copy that is still there, and
 a file that was never captured at all.
+
+**A missing artifact is exit 2, not exit 1.** `archive` writes artifacts *before* the manifest (§3), so
+a concurrent run leaves a window in which the ledger claims an artifact the store does not yet hold.
+Reading it currently propagates an I/O error and exits 1, which §8 reserves for the tool failing — but
+nothing failed: the bytes are not there *yet*. This is the read-side face of §5's non-snapshot
+condition, and read's correct response differs from verify's because **read does not accuse**: it
+cannot downgrade a finding, it can only state the fact. So it reports a coded exit-2 refusal that says
+the ledger claims these bytes and the store does not have them, **without asserting a cause** — a race
+and a genuine S1 violation are indistinguishable from here, and `yomi verify` run exclusively is the
+thing that can tell them apart. The same applies to an artifact that will not decompress: a store
+defect is exit 2 with a code, not a tool error (§9 P6.5).
+
+**A field the ledger does not carry must not be rendered as a value it does.** `ScratchManifest` gives
+every scalar `#[serde(default)]` so that a manifest predating a field still parses (§3) — and the
+listing then prints those defaults as data: `captured_at: ""` reads as an empty capture time,
+`total_bytes: 0` as an empty tree, neither distinguishable from the real thing. `verify` never looks at
+them so it was harmless there; `read` shows them to a person. The scalars a reader is shown become
+`Option`, written as `Some` by archive on every manifest (so serialized output is unchanged) and
+rendered as *unknown* when absent — the same "absent means something" the `present` and
+`capture_failed` flags already rely on (§9 P6.5).
 
 **`archive` report fields for scratch.** `--json` and the human summary both carry:
 
@@ -1617,7 +1732,7 @@ yomi/
   tests/  e2e.rs · p4_gc_break.rs · p4_toctou_break.rs · p4_umask_break.rs · p4_unlink_break.rs
           p5_scratch_cap_break.rs · p6_scratch_ledger_break.rs · p7_scratch_ledger_break.rs
           p8_scratch_capture_break.rs
-          p9_scratch_verify_break.rs · p10_scratch_verify_break.rs
+          p9_scratch_verify_break.rs · p10_scratch_verify_break.rs · p11_scratch_read_break.rs
           # fixtures are fabricated in-test under a tmpdir; no committed fixtures/ tree
 ```
 
@@ -1673,7 +1788,7 @@ Load-bearing fixtures: secret-scan **must** catch AKIA/PRIVATE KEY; double-archi
   2. **Enumeration + reconciliation** — the writer walks the whole `<slug>/<uuid>/`; archive
      establishes S1 by removing unclaimed `*.zst` under the tree's own store dir; vanished-file
      entries are retained `present: false`; `scratch_orphans_removed` in the run report, previewed
-     under `--dry-run`. **(implemented; in review)**
+     under `--dry-run`. **(merged)**
 
      Adversarial testing during U2 added five constructs the unit was not designed with, each now a
      contract in §3: `capture_failed` (a capture that never happened is not a policy decision not to
@@ -1690,7 +1805,7 @@ Load-bearing fixtures: secret-scan **must** catch AKIA/PRIVATE KEY; double-archi
      salvaged, and a store directory that is not ours.
   3. **`yomi verify` scratch pass** — S1 and S2 per store dir, in the three vocabularies of §5
      (`violation` / `unverifiable` / `foreign matter`), plus refused keys. Manifest-driven; no catalog
-     schema change and no migration. **(implemented; in review)**
+     schema change and no migration. **(merged)**
 
      The three checks §5 forbids are not merely omitted but structurally absent — `verify_stores`
      contains no reference to `source_sha256` or `entry.bytes` at all. Four additions the unit made to
@@ -1711,11 +1826,46 @@ Load-bearing fixtures: secret-scan **must** catch AKIA/PRIVATE KEY; double-archi
      itself classifies `Own`. `tests/p9_scratch_verify_break.rs` and
      `tests/p10_scratch_verify_break.rs` pin the vocabulary and attack its boundary.
   4. **`yomi read --scratch`** — manifest listing and stored-bytes retrieval, stored-only by
-     construction. Independent of (3); may land in parallel. **Reuses** (3)'s session→key resolver.
-  5. **Defect sweep D-S1 … D-S7** (§3). D-S1 (the GC gate reads a live scratch file outside the
-     blacklist gate) and D-S2 (a scratch quarantine path keyed by the lossy name) are invariant
-     repairs and should not wait on (3)/(4); D-S3/D-S4 (per-key failure containment and refusal
-     reporting) are prerequisites for anything unattended; D-S5/D-S6/D-S7 are diagnosability.
+     construction. Reuses (3)'s session→key resolver. **(implemented; in review)**
+
+     The unit's result is that §3's read-path guarantees stopped being promises about caller discipline
+     and became properties of a type: one constructor that classifies root then key before opening
+     anything beneath either, an entry handle with no public constructor, and a read method that
+     **takes no arguments** — so no function exists anywhere that turns a path or a string into stored
+     bytes. Traversal is not defended against; it is unrepresentable (§8). This is the fifth layer to
+     go through `classify_store_dir`.
+
+     Five deviations from §8, all adopted and now written there: `allow_hyphen_values` on the positional
+     (**the documented "full store key" form was unusable for every key that exists**, since every slug
+     begins `-`), `rel_hex` in the listing and in `--file --json` (without it a non-UTF-8 entry can be
+     listed but not fetched), `conflicts_with` against the transcript flags and `requires` on `--file`
+     (the `--all` standard), and stable `{error, reason}` codes with `NotFound` and `NotStored` kept
+     apart. The fifth was referred for a ruling and **partly overturned**: the retrieved payload's
+     length is the right quantity to emit, but not under the name `bytes`, which the listing already
+     uses for the manifest's pre-redaction source size — it is `content_bytes` (§8).
+  5. **Defect sweep.** D-S1 (the GC gate reads a live scratch file outside the blacklist gate) and
+     D-S2 (a scratch quarantine path keyed by the lossy name) are invariant repairs and should not wait
+     on (3)/(4); D-S3/D-S4 (per-key failure containment and refusal reporting) are prerequisites for
+     anything unattended; D-S5/D-S6/D-S7 are diagnosability. Joined by what (3) and (4) surfaced,
+     grouped by the change each needs:
+
+     - **`ScratchEntry` schema** — one edit adding D-S5's `blacklisted` (which joins `capture_failed`
+       on the refusing side) and `not_stored` (§3): the manifest must record *why* an entry was not
+       stored, because reconstructing the cause from the current config answers confidently and wrongly
+       once a cap has been widened.
+     - **Manifest scalars a reader is shown become `Option`** (§8), so a field the ledger does not carry
+       is rendered *unknown* rather than as `""` or `0`.
+     - **Exit-code correctness in `read --scratch`** (§8): a claimed artifact the store does not hold —
+       or one that will not decompress — is a coded exit 2, not the exit 1 that means the tool failed.
+     - **One selector grammar** (§8): `store_key_selected_by(key, selector)` shared by `verify` and
+       `read`, `allow_hyphen_values` on `verify`'s positional, and a selector matching no store reported
+       explicitly by `verify` rather than as "0 store dirs, exit 0".
+     - **`ForeignStoreRoot` split out of `ForeignStoreDir` in `verify`** (§8), keeping the `_scratch`
+       filing convention: a refusal covering every tree and one covering a single tree do not share a
+       name, for the same reason §8 already says they do not share a report field.
+     - **`--file-hex <HEX>`, and a marker in the human listing** for an entry whose `rel` is
+       undisplayable (§8) — the last step of making the non-UTF-8 population addressable rather than
+       merely visible.
   6. **Store-key hardening** (§3, "The store key of a tree"): `slug_hex`/`uuid_hex` identity fields
      with collision refusal, and the `KEY_MAX`/`_h256--` digest form for over-long keys. No migration
      and no renaming — that is the point of choosing detection over an injective encoding. `verify`'s
