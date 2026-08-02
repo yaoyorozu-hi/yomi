@@ -14,11 +14,12 @@
 //! markers — never file contents — so a failure can never print an original.
 
 use std::ffi::OsString;
-use std::os::unix::ffi::OsStringExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
+use yomi::scan::quarantine::quarantine_original;
 
 const BIN: &str = env!("CARGO_BIN_EXE_yomi");
 
@@ -714,5 +715,252 @@ fn p13_legacy_quarantine_layouts_are_never_disturbed() {
     assert!(
         fx.quarantine().join("_scratch").is_dir(),
         "the mirrored tree was not created alongside the legacy ones"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// H. The writer itself, called as the library type it is.
+//
+// Everything above drives the binary, which reaches the writer only through a
+// happy path an attacker does not control. These call `quarantine_original`
+// directly, because the object under attack is the **final component** of the
+// write — the one place the two fd-descent implementations in this codebase
+// differ — and no fixture that goes through `archive` can plant anything there.
+//
+// `Archiver` is a library type usable without `ensure_layout`, so the fixture is
+// a bare directory with no store around it, which is also the only way to
+// exercise the writer creating its own root.
+// ---------------------------------------------------------------------------
+
+/// A base directory with nothing in it. The quarantine root is `base/quarantine`
+/// and is deliberately **not** created: the writer owns that.
+fn bare_base(tag: &str) -> PathBuf {
+    let base = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "p13-{tag}-{}-{}",
+        std::process::id(),
+        unique()
+    ));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    base
+}
+
+/// The same shape `Fx::write_secret` produces, so `tag_of` reads it back.
+fn secret(tag: &str) -> Vec<u8> {
+    format!("aws_access_key_id = {FIXTURE_AKIA}\nTAG-{tag}\n").into_bytes()
+}
+
+fn mode_of(p: &Path) -> u32 {
+    std::fs::symlink_metadata(p)
+        .unwrap_or_else(|e| panic!("stat {}: {e}", p.display()))
+        .permissions()
+        .mode()
+        & 0o777
+}
+
+/// Entry names directly under `dir`, sorted, as raw bytes.
+fn entries_of(dir: &Path) -> Vec<Vec<u8>> {
+    let mut v: Vec<Vec<u8>> = std::fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()))
+        .flatten()
+        .map(|e| e.file_name().as_bytes().to_vec())
+        .collect();
+    v.sort();
+    v
+}
+
+fn shows(v: &[Vec<u8>]) -> Vec<String> {
+    v.iter()
+        .map(|b| String::from_utf8_lossy(b).into_owned())
+        .collect()
+}
+
+/// Whether any file under `dir` holds the fixture secret.
+fn leaked_into(dir: &Path) -> bool {
+    walk_files(dir).iter().any(|p| {
+        std::fs::read(p)
+            .map(|b| contains(&b, FIXTURE_AKIA.as_bytes()))
+            .unwrap_or(false)
+    })
+}
+
+const DEEP_STORED: &str = "-home-test/s1/sub/deep/transcript.jsonl.zst";
+const DEEP_LEVELS: [&str; 4] = ["-home-test", "s1", "sub", "deep"];
+
+/// A symlink at **any** descent level, not just the first, must refuse — and
+/// must leave the link's target with its bytes and its mode.
+///
+/// The two existing tests of this pin depth 1 and depth 2 through the binary.
+/// The mirrored layout is four levels deep for a session artifact with a
+/// subdirectory, and a guard that holds at the levels a fixture happens to reach
+/// is not a guard on the descent.
+#[test]
+fn p13_quarantine_refuses_a_symlinked_level_at_every_depth() {
+    for depth in 1..=DEEP_LEVELS.len() {
+        let base = bare_base(&format!("symdepth{depth}"));
+        let q = base.join("quarantine");
+
+        let evil = base.join("evil");
+        std::fs::create_dir_all(&evil).unwrap();
+        std::fs::set_permissions(&evil, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(evil.join("bystander"), b"untouched\n").unwrap();
+
+        // Every level above the attacked one is a real directory, so the descent
+        // genuinely arrives at the link rather than stopping short of it.
+        let mut at = q.clone();
+        std::fs::create_dir_all(&at).unwrap();
+        for name in &DEEP_LEVELS[..depth - 1] {
+            at.push(name);
+            std::fs::create_dir_all(&at).unwrap();
+        }
+        std::os::unix::fs::symlink(&evil, at.join(DEEP_LEVELS[depth - 1])).unwrap();
+
+        let r = quarantine_original(&q, Path::new(DEEP_STORED), &secret("DEPTH"));
+        assert!(
+            r.is_err(),
+            "a symlink at level {depth} of the descent was accepted, so the \
+             unredacted original was written through it"
+        );
+        assert!(
+            !leaked_into(&evil),
+            "the unredacted original reached the link's target through level \
+             {depth} of the descent"
+        );
+        assert_eq!(
+            entries_of(&evil),
+            vec![b"bystander".to_vec()],
+            "the descent created entries inside the link's target at level {depth}"
+        );
+        assert_eq!(
+            mode_of(&evil),
+            0o755,
+            "the link's target was re-moded through level {depth}"
+        );
+    }
+}
+
+/// Re-quarantining an artifact must leave **one** file at the mirror path,
+/// holding the new original.
+///
+/// The count is the load-bearing half: a writer that stages a replacement beside
+/// the original owes an assurance that the staging is gone when the write
+/// succeeds, and this is that assurance stated where it can be checked without
+/// knowing which writer is underneath.
+#[test]
+fn p13_a_re_quarantine_replaces_the_original_and_leaves_one_file() {
+    let base = bare_base("requarantine");
+    let q = base.join("quarantine");
+    let stored = Path::new("-home-test/s1/transcript.jsonl.zst");
+
+    quarantine_original(&q, stored, &secret("FIRST")).expect("first quarantine");
+    quarantine_original(&q, stored, &secret("SECOND")).expect("second quarantine");
+
+    let parent = q.join("-home-test/s1");
+    let entries = entries_of(&parent);
+    assert_eq!(
+        entries,
+        vec![b"transcript.jsonl".to_vec()],
+        "a re-quarantine left more than the original at the mirror path: {:?}",
+        shows(&entries)
+    );
+    assert_eq!(
+        tag_of(&parent.join("transcript.jsonl")).as_deref(),
+        Some("SECOND"),
+        "the mirror path holds the superseded original"
+    );
+}
+
+/// A refused write must leave **nothing** at the path it claimed.
+///
+/// The refusal is not the property worth pinning on its own — a refusal that
+/// still deposited a partial original at the claimed path would satisfy law Q's
+/// default pass, which is a `stat`, while the file it attests to is not the
+/// original of anything.
+#[test]
+fn p13_a_refused_quarantine_leaves_no_partial_file_at_the_claimed_path() {
+    let base = bare_base("refused-nopartial");
+    let q = base.join("quarantine");
+    let evil = base.join("evil");
+    std::fs::create_dir_all(&evil).unwrap();
+
+    std::fs::create_dir_all(q.join("-home-test")).unwrap();
+    std::os::unix::fs::symlink(&evil, q.join("-home-test/s1")).unwrap();
+
+    let stored = Path::new("-home-test/s1/transcript.jsonl.zst");
+    let r = quarantine_original(&q, stored, &secret("PARTIAL"));
+    assert!(r.is_err(), "a symlinked level was accepted");
+
+    let claimed = q.join("-home-test/s1/transcript.jsonl");
+    assert!(
+        std::fs::symlink_metadata(&claimed).is_err(),
+        "a refused write left an object at the path it claimed: {}",
+        claimed.display()
+    );
+    assert!(
+        entries_of(&evil).is_empty(),
+        "a refused write deposited {:?} inside the link's target",
+        shows(&entries_of(&evil))
+    );
+}
+
+/// A non-UTF-8 final component must land byte-for-byte.
+///
+/// `_scratch` names come from raw `ScratchRel` bytes, and the collision this
+/// whole rule exists to end was a lossy name. Any staging the writer does has to
+/// be built on the same bytes.
+#[test]
+fn p13_quarantine_survives_a_non_utf8_final_component() {
+    let base = bare_base("nonutf8-leaf");
+    let q = base.join("quarantine");
+
+    let stored = OsString::from_vec(b"_scratch/-home-test--s1/note-\xff.md.zst".to_vec());
+    let name = b"note-\xff.md".to_vec();
+    let payload = secret("FF");
+    quarantine_original(&q, Path::new(&stored), &payload).expect("quarantine a non-UTF-8 name");
+
+    let parent = q.join("_scratch/-home-test--s1");
+    assert_eq!(
+        entries_of(&parent),
+        vec![name.clone()],
+        "the non-UTF-8 name was not preserved: {:?}",
+        shows(&entries_of(&parent))
+    );
+    let mut dest = parent.into_os_string().into_vec();
+    dest.push(b'/');
+    dest.extend_from_slice(&name);
+    assert_eq!(
+        std::fs::read(PathBuf::from(OsString::from_vec(dest))).unwrap(),
+        payload,
+        "the original at the non-UTF-8 name is not byte-identical"
+    );
+}
+
+/// The writer creates its own root, at 700, when nothing else has.
+///
+/// `ensure_layout` creates `quarantine/` on every mutating run of the binary, so
+/// nothing that goes through the CLI can observe this. `Archiver` is a library
+/// type, and a caller that never ran `ensure_layout` must not get a root at the
+/// umask's mode holding raw secrets.
+#[test]
+fn p13_the_quarantine_root_is_created_at_700_when_absent() {
+    let base = bare_base("rootmode");
+    let q = base.join("quarantine");
+    assert!(
+        std::fs::symlink_metadata(&q).is_err(),
+        "fixture pre-created the root, so the assertion is vacuous"
+    );
+
+    quarantine_original(
+        &q,
+        Path::new("-home-test/s1/transcript.jsonl.zst"),
+        &secret("ROOT"),
+    )
+    .expect("quarantine onto an absent root");
+
+    assert!(q.is_dir(), "the writer did not create its root");
+    assert_eq!(
+        mode_of(&q),
+        0o700,
+        "the quarantine root was left at the umask's mode"
     );
 }
