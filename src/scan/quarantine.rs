@@ -13,19 +13,12 @@
 //! archive and rescan disagreed about how much of the path the `<uuid>` level
 //! had already consumed.
 
+use crate::safefs;
 use crate::scratch::FindingClass;
 use anyhow::{Context, Result};
-use rustix::fs::{Mode, OFlags};
 use std::ffi::OsStr;
-use std::fs::File;
-use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
-
-/// Every directory yomi creates under `quarantine/`, and every original in it.
-const DIR_MODE: u32 = 0o700;
-const FILE_MODE: u32 = 0o600;
 
 /// The quarantine-relative path of the artifact stored at `stored_rel`, which is
 /// that artifact's path relative to `archive/`.
@@ -55,6 +48,14 @@ fn strip_zst(path: &Path) -> PathBuf {
 /// Keep only ordinary components, so a path can never escape the quarantine
 /// root. Takes a `Path`, not a `&str`: a scratch store path is derived from raw
 /// `ScratchRel` bytes, and a `&str` here is exactly where those bytes were lost.
+///
+/// **Not redundant with `safefs::Dir::descend`, which refuses what this drops.**
+/// The two answer different questions because their inputs have different
+/// provenance — see [`quarantine_original`] — and this one runs strictly before
+/// the `safefs` boundary, so the refusal downstream is defence in depth rather
+/// than the same rule twice. Deleting this would turn a manifest a hand-edit or
+/// a corruption gave a `..` from a sanitized write into a refused one, and a
+/// refused quarantine is a refused archive.
 fn sanitize_rel(rel: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for comp in rel.components() {
@@ -74,17 +75,34 @@ fn sanitize_rel(rel: &Path) -> PathBuf {
 ///
 /// `stored_rel` is the artifact's archive-relative stored path.
 ///
-/// **The hierarchy is descended fd by fd, never by path.** Each level is
-/// `mkdirat`-ed, opened `O_DIRECTORY|O_NOFOLLOW` from its parent's fd, and
-/// `fchmod`-ed through that fd; the original is opened `O_CREAT|O_NOFOLLOW` and
-/// `fchmod`-ed the same way. `create_dir_all` and `set_permissions` both follow
-/// symlinks, so building the tree by path let anything planted at a mirrored
-/// level redirect **the raw secret itself** — and re-mode the link's target on
-/// the way. The store has `classify_store_dir` for that class; quarantine had
-/// nothing, and the object at stake here is the one copy of an unredacted
-/// original. Descending from fds refuses instead, with no window between the
-/// check and the use because there is no check: the kernel resolves one
-/// component at a time and never traverses a link.
+/// **Written through [`safefs`], which is this store's one writer.** The
+/// hierarchy is descended fd by fd — each level `mkdirat`-ed, opened
+/// `O_DIRECTORY|O_NOFOLLOW` from its parent's descriptor and `fchmod`-ed through
+/// that descriptor — and the original is staged under a temp sibling opened
+/// `O_EXCL` and `renameat`-ed into place. `create_dir_all` and `set_permissions`
+/// both follow symlinks, so building the tree by path let anything planted at a
+/// mirrored level redirect **the raw secret itself**, and re-mode the link's
+/// target on the way. Descending from descriptors refuses instead, with no
+/// window between the check and the use because there is no check: the kernel
+/// resolves one component at a time and never traverses a link.
+///
+/// **The destination name is replaced, never opened.** That is the half that is
+/// not merely deduplication. `O_NOFOLLOW` is a statement about symlinks and
+/// about nothing else: a hard link, a FIFO and a directory all pass it, and a
+/// writer that opened the destination `O_CREAT|O_TRUNC` answered all three by
+/// writing into whatever was already there — for a hard link, depositing the
+/// unredacted original into an inode outside the tree entirely, and for a FIFO,
+/// blocking forever. The rename also removes the truncate window, in which the
+/// sole recovery copy was observably short while law Q's default pass — a
+/// `stat` — would still call it present. §4 rules on this and on what it costs.
+///
+/// **`quarantine_rel` sanitizes and `Dir::descend` refuses, and both are
+/// right.** They are not one contract stated twice, so do not collapse them:
+/// `stored_rel` arrives from a manifest or a catalog row — *data*, which a
+/// writer of raw secrets cleans rather than trusts — while a path handed to
+/// `safefs` is built by its caller, so a `..` there is a bug to surface rather
+/// than input to clean. Sanitizing happens strictly before the `safefs`
+/// boundary, which leaves `descend`'s refusal as defence in depth.
 ///
 /// Any error means the original was **not** preserved. Every caller treats that
 /// as a refusal to archive the artifact at all — see `Archiver::capture` and
@@ -93,10 +111,8 @@ pub fn quarantine_original(
     quarantine_root: &Path,
     stored_rel: &Path,
     original: &[u8],
-) -> Result<PathBuf> {
+) -> Result<()> {
     let rel = quarantine_rel(stored_rel);
-    let dest = quarantine_root.join(&rel);
-
     // The root is created and opened **by path**, following whatever it is:
     // `quarantine/` is a documented part of the layout an operator may
     // legitimately relocate — an encrypted volume being the obvious case, since
@@ -104,85 +120,31 @@ pub fn quarantine_original(
     // creates and chmods it through the same path. Everything below it is a
     // namespace yomi derives from the artifact's own identity, which no operator
     // has a reason to hand-place, so that is where following stops.
-    std::fs::create_dir_all(quarantine_root)
-        .with_context(|| format!("create quarantine dir {}", quarantine_root.display()))?;
-    set_700(quarantine_root)?;
-    let mut dir = open_root(quarantine_root)?;
-
-    let mut walked = quarantine_root.to_path_buf();
-    for comp in rel.parent().unwrap_or(Path::new("")).components() {
-        walked.push(comp);
-        dir = open_level(&dir, comp.as_os_str(), &walked)?;
-    }
-
-    let name = rel
-        .file_name()
-        .context("quarantine path has no final component")?;
-    write_original(&dir, name, original, &dest)?;
-    Ok(dest)
-}
-
-fn set_700(dir: &Path) -> Result<()> {
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(DIR_MODE))
-        .with_context(|| format!("chmod {DIR_MODE:o} {}", dir.display()))
-}
-
-fn open_root(path: &Path) -> Result<File> {
-    let flags = OFlags::DIRECTORY | OFlags::CLOEXEC;
-    std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(flags.bits() as i32)
-        .open(path)
-        .with_context(|| format!("open quarantine dir {}", path.display()))
-}
-
-/// Create (if absent) and open one mirrored level under `parent`, refusing
-/// anything that is not a real directory reached without traversing a link.
-fn open_level(parent: &File, name: &OsStr, display: &Path) -> Result<File> {
-    // `mkdirat`'s mode is masked by the umask, so the `fchmod` below is what
-    // actually establishes 700 — `Archiver` is a library type a caller can use
-    // without `ensure_layout` ever having tightened the umask, and inherited
-    // modes are not something to rely on for a tree of raw secrets.
-    if let Err(e) = rustix::fs::mkdirat(parent, name, Mode::from_bits_truncate(DIR_MODE))
-        && e != rustix::io::Errno::EXIST
-    {
-        return Err(anyhow::Error::new(e))
-            .with_context(|| format!("create quarantine dir {}", display.display()));
-    }
-    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-    let dir: File = rustix::fs::openat(parent, name, flags, Mode::empty())
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "refusing to write an unredacted original through {}: {e} — that level \
-                 could not be opened as a directory without following a link",
-                display.display()
+    safefs::open_root_creating(quarantine_root, safefs::DIR_MODE)
+        .with_context(|| format!("open quarantine dir {}", quarantine_root.display()))?
+        .descend(rel.parent().unwrap_or(Path::new("")), safefs::DIR_MODE)
+        // `safefs` speaks for the store, where every reachable byte is
+        // post-redaction. Here the bytes are the secret, and an operator reading
+        // this line has to be told which of the two failed.
+        .with_context(|| {
+            format!(
+                "refusing to write an unredacted original through a level of {}",
+                quarantine_root.join(&rel).display()
             )
         })?
-        .into();
-    rustix::fs::fchmod(&dir, Mode::from_bits_truncate(DIR_MODE))
-        .with_context(|| format!("chmod {DIR_MODE:o} {}", display.display()))?;
-    Ok(dir)
-}
-
-fn write_original(dir: &File, name: &OsStr, original: &[u8], display: &Path) -> Result<()> {
-    let flags =
-        OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-    let mut file: File = rustix::fs::openat(dir, name, flags, Mode::from_bits_truncate(FILE_MODE))
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "refusing to write an unredacted original to {}: {e}",
-                display.display()
+        .write_atomic(
+            // `sanitize_rel` pushes `original` when it would otherwise empty the
+            // path, so there is always a final component.
+            rel.file_name().expect("a quarantine rel is never empty"),
+            original,
+            safefs::FILE_MODE,
+        )
+        .with_context(|| {
+            format!(
+                "refusing to write an unredacted original to {}",
+                quarantine_root.join(&rel).display()
             )
-        })?
-        .into();
-    // Before the bytes, not after: `O_CREAT`'s mode is masked by the umask, and
-    // an already-existing file keeps the mode it had, so a permissive one would
-    // otherwise hold a raw secret for the length of the write.
-    rustix::fs::fchmod(&file, Mode::from_bits_truncate(FILE_MODE))
-        .with_context(|| format!("chmod {FILE_MODE:o} {}", display.display()))?;
-    file.write_all(original)
-        .with_context(|| format!("write quarantine file {}", display.display()))?;
-    Ok(())
+        })
 }
 
 // ---------------------------------------------------------------------------
