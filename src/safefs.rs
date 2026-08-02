@@ -238,6 +238,25 @@ pub fn make_dirs(root: &Path, rel: &Path) -> Result<Dir> {
     Dir::open_root(root)?.descend(rel, DIR_MODE)
 }
 
+/// Open `root` — creating it if absent — and assert `mode` through the
+/// descriptor rather than the path.
+///
+/// The `create_dir_all` is path-based and unavoidable: the root is where the
+/// caller's vouching stops, so there is no descriptor above it to descend from.
+/// The **mode** is avoidable, and that is the point of this over a
+/// `create_dir_all` followed by a `set_permissions`: the latter resolves the
+/// whole path a second time and follows whatever is on it by then, while
+/// `fchmod` re-uses the descriptor this run already opened. For a caller whose
+/// root is a tree of raw secrets, that is the last path-based *mutation*
+/// removed.
+pub fn open_root_creating(root: &Path, mode: u32) -> Result<Dir> {
+    std::fs::create_dir_all(root).with_context(|| format!("create {}", root.display()))?;
+    let dir = Dir::open_root(root)?;
+    rustix::fs::fchmod(&dir.fd, Mode::from_bits_truncate(mode))
+        .with_context(|| format!("chmod {mode:o} {}", root.display()))?;
+    Ok(dir)
+}
+
 /// Split a store-relative path into the directories to descend and the final
 /// name.
 pub fn split(rel: &Path) -> Result<(PathBuf, OsString)> {
