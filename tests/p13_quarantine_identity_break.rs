@@ -964,3 +964,346 @@ fn p13_the_quarantine_root_is_created_at_700_when_absent() {
         "the quarantine root was left at the umask's mode"
     );
 }
+
+// ---------------------------------------------------------------------------
+// I. The final component — what the destination name may be, and what happens
+// when it is not a file this run put there.
+//
+// `O_NOFOLLOW` is a statement about symlinks and about nothing else. A hard
+// link, a FIFO and a directory all pass it, and the writer that opened the
+// destination name in place answered all three wrongly: it wrote the raw secret
+// into a hardlinked inode outside the tree, it blocked forever on the FIFO, and
+// its truncate opened a window in which the sole recovery copy was short. These
+// pin the writer that replaces the name instead of opening it.
+// ---------------------------------------------------------------------------
+
+/// Whether two names are the same object — the question a hard link asks and
+/// `symlink_metadata` alone cannot answer.
+fn ino_of(p: &Path) -> u64 {
+    std::fs::symlink_metadata(p)
+        .unwrap_or_else(|e| panic!("stat {}: {e}", p.display()))
+        .ino()
+}
+
+/// **A hard link at the destination is an exfiltration primitive.**
+///
+/// `link(2)` needs no privilege and `O_NOFOLLOW` does not see hard links, so a
+/// writer that opens the destination name `O_CREAT|O_TRUNC` deposits the
+/// unredacted original into an inode the attacker already holds a second name
+/// for — and `fchmod`s the attacker's file on the way. Same-uid is the threat
+/// model §4 already adopts for the credential-hardlink defence on the read side.
+///
+/// Replacing the name breaks the link instead.
+#[test]
+fn p13_a_hardlink_at_the_destination_does_not_receive_the_original() {
+    let base = bare_base("hardlink-dest");
+    let q = base.join("quarantine");
+    let outside = base.join("outside.txt");
+    std::fs::write(&outside, b"harmless\n").unwrap();
+    std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let parent = q.join("-home-test/s1");
+    std::fs::create_dir_all(&parent).unwrap();
+    let dest = parent.join("transcript.jsonl");
+    std::fs::hard_link(&outside, &dest).unwrap();
+
+    quarantine_original(
+        &q,
+        Path::new("-home-test/s1/transcript.jsonl.zst"),
+        &secret("HARDLINK"),
+    )
+    .expect("quarantine over a hardlinked destination");
+
+    assert!(
+        !contains(&std::fs::read(&outside).unwrap(), FIXTURE_AKIA.as_bytes()),
+        "the unredacted original was written into an inode the attacker holds a \
+         second name for, outside quarantine/ entirely"
+    );
+    assert_eq!(
+        std::fs::read(&outside).unwrap(),
+        b"harmless\n",
+        "the file outside the tree was written through the hard link"
+    );
+    assert_eq!(
+        mode_of(&outside),
+        0o644,
+        "the file outside the tree was re-moded through the hard link"
+    );
+    assert_ne!(
+        ino_of(&dest),
+        ino_of(&outside),
+        "the destination still shares an inode with the file outside the tree"
+    );
+    assert_eq!(mode_of(&dest), 0o600, "the original is not owner-only");
+}
+
+/// **A FIFO at the destination must not stop the archiver.**
+///
+/// `mkfifo` needs no privilege, and a blocking `open(O_WRONLY)` on a FIFO with
+/// no reader never returns. `O_NOFOLLOW` refuses symlinks, not FIFOs, and there
+/// is no `O_NONBLOCK` and no timeout anywhere in the writer — so one planted
+/// FIFO stops archiving indefinitely, with no error and no log line.
+///
+/// **The timeout is the test.** Without it this hangs the suite rather than
+/// failing it.
+#[test]
+fn p13_a_fifo_at_the_destination_does_not_hang_the_writer() {
+    let base = bare_base("fifo-dest");
+    let q = base.join("quarantine");
+    let parent = q.join("-home-test/s1");
+    std::fs::create_dir_all(&parent).unwrap();
+    let dest = parent.join("transcript.jsonl");
+    let st = Command::new("mkfifo")
+        .arg(&dest)
+        .status()
+        .expect("run mkfifo");
+    assert!(st.success(), "fixture could not create a FIFO");
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let qc = q.clone();
+    let payload = secret("FIFO");
+    std::thread::spawn(move || {
+        let r = quarantine_original(
+            &qc,
+            Path::new("-home-test/s1/transcript.jsonl.zst"),
+            &payload,
+        );
+        let _ = tx.send(r.is_ok());
+    });
+
+    let ok = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .unwrap_or_else(|_| {
+            panic!(
+                "the writer blocked on a FIFO at the destination and never \
+                 returned — a planted FIFO stops archiving indefinitely"
+            )
+        });
+    assert!(
+        ok,
+        "the write over a FIFO was refused rather than performed"
+    );
+    let md = std::fs::symlink_metadata(&dest).unwrap();
+    assert!(
+        md.is_file(),
+        "the FIFO is still at the destination after a reported success"
+    );
+    assert_eq!(mode_of(&dest), 0o600, "the original is not owner-only");
+}
+
+/// **A symlink at the destination is replaced, not followed — and not refused.**
+///
+/// This is the one property that weakens, deliberately. Refusing hands an
+/// attacker a denial-of-archival primitive, because every caller treats a
+/// quarantine failure as a refusal to archive the artifact at all; replacing
+/// destroys the link node and puts the bytes in a fresh inode inside a 700 tree.
+/// The store side already made this call.
+#[test]
+fn p13_a_symlinked_destination_is_replaced_not_followed() {
+    let base = bare_base("symlink-dest");
+    let q = base.join("quarantine");
+    let target = base.join("target.txt");
+    std::fs::write(&target, b"untouched\n").unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let parent = q.join("-home-test/s1");
+    std::fs::create_dir_all(&parent).unwrap();
+    let dest = parent.join("transcript.jsonl");
+    std::os::unix::fs::symlink(&target, &dest).unwrap();
+
+    quarantine_original(
+        &q,
+        Path::new("-home-test/s1/transcript.jsonl.zst"),
+        &secret("SYMDEST"),
+    )
+    .expect("quarantine over a symlinked destination");
+
+    assert_eq!(
+        std::fs::read(&target).unwrap(),
+        b"untouched\n",
+        "the unredacted original was written through the link, to its target"
+    );
+    assert_eq!(
+        mode_of(&target),
+        0o644,
+        "the link's target was re-moded through the link"
+    );
+    let md = std::fs::symlink_metadata(&dest).unwrap();
+    assert!(
+        md.is_file(),
+        "the destination is still a symlink, so the write was refused rather \
+         than replacing the link node — which is a denial-of-archival primitive"
+    );
+    assert_eq!(mode_of(&dest), 0o600, "the original is not owner-only");
+    assert_eq!(
+        tag_of(&dest).as_deref(),
+        Some("SYMDEST"),
+        "the destination does not hold this run's original"
+    );
+}
+
+/// **An original is never observable truncated.**
+///
+/// The crash case cannot be run here, so this is its deterministic proxy: stage
+/// a replacement and abandon it. Under a writer that opens the destination in
+/// place there is nothing to abandon — the prior original is already gone at
+/// `openat` time, before a single new byte — and law Q's default pass is a
+/// `stat`, so a short original satisfies Q1 and passes nightly `verify` in
+/// silence.
+#[test]
+fn p13_an_original_is_never_observable_truncated() {
+    let base = bare_base("no-truncate-window");
+    let q = base.join("quarantine");
+    let stored = Path::new("-home-test/s1/transcript.jsonl.zst");
+    quarantine_original(&q, stored, &secret("PRIOR")).expect("prior quarantine");
+
+    let parent = q.join("-home-test/s1");
+    let dest = parent.join("transcript.jsonl");
+    let before = std::fs::read(&dest).unwrap();
+    let before_ino = ino_of(&dest);
+
+    let dir = yomi::safefs::make_dirs(&q, Path::new("-home-test/s1")).expect("descend");
+    let staged = dir
+        .stage(
+            std::ffi::OsStr::new("transcript.jsonl"),
+            &secret("REPLACEMENT"),
+            yomi::safefs::FILE_MODE,
+        )
+        .expect("stage a replacement");
+
+    assert_eq!(
+        std::fs::read(&dest).unwrap(),
+        before,
+        "the prior original was disturbed while the replacement was only staged"
+    );
+    assert_eq!(
+        entries_of(&parent).len(),
+        2,
+        "the replacement was not staged beside the original: {:?}",
+        shows(&entries_of(&parent))
+    );
+
+    drop(staged);
+
+    assert_eq!(
+        std::fs::read(&dest).unwrap(),
+        before,
+        "an abandoned replacement destroyed the prior original — the one object \
+         in this design with no second copy anywhere"
+    );
+    assert_eq!(
+        ino_of(&dest),
+        before_ino,
+        "the prior original's inode was replaced by an abandoned write"
+    );
+    assert_eq!(
+        entries_of(&parent),
+        vec![b"transcript.jsonl".to_vec()],
+        "an abandoned replacement was left behind: {:?}",
+        shows(&entries_of(&parent))
+    );
+}
+
+/// **The crash residual, priced.** `Staged`'s `Drop` covers every ordinary early
+/// return but not `SIGKILL`, OOM or power loss, and nothing removes files from
+/// `quarantine/` by design — so a killed run can leave a temp holding raw secret
+/// bytes there forever.
+///
+/// The ruling is that this is reported, not that a new finding is minted for it:
+/// a temp is an unclaimed file, which is what `QuarantineStray` says, at the
+/// severity Q2 gives it. What it replaces is worse and invisible — a truncated
+/// original at the *claimed* path, which the default pass cannot see at all.
+#[test]
+fn p13_a_leftover_temp_is_reported_by_q2_and_does_not_fail_the_run() {
+    let fx = Fx::new("temp-stray");
+    fx.write_secret("leak.md", "LEAK");
+    fx.archive();
+    let originals = walk_files(&fx.quarantine());
+    assert_eq!(originals.len(), 1, "fixture quarantined {originals:?}");
+
+    // The residue a kill between `stage` and `commit` leaves, at the name
+    // `temp_name` builds: the artifact's own name with `.tmp-<pid>-<seq>`
+    // appended, never substituted for the extension.
+    let mut tmp = originals[0].clone().into_os_string().into_vec();
+    tmp.extend_from_slice(b".tmp-1-0");
+    let tmp = PathBuf::from(OsString::from_vec(tmp));
+    std::fs::write(&tmp, secret("ORPHANED")).unwrap();
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let o = fx.run(&["verify", "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_else(|e| {
+        panic!(
+            "verify --json ({e}); stderr={}",
+            String::from_utf8_lossy(&o.stderr)
+        )
+    });
+    let foreign = v["quarantine"]["foreign_matter"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let strays: Vec<&serde_json::Value> = foreign
+        .iter()
+        .filter(|f| f["issue"] == "QuarantineStray")
+        .collect();
+
+    assert_eq!(
+        strays.len(),
+        1,
+        "an orphaned temp was not reported exactly once as foreign matter: {}",
+        v["quarantine"]
+    );
+    assert!(
+        strays[0]["rel"]
+            .as_str()
+            .is_some_and(|r| r.contains(".tmp-")),
+        "the stray finding does not name the temp: {}",
+        strays[0]
+    );
+    assert!(
+        !v["quarantine"]["violations"]
+            .as_array()
+            .is_some_and(|a| a.iter().any(|f| f["issue"] == "QuarantineStray")),
+        "an orphaned temp was classed as a violation: {}",
+        v["quarantine"]
+    );
+    assert_eq!(
+        o.code, 0,
+        "an orphaned temp failed the run: {}",
+        v["quarantine"]
+    );
+    assert!(
+        !contains(&o.all(), FIXTURE_AKIA.as_bytes()),
+        "verify emitted the raw secret while reporting the stray"
+    );
+}
+
+/// A directory at the destination is refused — and the refusal leaves no
+/// staging behind. The rename is where this one surfaces, and the error path of
+/// a commit has to discard.
+#[test]
+fn p13_a_directory_at_the_destination_is_refused_and_leaves_no_temp() {
+    let base = bare_base("dir-dest");
+    let q = base.join("quarantine");
+    let parent = q.join("-home-test/s1");
+    std::fs::create_dir_all(parent.join("transcript.jsonl")).unwrap();
+
+    let r = quarantine_original(
+        &q,
+        Path::new("-home-test/s1/transcript.jsonl.zst"),
+        &secret("DIRDEST"),
+    );
+    assert!(
+        r.is_err(),
+        "a directory at the destination was reported as a successful write"
+    );
+    assert_eq!(
+        entries_of(&parent),
+        vec![b"transcript.jsonl".to_vec()],
+        "the refused write left staging behind: {:?}",
+        shows(&entries_of(&parent))
+    );
+    assert!(
+        parent.join("transcript.jsonl").is_dir(),
+        "the directory at the destination was replaced"
+    );
+}

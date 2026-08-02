@@ -12,10 +12,20 @@
 //! **The fix is not a check.** A `symlink_metadata` before the write leaves a
 //! window between the check and the use, which is the residual every guard in
 //! this design has had to state and accept. Descending from a directory *file
-//! descriptor* has no window because there is nothing to check: each component is
-//! opened from its parent's fd with `O_NOFOLLOW`, so the kernel resolves one name
-//! at a time and never traverses a link. A path that is not what this run reached
-//! is not a path this run can be made to write through.
+//! descriptor* has no such window for a **link**, because there is nothing to
+//! check: each component is opened from its parent's fd with `O_NOFOLLOW`, so
+//! the kernel resolves one name at a time and never traverses a link.
+//!
+//! **It closes the symlink window and not the directory-replacement one**, and
+//! the difference is worth stating precisely because the descent looks total.
+//! `openat(fd, name, O_NOFOLLOW)` proves the *name* was not a symlink; it does
+//! not prove the name still refers to the object this run expects. A
+//! `renameat2(RENAME_EXCHANGE)` swapping a level for another real directory
+//! involves no symlink at all, so `O_NOFOLLOW` is blind to it — measured, and
+//! measured to defeat the path-based writer this replaced at exactly the same
+//! rate. That residual is §3's, bounded by the held `WriteLock` and single-user
+//! ownership; closing it needs `openat2(RESOLVE_BENEATH)` or an `st_dev`/`st_ino`
+//! re-check, which is a different design.
 //!
 //! Ownership of a mode belongs to whoever creates the object: `mkdirat` and
 //! `O_CREAT` both mask their mode with the umask, and an *existing* file keeps
