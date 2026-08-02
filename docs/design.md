@@ -519,10 +519,35 @@ level above it.
 **Accepted residual: the assertion is not atomic with the writes it guards.** The classification is a
 `symlink_metadata` on a path, and the `create_dir_all` and `set_permissions` that follow are path-based
 too, so the whole set carries the plant-after-scan window a store directory carries — now at four
-levels instead of one. Bounded the same way: the held `WriteLock` plus single-user ownership. It is
-worth naming that the quarantine **writer** no longer has this window — U5-B1 replaced its path joins
-with a descent by directory fd — so the layout layer is the last path-based ownership check in the
-design, and that is where the technique should go next if the residual is ever judged too wide.
+levels instead of one. Bounded the same way: the held `WriteLock` plus single-user ownership.
+
+**Both writers descend by directory fd, and that closes less than it appears to.** `archive/` and
+`quarantine/` are written through one module (`safefs`), which opens each level from its parent's
+descriptor with `O_NOFOLLOW`. That removes the check-then-use window **for a symlink**: there is no
+check, so there is nothing to race. It does **not** remove it for a directory swapped in for another
+directory. `openat(fd, name, O_NOFOLLOW)` proves the name was not a link; it does not prove the name
+still refers to the object this run reached a moment ago, and a `renameat2(RENAME_EXCHANGE)` against a
+descent level involves no link at all. Measured against both the path-based writer this replaced and
+the fd-descending one: an attacker exchanging a level for a directory of their own captured the
+unredacted original in **200 of 200 rounds under each**. The technique is not a fix for that class,
+and stating it as one would retire a residual that is still open. Closing it needs
+`openat2(RESOLVE_BENEATH)` or an `st_dev`/`st_ino` re-check of the descended descriptor — a separate
+design, bounded meanwhile by the same `WriteLock` and single-user ownership as everything else in this
+paragraph.
+
+**What the two writers still resolve by path** — a statement about the writers, not an inventory of
+the store: `~/.yomi` itself, the outermost boundary `--home` names, above which there is no descriptor
+to descend from; the `create_dir_all` of a root, which is where the caller's vouching stops; and
+`classify_store_dir`, run per use at the scratch store dirs and at the head of the law-Q pass, where
+it classifies the *quarantine root* — the heaviest of the three, since that one's refusal is a
+`RefusedKey` that fails the run. That is where the technique goes next if the residual is ever judged
+too wide.
+
+**Deliberately not a claim about the rest of the store.** Bookkeeping outside the artifact trees — the
+lock file, the catalog, `gc.log`, `shapes.json` — and the removal of stale scratch artifacts are all
+still reached by path, some without `O_NOFOLLOW`. None of them holds an unredacted original and none
+is what this paragraph is scoped to; taking an inventory of them is its own audit, and an earlier
+draft of this sentence tried to state one and got it wrong.
 
 #### `ManifestRead` — absent and unreadable are not the same
 
@@ -1072,6 +1097,56 @@ which was sufficient while the layout was two deep and a mutating command's umas
 mirrored layout is deeper, and `Archiver` is a library type that a caller can use without
 `ensure_layout` ever having tightened the umask. Do not rely on inherited modes for a directory tree of
 raw secrets.
+
+**The writer replaces the destination name; it never opens it.** An original is staged under a temp
+sibling opened `O_EXCL`, moded, and `renameat`-ed into place — the same writer `archive/` uses. The
+alternative, opening the destination `O_CREAT|O_TRUNC|O_NOFOLLOW`, was what this design shipped first,
+and it is wrong for three separate reasons. **`O_NOFOLLOW` is a statement about symlinks and about
+nothing else.** A **hard link** planted at the destination passes it, and `link(2)` needs no
+privilege: opening that name in place deposits the unredacted original into an inode the attacker
+already holds a second name for, and re-modes their file to 600 on the way. Measured, deterministic,
+1/1 — the same-uid threat model this section already adopts for the credential-hardlink defence on the
+read side. That is the class §3 calls an exfiltration channel rather than a misplacement. A **FIFO**
+planted there passes it too, and a blocking `open(O_WRONLY)` on a FIFO with no reader never returns:
+one `mkfifo` stops archiving indefinitely, with no error and no log line. And `O_TRUNC` **manufactures
+a state Q1 is structurally blind to** — the old bytes are gone at `openat` time, before the first new
+byte, so a crash or an `ENOSPC` mid-write leaves a *truncated original at the claimed path*. Q1 is a
+`stat`; a truncated original satisfies it, counts as `present`, and passes nightly `verify` in
+silence. Only `verify --quarantine` could ever see it, and that is attended and never in cron. A
+rename cannot produce that state: the file at the claimed name is always a complete original of
+something.
+
+**What this costs, stated rather than buried.** A symlink at the destination goes from *refused* to
+*replaced* — the link node is destroyed and the bytes land in a fresh inode inside a 700 tree, with
+the link's target untouched and un-re-moded. That is the right trade in this direction: refusing hands
+an attacker a **denial-of-archival** primitive, because every caller treats a quarantine failure as a
+refusal to archive the artifact at all. The store side already ruled the same way.
+
+**Crash residual: a temp holding raw secret bytes.** The staging file is unlinked on drop, which
+covers every ordinary early return but not `SIGKILL`, OOM or power loss — and nothing removes files
+from `quarantine/` by design, so no reconciler sweeps it. The ruling is to **report it, not to mint a
+finding for it**: a temp is a file no derivation claims, which is exactly what Q2's `QuarantineStray`
+says, at the advisory severity Q2 gives it and `requires_exclusion` already. What it replaces is worse
+and invisible — the `O_TRUNC` residual above, a corrupt original at the *claimed* path that the
+default pass cannot see. Trading an invisible corruption for a visible stray is the direction to trade
+in.
+
+**And that residual carries, narrowly, the same shape this whole ruling argues against.** A staged
+write opens its temp `O_EXCL`, and the temp is `<name>.tmp-<pid>-<seq>` with the sequence counter
+global to the *process* — so a surviving temp blocks a later write of the same artifact exactly when a
+recycled pid reaches the same sequence number, and that collision is an `EEXIST` that refuses the
+quarantine, which refuses the archive. It is stated because the argument for replacing the destination
+is that *refusing* hands an attacker a denial-of-archival primitive; a residual with the same shape
+has to be weighed on the same scale rather than excused by being small. It is small: it is not new
+attack surface, since anyone who can write in that directory already holds the cheaper version —
+planting a directory at the destination name, which is refused by construction — and it turns on a pid
+recycle no attacker can aim. Priced, not dismissed.
+
+**Not addressed either way: durability.** Neither writer `fsync`s, before or after. A rename without
+an `fsync` of the file can, on power loss, leave the old file or an empty new one. This is not a
+regression — the path-based writer did not fsync either — and it is named here so it is not mistaken
+for a property the rename bought. If durability is ever wanted it is `fsync(file)` before the rename
+and `fsync(dir)` after, in `safefs`, so `archive/` gets it on the same terms.
 
 **Existing quarantine trees are never renamed, moved or removed.** They may hold the only copy of an
 original, and no naming improvement is worth transposing such a tree. The new rule governs **writes**;
@@ -2166,6 +2241,7 @@ yomi/
     blacklist.rs            # compiled path denylist
     model.rs                # Entry, Session, Manifest, Finding (serde)
     lock.rs                 # advisory single-writer lock
+    safefs.rs               # fd-pinned writes — the one writer for archive/ and quarantine/ (§3, §4)
     scratch.rs              # ScratchRel + ScratchManifest/Entry — the one owner of scratch identity (§3)
     source/  {mod, claude, single, discover}.rs
     archive/ {mod, manifest, incremental, compress}.rs             # zstd frames
@@ -2179,6 +2255,8 @@ yomi/
           p5_scratch_cap_break.rs · p6_scratch_ledger_break.rs · p7_scratch_ledger_break.rs
           p8_scratch_capture_break.rs
           p9_scratch_verify_break.rs · p10_scratch_verify_break.rs · p11_scratch_read_break.rs
+          p12_scratch_read_break.rs · p13_quarantine_identity_break.rs · p14_law_q_break.rs
+          p15_store_key_identity_break.rs · p16_store_ownership_break.rs · p17_safefs_break.rs
           # fixtures are fabricated in-test under a tmpdir; no committed fixtures/ tree
 ```
 

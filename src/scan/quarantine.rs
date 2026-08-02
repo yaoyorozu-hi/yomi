@@ -263,9 +263,14 @@ impl QuarantineIssue {
             // A stray is what a half-written archive looks like: the original
             // has landed and the row that claims it has not.
             QuarantineIssue::QuarantineStray => true,
-            // Re-quarantining an artifact whose source changed truncates and
-            // rewrites the original in place, so mid-run the file on disk and
-            // the ledger's `source_sha256` legitimately disagree.
+            // Every writer quarantines the original *before* it updates the
+            // ledger, so between the rename that puts a re-quarantined original
+            // in place and the row that records the source it came from, the
+            // file on disk and the ledger's `source_sha256` legitimately
+            // disagree. The window is the write **order**, not the write: the
+            // rename is atomic, so the file is always some complete original —
+            // of the source this run read, while the ledger still names the one
+            // the last run did.
             QuarantineIssue::QuarantineMismatch => true,
             // Q0 is ledger-only. Q1 cannot be transiently violated (above). A
             // legacy-layout path is one no current writer produces at all, and
