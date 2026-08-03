@@ -39,3 +39,14 @@ rustix = { version = "1", features = ["fs", "process"] }
 [dev-dependencies]
 filetime = "0.2"
 rusqlite = { version = "0.32", features = ["bundled"] }
+
+[profile.release]
+# This binary computes byte offsets and lengths that decide which spans get
+# redacted. A wrapped arithmetic op there silently produces the wrong span and
+# leaks the secret it was supposed to remove; a panic does not. Release keeps
+# the same arithmetic semantics as debug so that gap cannot exist.
+overflow-checks = true
+# Deliberately left at the default (false): the rescan fault seam in
+# `src/rescan/mod.rs` is gated on `debug_assertions` precisely so a release
+# binary cannot be made to skip the stored rename via the environment.
+debug-assertions = false

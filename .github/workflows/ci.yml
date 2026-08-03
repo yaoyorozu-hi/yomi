@@ -22,7 +22,7 @@ env:
 
 jobs:
   test:
-    name: test (${{ matrix.rust }})
+    name: test (${{ matrix.rust }}, ${{ matrix.profile }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -31,6 +31,16 @@ jobs:
         # 1.89 is the declared MSRV (Cargo.toml rust-version). stable guards
         # against breakage introduced by newer toolchains.
         rust: ['1.89', 'stable']
+        # release is a genuinely different build: `debug_assertions` is off, so
+        # the rescan fault seam disappears, and `overflow-checks` is set
+        # explicitly in Cargo.toml rather than inherited. Shipping is done from
+        # release, so release is gated.
+        profile: [debug, release]
+        include:
+          - profile: debug
+            flags: ''
+          - profile: release
+            flags: '--release'
     steps:
       - uses: actions/checkout@v7
 
@@ -40,13 +50,14 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
+          key: ${{ matrix.profile }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: cargo build
-        run: cargo build --locked
+        run: cargo build --locked ${{ matrix.flags }}
 
       - name: cargo test
-        run: cargo test --locked --no-fail-fast
+        run: cargo test --locked --no-fail-fast ${{ matrix.flags }}
 
   lint:
     # Pinned to the MSRV so the gate is deterministic: a new clippy release can
@@ -71,6 +82,11 @@ jobs:
 
       - name: cargo clippy
         run: cargo clippy --locked --all-targets -- -D warnings
+
+      # `cfg(debug_assertions)` code is invisible to the debug pass above: a
+      # release-only dead helper or lint would otherwise reach main unseen.
+      - name: cargo clippy (release)
+        run: cargo clippy --locked --all-targets --release -- -D warnings
 
   audit:
     name: cargo audit

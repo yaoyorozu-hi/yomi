@@ -118,6 +118,9 @@ impl Fixture {
 
     /// Run with the rescan fault seam armed: `commit` skips the stored rename of
     /// the first targeted artifact right after its DB transaction commits.
+    ///
+    /// The seam only exists in debug builds, so this helper does too.
+    #[cfg(debug_assertions)]
     fn run_faulted(&self, args: &[&str]) -> std::process::Output {
         self.command(args)
             .env("YOMI_RESCAN_FAULT", "1")
@@ -2574,6 +2577,12 @@ fn rescan_whole_quarantines_escape_hidden_and_skips_marker() {
 /// stored copy is still stale raw — verify flags the mismatch, and re-running
 /// converges to a fully clean, verifying state. Proves index-no-leak at the one
 /// crash point the ordering invariant guards.
+///
+/// Debug-only, mirroring the seam it drives (`src/rescan/mod.rs`): in a release
+/// binary `YOMI_RESCAN_FAULT` is inert by design, so there is no crash to inject
+/// and nothing here to assert. `#[cfg]` rather than `#[ignore]` so that
+/// `--ignored` cannot resurrect it against a profile where it cannot hold.
+#[cfg(debug_assertions)]
 #[test]
 fn rescan_fault_between_commit_and_rename_keeps_index_clean() {
     let fx = Fixture::new("rescan-fault");
