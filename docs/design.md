@@ -80,7 +80,7 @@ Rejected `~/.zaibatsu/memory/vol/yomi/`. Rationale:
     _snapshots/<name>.sh.zst
     _paste/<name>.txt.zst          # paste-cache
     _scratch/<slug--uuid>/         # scratch: manifest.json (every file) + allow-listed stored files
-  quarantine/<session-uuid>/<rel>  # mode 700 — unredacted originals, keyed by artifact rel-path; NOT indexed
+  quarantine/<archive-rel>         # mode 700 — unredacted originals, mirroring archive/ path-for-path (§4 law Q); NOT indexed
                                    # (no `index/` directory: the shipped FTS5 index lives
                                    #  inside state/catalog.db — §6. A tantivy upgrade would
                                    #  add index/ here.)
@@ -95,7 +95,7 @@ Rejected `~/.zaibatsu/memory/vol/yomi/`. Rationale:
 **P1 layout notes (reconciled to implementation):**
 - **`_history` is a single incremental store**, not date-sliced: the byte-offset watermark *is* the slice watermark (source is never wiped; §5). Date-partitioned *views* are an index concern (P4).
 - **`_paste/` and `_scratch/`** join the date/name-partitioned single-file stores; `_scratch/<key>/` holds a `manifest.json` of every scratch file plus the allow-listed, under-cap files.
-- **Quarantine is keyed by the artifact's rel-path** (`quarantine/<uuid>/<rel>`), not basename, so same-named originals from different sources cannot clobber each other.
+- **Quarantine mirrors the archive** — `quarantine/<X>` holds the unredacted original of `archive/<X>.zst` (§4, law Q). An original is named by the identity of the artifact it is the original of, so it inherits the store's uniqueness and same-named originals from different sources cannot clobber each other.
 - **No `.v<n>` rotation in P1.** A prefix-divergence or corruption-triggered recapture overwrites the store in place (atomic temp-write + rename). This avoids untracked orphan versions and eliminates any stale, pre-redaction copy as a leak surface; catalog-tracked versioning is deferred to P3.
 
 **Keyed by `session-uuid`, not date.** Date is derived metadata (manifest + index), not a directory
@@ -1034,7 +1034,7 @@ they are documented rather than shipped half-built:
 
 **Action model — scan → decide → act → record:**
 
-- **HIGH** finding → redact span in stored copy with `‹REDACTED:kind:sha8›` (sha8 = hash of the secret, for dedup/audit, **never the secret**) **and** move the unredacted original to `quarantine/<uuid>/` (mode 700, index-excluded). Recoverable if false positive.
+- **HIGH** finding → redact span in stored copy with `‹REDACTED:kind:sha8›` (sha8 = hash of the secret, for dedup/audit, **never the secret**) **and** move the unredacted original to its mirrored quarantine path — `quarantine/<X>` for the artifact stored at `archive/<X>.zst`, per the mirror rule below (mode 700, index-excluded). Recoverable if false positive.
 - **MED** → redact in stored copy, no quarantine.
 - **LOW** → **flag only** in `manifest.secret_scan.flagged`, surfaced via `yomi status --secrets` for human review. Not redacted (too FP-prone to auto-mutate on entropy alone).
 - **Allowlist** `[scan.allow]` (regexes / secret-sha8s of known-benign, e.g. doc example keys) suppresses a finding entirely.
