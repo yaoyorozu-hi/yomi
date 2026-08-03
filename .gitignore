@@ -1,1 +1,6 @@
 /target
+
+# rustyline drops this wherever an interactive REPL was launched; the SurrealDB
+# CLI leaves one here whenever it is run from the repo root. Nothing in the tree
+# reads it, and it is a transcript of whatever was typed — mode 600 for a reason.
+/history.txt
