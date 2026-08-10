@@ -51,7 +51,7 @@ pub fn run(env: &Env, args: &ArchiveArgs, json: bool) -> Result<i32> {
         None => Include::default_set(),
     };
 
-    let blacklist = Blacklist::compile(&env.config.blacklist_add)?;
+    let blacklist = Blacklist::compile(env)?;
     let allow = Allowlist::compile(&env.config.scan.allow);
     let roots = SourceRoots::resolve()?;
 

@@ -183,7 +183,7 @@ fn p4t_containment_is_not_rechecked_between_plan_and_commit() {
     let env = Env::resolve(Some(&fx.yomi_home), None).unwrap();
     let cfg = env.config.gc.clone();
     let cat = catalog::open_env(&env).unwrap();
-    let bl = Blacklist::compile(&env.config.blacklist_add).unwrap();
+    let bl = Blacklist::compile(&env).unwrap();
     let roots = SourceRoots::resolve().unwrap();
     let live = ProcLiveness::resolve(&roots, cfg.active_window.0);
 
@@ -252,7 +252,7 @@ fn p4t_scratch_tree_swapped_for_symlink_after_plan() {
     let env = Env::resolve(Some(&fx.yomi_home), None).unwrap();
     let cfg = env.config.gc.clone();
     let cat = catalog::open_env(&env).unwrap();
-    let bl = Blacklist::compile(&env.config.blacklist_add).unwrap();
+    let bl = Blacklist::compile(&env).unwrap();
     let roots = SourceRoots::resolve().unwrap();
     let live = ProcLiveness::resolve(&roots, cfg.active_window.0);
 
@@ -291,7 +291,7 @@ fn p4t_content_drift_between_plan_and_commit_is_caught() {
     let env = Env::resolve(Some(&fx.yomi_home), None).unwrap();
     let cfg = env.config.gc.clone();
     let cat = catalog::open_env(&env).unwrap();
-    let bl = Blacklist::compile(&env.config.blacklist_add).unwrap();
+    let bl = Blacklist::compile(&env).unwrap();
     let roots = SourceRoots::resolve().unwrap();
     let live = ProcLiveness::resolve(&roots, cfg.active_window.0);
 
@@ -332,7 +332,7 @@ fn p4t_credential_hardlink_planted_after_plan_is_refused() {
     let env = Env::resolve(Some(&fx.yomi_home), None).unwrap();
     let cfg = env.config.gc.clone();
     let cat = catalog::open_env(&env).unwrap();
-    let bl = Blacklist::compile(&env.config.blacklist_add).unwrap();
+    let bl = Blacklist::compile(&env).unwrap();
     let roots = SourceRoots::resolve().unwrap();
     let live = ProcLiveness::resolve(&roots, cfg.active_window.0);
 
@@ -368,7 +368,7 @@ fn p4t_session_going_live_between_plan_and_commit_protects() {
     let env = Env::resolve(Some(&fx.yomi_home), None).unwrap();
     let cfg = env.config.gc.clone();
     let cat = catalog::open_env(&env).unwrap();
-    let bl = Blacklist::compile(&env.config.blacklist_add).unwrap();
+    let bl = Blacklist::compile(&env).unwrap();
     let roots = SourceRoots::resolve().unwrap();
 
     let live = ProcLiveness::resolve(&roots, cfg.active_window.0);
