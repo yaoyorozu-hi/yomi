@@ -924,16 +924,41 @@ Path-exact + glob, non-overridable by config (config may **add**, never remove):
 - `~/.claude/mcp-needs-auth-cache.json`
 - `~/.zaibatsu/**`
 - `~/.local/share/claude/versions/**`, `~/.local/state/claude/locks/**`
+- **`$YOMI_HOME` and everything under it** — the store this run writes, resolved from `Env`, not the
+  `~/.yomi` default (`--home` and `$YOMI_HOME` both move it)
 
 A blacklisted path is never opened for read **or** delete. Test-proven in CI (P1 gate).
+
+**Self-exclusion (no recursive ingestion).** `quarantine/` holds unredacted originals by design, so a
+store placed inside a walked source root composes with `archive --include scratch`, which enumerates
+`<tmp_root>/<slug>/<uuid>/` **entire**: run N reads run N-1's raw secrets back as ordinary
+`*.md`/`*.json` work files, stores them a level deeper, and quarantines them again — monotonic and
+unbounded, with every copy keeping the original's name so it never leaves the default allow globs. The
+denylist is the only layer that can refuse this, and the default `~/.yomi` was safe only by sitting
+outside the three source roots by accident. Registering the store here rather than filtering in the
+scratch walk keeps it on the one gate every read and every unlink already passes. Consequence, and the
+intended one: a scratch tree containing the store is never reclaimed, because its manifest carries
+`blacklisted: true` entries. Measured in `tests/p18_self_ingest_break.rs` (two-pass and six-pass).
+
+**Patterns are anchored through the same normalization as their subjects.** Each entry's leading
+metacharacter-free path is resolved with `abs_normalize` at compile time — the function `path_denied`
+runs on every subject — and only then escaped, so `$HOME` being a symlink (NFS home, bind mount,
+`/home` → `/mnt/home`) cannot leave pattern and subject naming different strings. It could: patterns
+were built from an unresolved `$HOME` while every subject was canonicalized, and the three entries with
+no inode backstop behind them — `~/.zaibatsu/**`, `versions/**`, `locks/**` — matched nothing and were
+archived. Resolving the whole literal prefix rather than only the home also covers a symlink *inside* a
+denied path (`~/.zaibatsu` → `/mnt/secrets`), which no per-entry inode snapshot could, and the escape
+keeps a metacharacter in a real directory name (`~/a[1]`) a literal instead of a character class that
+matches something else. `abs_normalize` resolves the longest **existing** ancestor and appends any
+missing tail lexically, so the two sides agree whether or not a subject's leaf is present.
 
 **Hardlink defense.** The blacklist matches on a normalized absolute path *and* on the inode
 `(dev, ino)` of the credential files, so a hardlink to a credential placed at a non-denied path (e.g.
 inside `projects/`) is still refused. The cardinal credential files (`.credentials.json`,
 `.claude.json`, `mcp-needs-auth-cache.json`) are **re-stat'd live on every check**, so a hardlink
 created *after* the denylist was built is still caught. Rolling `backups/*` use a compile-time inode
-snapshot (lower value; mid-run rotation is a narrow, non-cardinal window). Symlinks are already caught
-by path normalization.
+snapshot (lower value; mid-run rotation is a narrow, non-cardinal window). Symlinks are caught by the
+normalization above, on both sides of the comparison — the pattern's as well as the subject's.
 
 **Open is fd-pinned (no check→open race).** The reader `open()`s the source **once** and runs the
 inode check against that open fd's own `fstat`, then reads from the fd — never re-opening the path. A

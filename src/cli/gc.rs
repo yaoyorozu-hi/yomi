@@ -45,7 +45,7 @@ pub fn run(env: &Env, args: &GcArgs, json: bool) -> Result<i32> {
         );
     }
 
-    let bl = Blacklist::compile(&env.config.blacklist_add)?;
+    let bl = Blacklist::compile(env)?;
     let roots = SourceRoots::resolve()?;
     let live = ProcLiveness::resolve(&roots, cfg.active_window.0);
     let min_over: Option<Duration> = match &args.min_age {

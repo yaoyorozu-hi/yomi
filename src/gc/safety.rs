@@ -645,7 +645,12 @@ mod tests {
 
         // Compile the denylist against the fake HOME (credential inode captured);
         // the check itself re-stats stored absolute paths, not HOME.
-        let bl = crate::blacklist::Blacklist::compile_with_home(&fake_home, &[]).unwrap();
+        let bl = crate::blacklist::Blacklist::compile_with_roots(
+            &fake_home,
+            &fake_home.join(".yomi"),
+            &[],
+        )
+        .unwrap();
 
         let outcome = remove_tree_guarded(&bl, &tree).unwrap();
         assert!(

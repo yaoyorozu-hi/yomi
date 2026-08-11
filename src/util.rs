@@ -78,18 +78,43 @@ pub fn expand_tilde(path: &str) -> Result<PathBuf> {
     }
 }
 
-/// Canonicalize if the path exists, else lexically normalize against cwd.
-/// Used so blacklist matching is stable whether or not a path is present.
+/// Absolute, symlink-resolved form of `path`, for comparing one path against
+/// another — blacklist globs against their subjects, catalog keys against each
+/// other.
+///
+/// Fully canonicalized when the path exists. When it does not, the **longest
+/// existing ancestor** is canonicalized and the missing tail appended lexically,
+/// so a path under a symlinked ancestor lands in the same tree whether or not its
+/// leaf is present. Resolving only the whole path or nothing was the asymmetry
+/// that let a denylist glob stop matching: patterns are anchored through this same
+/// function, and a pattern resolved to `/mnt/home/u/...` never meets a subject
+/// left at `/home/u/...` because its leaf happened to be gone.
 pub fn abs_normalize(path: &Path) -> PathBuf {
     if let Ok(c) = path.canonicalize() {
         return c;
     }
-    let base = if path.is_absolute() {
+    let lexical = lexical_abs(path);
+    let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut cur: &Path = &lexical;
+    while let (Some(parent), Some(name)) = (cur.parent(), cur.file_name()) {
+        tail.push(name);
+        if let Ok(mut resolved) = parent.canonicalize() {
+            resolved.extend(tail.iter().rev().copied());
+            return resolved;
+        }
+        cur = parent;
+    }
+    lexical
+}
+
+/// `path` made absolute against the cwd with `.` and `..` folded away, resolving
+/// no symlinks.
+fn lexical_abs(path: &Path) -> PathBuf {
+    let mut out = if path.is_absolute() {
         PathBuf::new()
     } else {
         std::env::current_dir().unwrap_or_default()
     };
-    let mut out = base;
     for comp in path.components() {
         use std::path::Component;
         match comp {
@@ -104,4 +129,38 @@ pub fn abs_normalize(path: &Path) -> PathBuf {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The property blacklist anchoring rests on: a symlinked ancestor is
+    /// resolved even when the leaf below it does not exist, so the same subject
+    /// normalizes into the target tree whether it is present or missing.
+    #[test]
+    fn normalizes_a_missing_leaf_through_a_symlinked_ancestor() {
+        let base = std::env::temp_dir().join(format!("yomi-norm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("real/sub")).unwrap();
+        std::os::unix::fs::symlink(base.join("real"), base.join("link")).unwrap();
+        let real = base.join("real").canonicalize().unwrap();
+
+        // Present leaf: plain canonicalization.
+        std::fs::write(base.join("real/sub/here"), b"x").unwrap();
+        assert_eq!(
+            abs_normalize(&base.join("link/sub/here")),
+            real.join("sub/here")
+        );
+        // Missing leaf, and a missing directory above it: same tree.
+        assert_eq!(
+            abs_normalize(&base.join("link/sub/gone")),
+            real.join("sub/gone")
+        );
+        assert_eq!(
+            abs_normalize(&base.join("link/absent/deeper/gone")),
+            real.join("absent/deeper/gone")
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
