@@ -69,6 +69,65 @@ impl Target {
     }
 }
 
+/// How aggressively this run reclaims. `clear` is three levels behind two flags
+/// (decision #11), and the level is a property of the *run*, not of a target: it
+/// moves the age policy for every family and, on the scratch path, decides which
+/// trees the verb claims at all.
+///
+/// It lives here beside [`Target`] because both are run-level vocabulary the
+/// orchestrator hands to `policy` and `safety`; neither is policy's own.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ScratchMode {
+    /// Default `gc`: archived **and** aged. Every retain window and the
+    /// `min_age` floor are in force.
+    Aged,
+    /// `gc --full`: what the gates already prove is archived, at any age above the
+    /// relaxed floor. Every family's retain window drops to zero and the floor
+    /// relaxes to [`policy::relaxed_min_age_floor`] — the level is not a target
+    /// filter. A scratch tree carries one **additional** requirement, since a
+    /// whole-tree delete is not a per-file one: a ledger recording `caps_lifted`
+    /// and an empty captured set.
+    Full,
+    /// `gc --wipe`: the whole tree, no ledger required. **Declared, not
+    /// implemented** — the behaviour is PR C2's. Nothing constructs this variant
+    /// yet; it is here so C2 adds a coverage bypass rather than an enum.
+    Wipe,
+}
+
+/// A candidate's live bytes, split by whether this run could verify an archived
+/// copy of them. Reported so a plan says not only how much it reclaims but how
+/// much of that exists nowhere else.
+///
+/// `archived + unarchived` is not required to equal the candidate's total. A
+/// scratch tree's split is stated over its ledger's **present** entries, and a
+/// retained (`present: false`) entry describes a file that has already left the
+/// live tree — deleting the tree loses none of its bytes, so it belongs to
+/// neither side. That is the same reasoning [`safety`]'s captured-set test makes:
+/// a retained entry says nothing about what a whole-tree delete destroys.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct ByteSplit {
+    pub archived: u64,
+    pub unarchived: u64,
+}
+
+impl ByteSplit {
+    /// Every one of these bytes was proved to be in the store.
+    pub fn all_archived(bytes: u64) -> Self {
+        ByteSplit {
+            archived: bytes,
+            unarchived: 0,
+        }
+    }
+
+    /// None of these bytes has an archived copy this run could verify.
+    pub fn all_unarchived(bytes: u64) -> Self {
+        ByteSplit {
+            archived: 0,
+            unarchived: bytes,
+        }
+    }
+}
+
 /// What kind of candidate this is, which decides the gate path.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum CandidateKind {
@@ -146,10 +205,26 @@ impl SkipReason {
     }
 }
 
+/// Why a candidate was held back. Every one of these is a `Protected` verdict and
+/// not an `Unverified` one, including the two `--full` adds: nothing about the
+/// candidate is unproven — the gates passed and the policy declined to act.
 pub enum ProtectReason {
     SessionLive,
     TooYoung,
     RetainWindow,
+    /// `--full` only: the captured set is not empty, so this tree holds content the
+    /// store already has, and removing it is outside what `--full` claims — this
+    /// level reclaims only trees whose contents were never stored.
+    ///
+    /// **Not a loss, a scope.** The `.zst` copies remain either way, so nothing is
+    /// destroyed by taking the tree; what stops is the verb, because it never
+    /// promised to decide the fate of content that has been captured. Remedy:
+    /// `--wipe` to remove it regardless, or let the default age policy take it.
+    Captured,
+    /// `--full` only: this ledger was not written by a caps-lifted archive run,
+    /// so whether the tree holds admittable content is not established under
+    /// `--full` policy. Remedy: `yomi archive --all --full`.
+    NotFullyArchived,
 }
 
 impl ProtectReason {
@@ -158,6 +233,8 @@ impl ProtectReason {
             ProtectReason::SessionLive => "SessionLive",
             ProtectReason::TooYoung => "TooYoung",
             ProtectReason::RetainWindow => "RetainWindow",
+            ProtectReason::Captured => "Captured",
+            ProtectReason::NotFullyArchived => "NotFullyArchived",
         }
     }
 }
@@ -180,20 +257,39 @@ pub struct PlanItem {
     pub candidate: Candidate,
     pub verdict: Verdict,
     pub bytes: u64,
+    pub split: ByteSplit,
 }
 
 pub struct Plan {
     pub items: Vec<PlanItem>,
     pub reclaimable_bytes: u64,
+    pub reclaimable_archived_bytes: u64,
+    pub reclaimable_unarchived_bytes: u64,
     pub protected: usize,
     pub unverified: usize,
     pub deletable: usize,
+    /// The level this plan was computed under, so an emitter describes the plan it
+    /// was handed rather than re-reading the flag that produced it.
+    pub mode: ScratchMode,
+    /// Scratch trees no ledger this run could verify covers — `NoCatalogRow`, which
+    /// on the scratch path means an absent manifest, one that will not parse, or a
+    /// live file the manifest does not mention (§5 D-S7 keeps them under one
+    /// reason). Counted because under `--full` an operator who has never archived
+    /// otherwise sees "0 deletable" with nothing naming the cause: a tree yomi never
+    /// captured is not a tree with an empty captured set, and the remedy for all
+    /// three states is one `yomi archive --all --full` run, not a different gc flag.
+    pub scratch_no_ledger: usize,
+    /// Scratch trees held at `NotFullyArchived`. Same remedy, different state, so
+    /// it is its own count rather than folded into the one above.
+    pub scratch_not_fully_archived: usize,
 }
 
 #[derive(Default)]
 pub struct CommitReport {
     pub deleted: usize,
     pub reclaimed_bytes: u64,
+    pub reclaimed_archived_bytes: u64,
+    pub reclaimed_unarchived_bytes: u64,
     /// Plan-`Delete` items that flipped to Unverified at the commit re-check.
     pub flipped_unverified: usize,
     /// Plan-`Delete` items that flipped to Protected at the commit re-check.
@@ -306,6 +402,7 @@ fn file_candidate(source: PathBuf, target: Target) -> Candidate {
 }
 
 /// Evaluate one candidate through the appropriate gate path.
+#[allow(clippy::too_many_arguments)]
 fn evaluate_candidate(
     env: &Env,
     cfg: &GcConfig,
@@ -314,8 +411,9 @@ fn evaluate_candidate(
     cand: &Candidate,
     active: &HashSet<String>,
     min_age: Duration,
-) -> Result<(Verdict, u64)> {
-    let retain = policy::retain_for(cfg, cand.target);
+    mode: ScratchMode,
+) -> Result<(Verdict, u64, ByteSplit)> {
+    let retain = policy::retain_for(cfg, cand.target, mode);
     let active_window = cfg.active_window.0;
     match cand.kind {
         CandidateKind::File => safety::evaluate_file(
@@ -340,6 +438,7 @@ fn evaluate_candidate(
             min_age,
             retain,
             active_window,
+            mode,
         ),
         CandidateKind::EmptyDir => {
             safety::evaluate_empty_dir(&cand.source, active, min_age, active_window)
@@ -394,6 +493,7 @@ fn under_allowed(source: &Path, roots: &SourceRoots) -> bool {
 }
 
 /// Build the plan (pure read, no mutation) for the requested targets.
+#[allow(clippy::too_many_arguments)]
 pub fn plan(
     env: &Env,
     cfg: &GcConfig,
@@ -402,10 +502,11 @@ pub fn plan(
     bl: &Blacklist,
     live: &dyn live::Liveness,
     min_age_override: Option<Duration>,
+    mode: ScratchMode,
 ) -> Result<Plan> {
     let roots = SourceRoots::resolve()?;
     let active = live.active_session_uuids();
-    let min_age = policy::effective_min_age(cfg, min_age_override);
+    let min_age = policy::effective_min_age(cfg, min_age_override, mode);
 
     let mut items = Vec::new();
     for &target in targets {
@@ -414,41 +515,66 @@ pub fn plan(
                 tracing::warn!(path = %cand.source.display(), "candidate escapes user roots; dropped");
                 continue;
             }
-            let (verdict, bytes) = evaluate_candidate(env, cfg, cat, bl, &cand, &active, min_age)?;
+            let (verdict, bytes, split) =
+                evaluate_candidate(env, cfg, cat, bl, &cand, &active, min_age, mode)?;
             items.push(PlanItem {
                 candidate: cand,
                 verdict,
                 bytes,
+                split,
             });
         }
     }
 
     let mut reclaimable_bytes = 0;
+    let mut reclaimable_archived_bytes = 0;
+    let mut reclaimable_unarchived_bytes = 0;
     let mut protected = 0;
     let mut unverified = 0;
     let mut deletable = 0;
+    let mut scratch_no_ledger = 0;
+    let mut scratch_not_fully_archived = 0;
     for it in &items {
+        let scratch = it.candidate.kind == CandidateKind::ScratchTree;
         match &it.verdict {
             Verdict::Delete { .. } => {
                 deletable += 1;
                 reclaimable_bytes += it.bytes;
+                reclaimable_archived_bytes += it.split.archived;
+                reclaimable_unarchived_bytes += it.split.unarchived;
             }
-            Verdict::Protected { .. } => protected += 1,
-            Verdict::Unverified { .. } => unverified += 1,
+            Verdict::Protected { reason } => {
+                protected += 1;
+                if scratch && matches!(reason, ProtectReason::NotFullyArchived) {
+                    scratch_not_fully_archived += 1;
+                }
+            }
+            Verdict::Unverified { reason } => {
+                unverified += 1;
+                if scratch && matches!(reason, SkipReason::NoCatalogRow) {
+                    scratch_no_ledger += 1;
+                }
+            }
         }
     }
     Ok(Plan {
         items,
         reclaimable_bytes,
+        reclaimable_archived_bytes,
+        reclaimable_unarchived_bytes,
         protected,
         unverified,
         deletable,
+        mode,
+        scratch_no_ledger,
+        scratch_not_fully_archived,
     })
 }
 
 /// Execute a plan's `Delete` items under the caller-held write lock, re-running
 /// every gate against the live fs immediately before each delete (the plan can
 /// be minutes stale), appending each action to `gc.log`.
+#[allow(clippy::too_many_arguments)]
 pub fn commit(
     env: &Env,
     cfg: &GcConfig,
@@ -457,11 +583,13 @@ pub fn commit(
     bl: &Blacklist,
     live: &dyn live::Liveness,
     min_age_override: Option<Duration>,
+    mode: ScratchMode,
 ) -> Result<CommitReport> {
     let active = live.active_session_uuids();
     // Re-evaluation must honor the same effective floor the plan used, so a
-    // `--min-age` raise is not silently dropped between plan and unlink (N3).
-    let min_age = policy::effective_min_age(cfg, min_age_override);
+    // `--min-age` raise is not silently dropped between plan and unlink (N3), and
+    // the same level, so a `--full` plan is not re-judged under the aged policy.
+    let min_age = policy::effective_min_age(cfg, min_age_override, mode);
     let mut log = GcLog::open(env)?;
     let mut report = CommitReport::default();
 
@@ -470,8 +598,8 @@ pub fn commit(
             // Delete-planned items are re-evaluated against the live fs — the plan
             // can be minutes stale, so liveness and sha are re-checked before unlink.
             Verdict::Delete { .. } => {
-                let (verdict, bytes) =
-                    evaluate_candidate(env, cfg, cat, bl, &item.candidate, &active, min_age)?;
+                let (verdict, bytes, split) =
+                    evaluate_candidate(env, cfg, cat, bl, &item.candidate, &active, min_age, mode)?;
                 match verdict {
                     Verdict::Delete { archive_id, checks } => {
                         // A delete that fails (EACCES on the parent, EIO, …) must
@@ -483,6 +611,8 @@ pub fn commit(
                             Ok(true) => {
                                 report.deleted += 1;
                                 report.reclaimed_bytes += bytes;
+                                report.reclaimed_archived_bytes += split.archived;
+                                report.reclaimed_unarchived_bytes += split.unarchived;
                                 log.delete(
                                     &item.candidate,
                                     archive_id,
