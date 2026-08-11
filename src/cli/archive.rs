@@ -24,6 +24,12 @@ pub struct ArchiveArgs {
     /// Comma list: transcript,subagents,tool-results,history,mcp,snapshots,paste,scratch,all.
     #[arg(long)]
     pub include: Option<String>,
+    /// Archive every source family, with the [scratch] caps lifted. Implies
+    /// --all when no selector is given; --session and PATH still narrow. An
+    /// explicit --include wins over the family set, so `--full --include
+    /// scratch` lifts the caps for scratch alone.
+    #[arg(long)]
+    pub full: bool,
     /// Skip the secret scan (store raw). Not recommended.
     #[arg(long)]
     pub no_scan: bool,
@@ -46,9 +52,15 @@ pub fn run(env: &Env, args: &ArchiveArgs, json: bool) -> Result<i32> {
         return Ok(EXIT_REFUSED);
     }
 
-    let includes = match &args.include {
-        Some(spec) => Include::parse_list(spec)?,
-        None => Include::default_set(),
+    // `--full` widens the *default* family set and lifts the caps; an explicit
+    // `--include` still decides which families run. The two are separable on
+    // purpose: `--include all` keeps the caps in force — the combination "every
+    // family, caps still applied" is useful, and existing callers rely on it —
+    // so the only thing `--full` adds beyond the family set is the cap lift.
+    let includes = match (&args.include, args.full) {
+        (Some(spec), _) => Include::parse_list(spec)?,
+        (None, true) => Include::all(),
+        (None, false) => Include::default_set(),
     };
 
     let blacklist = Blacklist::compile(env)?;
@@ -82,6 +94,7 @@ pub fn run(env: &Env, args: &ArchiveArgs, json: bool) -> Result<i32> {
         catalog: &cat,
         scan_enabled: !args.no_scan,
         quarantine_all: args.quarantine_on_secret,
+        caps_lifted: args.full,
         dry_run: args.dry_run,
     };
 
@@ -98,7 +111,13 @@ pub fn run(env: &Env, args: &ArchiveArgs, json: bool) -> Result<i32> {
             Selector::TranscriptPath(p.clone())
         } else if let Some(u) = &args.session {
             Selector::Session(u.clone())
-        } else if args.all {
+        } else if args.all || args.full {
+            // `--full` fills an *empty* selector only. "Archive everything, caps
+            // off" is what the flag means, and `yomi archive --full` with no
+            // selector is what an operator types for it — reaching the bail below
+            // would make the flag's own spelling an error. An explicit
+            // `--session` or PATH is still honoured: narrowing is the caller's,
+            // and the flag adds the cap lift to whatever they asked for.
             Selector::All
         } else {
             anyhow::bail!("specify one of --all, --session <uuid>, or a transcript PATH");
@@ -173,6 +192,8 @@ fn emit(r: &Report, dry_run: bool, json: bool) {
             "oversize_skipped": r.oversize_skipped,
             "quarantine_refused": r.quarantine_refused,
             "scratch_orphans_removed": r.scratch_orphans_removed,
+            "scratch_orphans_cap_declined": r.scratch_orphans_cap_declined,
+            "scratch_keys_caps_reimposed": r.scratch_keys_caps_reimposed,
         });
         println!("{}", serde_json::to_string(&v).unwrap_or_default());
         return;
@@ -214,5 +235,25 @@ fn emit(r: &Report, dry_run: bool, json: bool) {
              [scratch] policy no longer stores them.",
             r.scratch_orphans_removed
         );
+        // Which rule dropped them. The count above says a loss happened; on its
+        // own it is indistinguishable from an operator having edited the globs,
+        // and the two remedies are opposite ones.
+        if r.scratch_orphans_cap_declined > 0 {
+            println!(
+                "{prefix}cause: the [scratch] caps declined {} of them — over \
+                 file_cap, or in a tree over total_cap.",
+                r.scratch_orphans_cap_declined
+            );
+        }
+        if r.scratch_keys_caps_reimposed > 0 {
+            let dropped = if dry_run { "would drop" } else { "dropped" };
+            println!(
+                "{prefix}{} of those store keys had a --full run as their last \
+                 archive, which lifted those caps; this run has them in force, so \
+                 it {dropped} what that run stored. Re-run with --full to store it \
+                 again.",
+                r.scratch_keys_caps_reimposed
+            );
+        }
     }
 }

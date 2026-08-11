@@ -66,23 +66,33 @@ pub enum Include {
 }
 
 impl Include {
+    /// Every source family: what `--include all` selects, and what `--full`
+    /// selects when no `--include` is given.
+    ///
+    /// One list, in one place: `parse_list` delegates here rather than spelling
+    /// the eight variants a second time beside `--full`'s default. A list written
+    /// twice drifts the first time a family is added, and it drifts silently — a
+    /// missing variant reads as "that family was not asked for", never as an error.
+    pub fn all() -> Vec<Include> {
+        use Include::*;
+        vec![
+            Transcript,
+            Subagents,
+            ToolResults,
+            History,
+            Mcp,
+            Snapshots,
+            Paste,
+            Scratch,
+        ]
+    }
+
     pub fn parse_list(spec: &str) -> Result<Vec<Include>> {
         use Include::*;
         let mut out = Vec::new();
         for tok in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
             match tok {
-                "all" => {
-                    return Ok(vec![
-                        Transcript,
-                        Subagents,
-                        ToolResults,
-                        History,
-                        Mcp,
-                        Snapshots,
-                        Paste,
-                        Scratch,
-                    ]);
-                }
+                "all" => return Ok(Include::all()),
                 "transcript" => out.push(Transcript),
                 "subagents" => out.push(Subagents),
                 "tool-results" => out.push(ToolResults),

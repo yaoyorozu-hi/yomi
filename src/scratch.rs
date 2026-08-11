@@ -572,6 +572,24 @@ pub struct ScratchManifest {
     pub total_bytes: u64,
     #[serde(default)]
     pub over_total_cap: bool,
+    /// The `[scratch]` caps were lifted for the run that wrote this ledger
+    /// (`archive --full`).
+    ///
+    /// Without it, `over_total_cap: false` and the absence of any
+    /// `not_stored: "file_cap"` are ambiguous: they mean either "no cap declined
+    /// anything" or "no cap was applied". The two look identical in a manifest and
+    /// differ in exactly the case that loses data — a `--full` run stores N
+    /// artifacts, a later plain `--include scratch` run finds them unclaimed under
+    /// the caps it does apply, and reconciliation removes them. That removal is
+    /// correct (store law S: the store holds what current policy stores), but a
+    /// removal with no nameable cause reads as a defect, and the operator who
+    /// wanted those bytes has nothing to act on. This field is the name.
+    ///
+    /// `serde(default)` and emitted only when true, so a manifest written before
+    /// it parses unchanged and a capped run's manifest is byte-identical to one
+    /// from before the field existed.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub caps_lifted: bool,
     pub entries: Vec<ScratchEntry>,
 }
 
@@ -1956,6 +1974,7 @@ mod tests {
             captured_at: String::new(),
             total_bytes: 0,
             over_total_cap: false,
+            caps_lifted: false,
             entries: Vec::new(),
         };
         assert_eq!(
@@ -2105,6 +2124,7 @@ mod tests {
             captured_at: String::new(),
             total_bytes: 0,
             over_total_cap: false,
+            caps_lifted: false,
             entries: Vec::new(),
         };
         assert_eq!(

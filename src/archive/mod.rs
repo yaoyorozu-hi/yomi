@@ -41,6 +41,21 @@ pub struct Report {
     /// under `--dry-run`. Surfaced because a config change that discards stored
     /// bytes must be loud.
     pub scratch_orphans_removed: u64,
+    /// The subset of `scratch_orphans_removed` the `[scratch]` caps account for:
+    /// this run's `file_cap` declined the file, or its `total_cap` declined the
+    /// whole tree.
+    ///
+    /// Loud counts a removal; this names the **rule** that caused it. Without it
+    /// a `--full` run followed by a plain one reports "N artifacts removed" with
+    /// no cause, indistinguishable from an operator having edited the globs —
+    /// which is the sharpest data-loss path `--full` opens, since the narrower
+    /// run is the one that deletes.
+    pub scratch_orphans_cap_declined: u64,
+    /// Store keys where the removal above happened *and* the prior ledger
+    /// recorded `caps_lifted` — a `--full` run stored those bytes and this run,
+    /// with the caps in force, dropped them. The other half of the cause: the
+    /// rule, and the run whose output it acted on.
+    pub scratch_keys_caps_reimposed: u64,
 }
 
 pub struct Archiver<'a> {
@@ -51,6 +66,16 @@ pub struct Archiver<'a> {
     pub scan_enabled: bool,
     /// Force quarantine of the original for MED findings too, not just HIGH.
     pub quarantine_all: bool,
+    /// `--full`: the `[scratch]` caps decline nothing this run — neither
+    /// `file_cap` per file nor `total_cap` per tree.
+    ///
+    /// **Exactly the caps.** The allow/deny globs still decide what is stored, so
+    /// `NotStored::{NotAllowed, Denied}` are unaffected and a `.git` tree is no
+    /// more archivable under `--full` than without it; only `NotStored::FileCap`
+    /// and `over_total_cap` become unreachable. The sizes are still measured and
+    /// `total_bytes` is still recorded — lifting a cap is not a reason to stop
+    /// knowing what it would have declined.
+    pub caps_lifted: bool,
     pub dry_run: bool,
 }
 
@@ -423,6 +448,11 @@ impl<'a> Archiver<'a> {
             }
         }
 
+        // Whether the bytes this run may be about to reconcile away were stored by
+        // a run that had the caps lifted. Read before the walk, because the
+        // manifest is about to be replaced by this run's.
+        let prior_caps_lifted = prior.as_ref().is_some_and(|mf| mf.caps_lifted);
+
         // The whole session tree, not `scratchpad/` + `tasks/*.output`: the
         // deleter removes `<slug>/<uuid>/` entire, so a live file the writer
         // never manifests is one the GC gate cannot account for, and the tree is
@@ -438,6 +468,13 @@ impl<'a> Archiver<'a> {
         let mut entries: Vec<ScratchEntry> = Vec::new();
         let mut kept: Vec<(PathBuf, ScratchRel)> = Vec::new();
         let mut denied: Vec<ScratchRel> = Vec::new();
+        // Identities a `[scratch]` cap declined this run, collected as the
+        // decisions are taken rather than reconstructed at reconcile time: after
+        // the tree cap flips `stored`, an entry it declined is indistinguishable
+        // from one the globs never admitted, and the two send an operator to
+        // different edits. Empty under `--full`, where no cap declines anything.
+        let mut cap_declined: std::collections::HashSet<ScratchRel> =
+            std::collections::HashSet::new();
         let mut total: u64 = 0;
         for path in &candidates {
             if self.blacklist.is_blacklisted(path) {
@@ -480,11 +517,14 @@ impl<'a> Archiver<'a> {
                 Some(NotStored::NotAllowed)
             } else if deny.is_match(subpath) {
                 Some(NotStored::Denied)
-            } else if size > cfg.file_cap.0 {
+            } else if !self.caps_lifted && size > cfg.file_cap.0 {
                 Some(NotStored::FileCap)
             } else {
                 None
             };
+            if not_stored == Some(NotStored::FileCap) {
+                cap_declined.insert(rel.clone());
+            }
             entries.push(ScratchEntry::new(&rel, size, not_stored));
             kept.push((path.clone(), rel));
         }
@@ -496,9 +536,16 @@ impl<'a> Archiver<'a> {
         // the GC gate as a corrupt archive, which refuses the tree forever (the
         // 134M clone the cap exists for was never reclaimable). `over_total_cap`
         // already records why nothing was stored — design §3, decision #4.
-        let over_total = total > cfg.total_cap.0;
+        //
+        // `total` is accumulated either way: `--full` lifts the cap, not the
+        // measurement, and `total_bytes` is what a later reader needs to see what
+        // the cap would have decided.
+        let over_total = !self.caps_lifted && total > cfg.total_cap.0;
         if over_total {
-            for entry in &mut entries {
+            for (entry, (_, rel)) in entries.iter_mut().zip(kept.iter()) {
+                if entry.stored {
+                    cap_declined.insert(rel.clone());
+                }
                 entry.stored = false;
             }
         }
@@ -625,6 +672,7 @@ impl<'a> Archiver<'a> {
                 captured_at: now_iso(),
                 total_bytes: total,
                 over_total_cap: over_total,
+                caps_lifted: self.caps_lifted,
                 entries,
             };
             let mfp = store_dir.join("manifest.json");
@@ -635,11 +683,12 @@ impl<'a> Archiver<'a> {
             // claiming a `.zst` that is gone, which refuses the tree until someone
             // re-archives.
             if ledger_complete {
-                report.scratch_orphans_removed +=
-                    reconcile_scratch_store(&store_dir, &mf.entries, false)?;
+                let rec = reconcile_scratch_store(&store_dir, &mf.entries, &cap_declined, false)?;
+                rec.tally(report, prior_caps_lifted);
             }
         } else if ledger_complete {
-            report.scratch_orphans_removed += reconcile_scratch_store(&store_dir, &entries, true)?;
+            let rec = reconcile_scratch_store(&store_dir, &entries, &cap_declined, true)?;
+            rec.tally(report, prior_caps_lifted);
         }
         Ok(())
     }
@@ -1256,10 +1305,34 @@ fn salvage(
     }
 }
 
+/// What one key's reconciliation did, and how much of it has a nameable cause.
+#[derive(Default)]
+struct Reconciled {
+    /// Stale artifacts removed, or — under `dry_run` — that would be.
+    removed: u64,
+    /// The subset a `[scratch]` cap declined this run. Split out because a count
+    /// alone cannot be acted on: the remedy for a cap is `--full` or a wider cap,
+    /// and the remedy for a glob is an edit to `allow`/`deny`.
+    by_cap: u64,
+}
+
+impl Reconciled {
+    /// Fold into the run report, recording the prior ledger's `caps_lifted` only
+    /// where a cap actually took something away. Ungated it would report a key
+    /// that lost nothing, which is a claim about a loss that did not happen.
+    fn tally(&self, report: &mut Report, prior_caps_lifted: bool) {
+        report.scratch_orphans_removed += self.removed;
+        report.scratch_orphans_cap_declined += self.by_cap;
+        if self.by_cap > 0 && prior_caps_lifted {
+            report.scratch_keys_caps_reimposed += 1;
+        }
+    }
+}
+
 /// Establish store law S for one scratch key: the `*.zst` under
 /// `archive/_scratch/<K>/` are exactly the `store_rel()` of the manifest's
 /// `stored: true` entries. Returns how many stale artifacts were removed — or,
-/// under `dry_run`, how many would be.
+/// under `dry_run`, how many would be — and how many of those a cap explains.
 ///
 /// The delete authority is deliberately enumerable and cannot grow: **regular
 /// files only**, **`.zst` extension only**, **under this one key's store dir
@@ -1277,18 +1350,19 @@ fn salvage(
 fn reconcile_scratch_store(
     store_dir: &Path,
     entries: &[ScratchEntry],
+    cap_declined: &std::collections::HashSet<ScratchRel>,
     dry_run: bool,
-) -> Result<u64> {
+) -> Result<Reconciled> {
     if entries.iter().any(|e| e.rel().is_none()) {
         tracing::warn!(
             store = %store_dir.display(),
             "refusing to reconcile a store whose ledger holds an entry with an \
              undecodable identity"
         );
-        return Ok(0);
+        return Ok(Reconciled::default());
     }
     if crate::scratch::classify_store_dir(store_dir) != StoreDir::Own {
-        return Ok(0);
+        return Ok(Reconciled::default());
     }
     let expected: std::collections::HashSet<PathBuf> = entries
         .iter()
@@ -1296,8 +1370,12 @@ fn reconcile_scratch_store(
         .filter_map(|e| e.rel())
         .map(|rel| store_dir.join(rel.store_rel()))
         .collect();
+    let capped: std::collections::HashSet<PathBuf> = cap_declined
+        .iter()
+        .map(|rel| store_dir.join(rel.store_rel()))
+        .collect();
 
-    let mut removed = 0u64;
+    let mut out = Reconciled::default();
     for entry in walkdir::WalkDir::new(store_dir)
         .into_iter()
         .filter_map(Result::ok)
@@ -1320,13 +1398,15 @@ fn reconcile_scratch_store(
             continue;
         }
         if dry_run {
-            removed += 1;
+            out.removed += 1;
+            out.by_cap += u64::from(capped.contains(path));
             continue;
         }
         match std::fs::remove_file(path) {
             Ok(()) => {
                 tracing::info!(path = %path.display(), "removed stale scratch artifact");
-                removed += 1;
+                out.removed += 1;
+                out.by_cap += u64::from(capped.contains(path));
             }
             Err(e) => tracing::warn!(
                 path = %path.display(), error = %e,
@@ -1334,7 +1414,7 @@ fn reconcile_scratch_store(
             ),
         }
     }
-    Ok(removed)
+    Ok(out)
 }
 
 /// Build a globset where each pattern also matches nested occurrences, so

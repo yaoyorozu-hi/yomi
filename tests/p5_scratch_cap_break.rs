@@ -1,11 +1,11 @@
 //! P5 break tests: the `over_total_cap` scratch tree.
 //!
-//! Design §3 (`docs/design.md:174-209`) makes over-cap trees **manifest-only +
+//! Design §3, "Scratch (the 134M trap)", makes over-cap trees **manifest-only +
 //! flag**: contents are deliberately not hoarded, the `over_total_cap` flag
 //! records why, and the GC gate's size-only path is the intended assurance —
 //! "Nothing about it is lost except bytes we deliberately declined to hoard."
-//! Reclaiming the 134M scratch clone is the P2 done-when criterion
-//! (`docs/design.md:752`).
+//! Reclaiming the 134M scratch clone is the P2 done-when criterion, in §9's
+//! "Phases (each with a hard done-when)".
 //!
 //! The archive writer instead marks every entry `stored: true` while writing no
 //! `.zst` and no hashes, and the GC gate refuses a stored entry with no hashes.
@@ -299,7 +299,8 @@ fn p5_over_cap_manifest_never_claims_stored_without_hashes() {
     );
 }
 
-/// The P2 done-when: "reclaims the 134M scratch clone" (`docs/design.md:752`).
+/// The P2 done-when: "reclaims the 134M scratch clone" (§9, "Phases (each with a
+/// hard done-when)").
 /// An over-cap tree is aged, non-live, and manifested — every condition the
 /// design places on a scratch reclaim — and must be reclaimed on the size-only
 /// path.
