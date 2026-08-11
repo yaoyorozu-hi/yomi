@@ -9,8 +9,42 @@ Status: **DECIDED** — user裁定完 2026-07-12. P1 buildable. Human-facing →
 2. **history.jsonl = archive-slice-only, source never wiped.** No live-file compaction. §5.
 3. **HIGH secret = redact stored copy + quarantine unredacted original** (recoverable). §4.
 4. **scratch = allowlist + size-cap store** (not manifest-only). §3.
+   — 2026-08-10 に修正。下の 決定事項 (2026-08-10) を見よ。
 5. **codex = frozen read-only vestige — NOT removed.** Freeze writes + import into yomi, but `mx codex read`/`list`/`search` remain available indefinitely for any legacy archives. **No mx subcommand-removal PR.** yomi-side import path unchanged. §7, P5.
 6. **quarantine at-rest = mode-700 plaintext (v1);** age/gpg encryption deferred to P6. §4.
+
+## 決定事項 (Decisions — user-ratified 2026-08-10)
+
+Every one of these arose from the same question — *what should `yomi archive` do about `/tmp`?* — and
+they are numbered on from #6 because they refine decision #4 rather than replace it.
+
+7. **Default `archive` never touches `/tmp`.** `--include` defaults to the three session pillars
+   (`Include::default_set()` = transcript, subagents, tool-results), so scratch is opt-in and the
+   `[scratch]` caps are unreachable on a default run. Already true in code; recorded because the
+   `--full` decisions below only make sense against it. §3.
+8. **`--full` = every source family + the `[scratch]` caps lifted.** `--include all` keeps the caps:
+   "every family, caps still applied" is a useful and pre-existing combination, and redefining it
+   would make existing callers hoard silently. **What `--full` adds beyond the family set is exactly
+   one thing — the cap lift.** The allow/deny globs are not lifted by it. §3, §8.
+9. **`total_cap` counts would-store bytes, not the whole tree.** Today `total` sums every candidate,
+   including the files the globs already refused, so the build output and `.git` trees the globs exist
+   to exclude are what puts a tree over the cap — and it then stores nothing at all, including the few
+   MB it would have stored. Measured on this host: 30.9MB admitted, 9.3MB effectively stored (§0).
+   Queued as its own change (PR E), together with raising the default to 64MB; **not implemented by the
+   `--full` PR**. §3.
+10. **`~/.yomi` has no size ceiling by default.** Opt-in by config/env when one is wanted, and it is a
+    *refusal to grow* — no eviction of what is already archived, since eviction would delete the only
+    copy of something. Issue #59. §2.
+11. **Default `gc` stays age-based.** `clear` is three levels behind two flags: default (age policy),
+    `--full` (everything in the captured set, regardless of age), `--wipe` (the whole tree). Queued as
+    PR C1/C2; not part of the `--full` archive PR. §5.
+12. **`--full` does not widen `tmp_root`.** It archives more of `/tmp/claude-<uid>/` and nothing
+    outside it. It is **not** a flag for the uid-owned entries sitting directly in `/tmp` (the
+    `yomi-*` test directories of issue #48) — those are a janitor's problem, not an archive's. §3.
+13. **The scratch delete unit stays the tree.** Per-file deletion was considered and refused: the GC
+    gate's invariant is stated over a whole tree (`verify_scratch_tree` check 1 — every live file is
+    accounted for by the manifest), so per-file deletion would mean redesigning the gate, which is the
+    one part of §5 that must not move for a convenience. §5.
 
 黄泉 = the underworld where the dead are preserved and, in time, cleared. Session data descends
 to yomi: archived faithfully, then the stale are laid to rest. One static Rust binary. Three
@@ -20,12 +54,54 @@ pillars — **archive**, **wipe**, **index/search** — plus **codex absorption*
 
 ## 0. Grounding facts (verified on host, not assumed)
 
-- **codex store is empty today.** `mx codex list` → `[]`, `~/.zaibatsu/mx/` empty, no `~/.wonka/vault`.
-  → absorption has **near-zero legacy corpus**. Migration is a forward-cutover, not a data conversion. This de-risks P5 dramatically.
-- **Real data ≈ 25M** (projects 23M + tmp scratch ~2M ex-clone + MCP logs 2M). Size traps: `versions/` 248M (runtime, never touched), one 134M `/tmp` repo clone (excluded by rule).
+**Every fact carries the date it was measured, the host, and — for a size — *which quantity* was
+measured.** All three are load-bearing. Until 2026-08-10 this section carried none of them, and its two
+headline figures were wrong by 12× and ~70×: they read as `du -sh` (on-disk) values taken on
+2026-07-12, but nothing said so, and `/tmp` here is ZFS with compression on, where apparent and on-disk
+sizes differ by 2.4–3×. A number without its measure is a number a reader cannot use. Issue #49.
+
+Host below is `luola`, user `yhi` (uid 1007). Sizes are given as **apparent** (`du -sb
+--apparent-size`, the bytes a copy would move) and **on-disk** (`du -s`, post-compression) whenever the
+two differ, because the design leans on both — caps compare against apparent bytes, storage pressure is
+on-disk.
+
+- **codex store is empty.** `mx codex list` → `[]`, `~/.zaibatsu/mx/` empty, no `~/.wonka/vault`.
+  *(2026-07-12; not re-measured since.)* → absorption has **near-zero legacy corpus**. Migration is a
+  forward-cutover, not a data conversion. This de-risks P5 dramatically.
+- **Scratch root `/tmp/claude-1007`: apparent 4.16 GB (4,466,661,813 B) / on-disk 1.65 GiB.** 17,201
+  files, 13,056 directories (3,068 of them empty), max depth 15. *(2026-08-10, `luola`, uid 1007.)*
+  This is a live tree and it moves; the 12× discrepancy the old "~2M + one 134M clone" figure carried is
+  the point, not the exact value.
+- **Under the default `[scratch]` globs, 3,582 files / 30,928,594 B are admitted — 0.69% of the tree.**
+  *(2026-08-10, `luola`, apparent.)* Of that, one tree (`aa0a0ca5…`, 12,729 files, 21,677,097 B
+  admitted) exceeds the 20MB `total_cap` and therefore stores **nothing**, so the effective stored set
+  is **≈9,251,497 B (9.3 MB)**. The gap between 30.9MB admitted and 9.3MB stored is decision #9's
+  subject: the cap is compared against the whole tree rather than the admitted set.
+- **What the bulk actually is:** BUILD 3,794,415,065 B / 11,027 files (84.98%), GIT 613,167,298 B /
+  323 files (13.73%), everything else 57,816,060 B / 5,792 files (1.29%). *(2026-08-10, `luola`,
+  apparent.)* The "134M repo clone" of the original text is gone; build output, not clones, is the
+  population the globs exclude.
+- **Build roots are already fully excluded, measured rather than assumed.** Seven directories match the
+  build-root union rule, and their would-store set is **0 files / 0 bytes**. One complete `cargo target`
+  (464,244,436 B / 1,249 files) contributes 88 allow-matching files totalling 74,331 B, every one a
+  fingerprint `.json`. *(2026-08-10, `luola`, apparent.)*
+- **`/tmp` as a whole: 106 GiB on disk — and this figure required `sudo`, so it is not reproducible as
+  uid 1007.** As this user, `du -sh /tmp` returns 3.5G, because the five per-uid namespaces are all mode
+  700 (`claude-1000` kautau, `1002` charlie, `1004` capitalism, `1006` sandman, `1007` yhi) and only
+  one of them is readable. *(2026-08-10, `luola`; the 106 GiB reading is privileged.)* The provenance is
+  stated rather than dropped: an unattributed number a reader cannot reproduce is the defect #49 is
+  about, and a number they could reproduce *differently* (3.5G) is worse than a missing one.
+- **`/tmp` is part of the `rpool/root` ZFS dataset, not a tmpfs.** It therefore survives reboots:
+  boot was 2026-08-04 11:46 while `/tmp/claude-1002` dates from 2026-07-03. *(2026-08-10, `luola`.)*
+  Nothing may assume `/tmp` clears itself.
+- **`~/.claude/projects`: apparent 133 MB / on-disk 41 MB. MCP logs: apparent 1.2 MB / on-disk 2.7 MB.
+  `~/.local/share/claude/versions/`: apparent 840 MB / on-disk 269 MB** (runtime binaries, never
+  touched). *(2026-08-10, `luola`; issue #49's table.)*
 - **Transcript = append-only JSONL**, one dir per `projects/<slug>/<uuid>`. Slug = cwd with `/`→`-`.
-- Every entry carries `sessionId`, `cwd`, `gitBranch`, `version` (cc), `timestamp`, `userType`, `type`, `uuid`, `parentUuid`. `assistant.message` has `model`, `usage`, content blocks. `subagents/*.meta.json` = `{agentType, description, toolUseId}`.
+  *(2026-07-12; structural, and unchanged since.)*
+- Every entry carries `sessionId`, `cwd`, `gitBranch`, `version` (cc), `timestamp`, `userType`, `type`, `uuid`, `parentUuid`. `assistant.message` has `model`, `usage`, content blocks. `subagents/*.meta.json` = `{agentType, description, toolUseId}`. *(2026-07-12; structural.)*
 - Live-session signal: `~/.claude/sessions/<pid>.json` + `~/.local/state/claude/locks/*.lock`.
+  *(2026-07-12; structural.)*
 
 ---
 
@@ -172,6 +248,12 @@ Frame proliferation hurts ratio slightly; **compaction** (rewrite to single fram
 
 ### Scratch (the 134M trap)
 
+**The `134M` in this heading and in the figures below is the original 2026-07-12 number.** §0 now
+carries measured values, and the clone it names no longer exists at that size — build output, not
+clones, is what the globs exclude. The heading is kept verbatim so this section stays findable by the
+name `tests/p5_scratch_cap_break.rs` cites it under; reconciling the figures that remain inside it is
+issue #49.
+
 Scratch is a working checkout, not "output." Default: **capture a scratch manifest** (file list +
 sizes + hashes), **store contents only for an allowlist under a size cap**:
 
@@ -182,6 +264,19 @@ deny   = [".git/**","node_modules/**","target/**","**/*.{mp4,zip,tar,iso,bin}"]
 file_cap  = "5MB"    # any single file over cap → listed, not stored
 total_cap = "20MB"   # whole scratch over cap → manifest-only + flag
 ```
+
+Two things about the caps, both decided 2026-08-10:
+
+- **`archive --full` lifts both of them** for that run, and nothing else about them (the allow/deny
+  globs are unaffected). The run records `caps_lifted: true` in the manifest, because otherwise
+  "no cap declined anything" and "no cap was applied" are indistinguishable in the ledger — see
+  `--full` below. Decision #8.
+- **`total_cap` counts the wrong bytes today**, and the repair is queued rather than done here: it sums
+  *every* candidate rather than the ones the globs would store, so the build output and `.git` trees the
+  `deny` list already refuses are what carries a tree over the cap, after which it stores nothing at all
+  — which is exactly what happens on this host, where 21.7MB of one tree's admitted files are dropped by
+  a 20MB cap the tree only exceeds on bytes that were never going to be stored (§0). Decision #9, PR E;
+  the default also rises to 64MB there.
 
 The 134M cloned repo → excluded by `deny` + `total_cap`, but its existence is recorded in the scratch
 manifest. Nothing about it is lost except bytes we deliberately declined to hoard.
@@ -203,6 +298,66 @@ flag", "nothing about it is lost except bytes we deliberately declined to hoard"
 same rule: an allow-listed file that would have been stored individually is **not** stored, and is
 deleted with the rest, once the tree as a whole goes over the cap. The trade is per-tree, not
 per-file.
+
+**Under `--full` the same consequence exists at a different scale, in the other direction.** With the
+caps lifted the store holds the whole allow-listed set of a tree the caps would have declined — on this
+host that is a 9.3MB stored set becoming a 30.9MB one (§0), and on a tree with a large allow-listed
+corpus it is unbounded by anything but the globs. That is the point of the flag, and it is why the cap
+lift is opt-in per run rather than a config default: the operator asking for it is present, and the
+next unattended run reverts to the caps. The reversion is itself lossy — see the narrowing note under
+`--full` — which is why the manifest records that the caps were lifted.
+
+#### `archive --full` — what it lifts, and what it must not
+
+Decision #8. `--full` does two things and no third:
+
+1. **the family set**, when nothing else supplies one: `--include` unset becomes every family rather
+   than the three session pillars. An explicit `--include` still decides, so `--full --include
+   transcript` archives transcripts and enumerates no scratch at all;
+2. **the `[scratch]` caps**, lifted for that run: `file_cap` declines no file and `total_cap` declines
+   no tree.
+
+`--include all` is untouched and keeps the caps. It has meant "every family, caps applied" since it
+existed, so any scripted or scheduled caller already passing it would have started hoarding on upgrade
+without a line of its own changing — and the combination it names is worth keeping addressable, since
+redefining it would have made the cap lift unavoidable for anyone who only wanted the families.
+**The whole of what `--full` adds beyond the family set is the cap lift** — stated in the negative
+because the flag's name invites more:
+
+| Not lifted | Why |
+|---|---|
+| `allow` / `deny` globs | they say *what kind of file* is archive-worthy, which is decision #4 itself. A `.git` object tree is no more archivable under `--full` than without it, and `not_stored: "not_allowed"` / `"denied"` are recorded exactly as before |
+| the hard blacklist (§4) | non-overridable by config, and a flag is not a config |
+| `tmp_root` | `--full` archives more *of* `/tmp/claude-<uid>/` and nothing outside it. Decision #12: the uid-owned entries directly under `/tmp` (issue #48's `yomi-*` test dirs) are a janitor's problem, not an archive's |
+| what counts as a session tree | the enumerator takes `<tmp_root>/<X>/<Y>/` as a unit **whatever `Y` looks like** — it does not require a uuid shape, and `--full` does not relax anything here because there is nothing to relax. That breadth is load-bearing rather than lax: the enumerator's unit must equal the deleter's unit, or a live file the writer never manifested refuses its tree forever (§5) |
+| the source-root ownership refusal | a `tmp_root` this euid does not own archives no scratch, under `--full` exactly as without it. "Full" is not an authority over another user's files |
+
+`total` is still accumulated under `--full`, and `total_bytes` still recorded: lifting a cap is not a
+reason to stop measuring what it would have decided. `over_total_cap` is then always `false`, which is
+what makes the ledger field below necessary.
+
+**The narrowing is the sharp edge, and it is named rather than prevented.** A `--full` run stores N
+artifacts; a later plain `--include scratch` run applies the caps, finds those artifacts unclaimed by
+its own manifest, and reconciliation removes them — **store law S working as specified**, since the
+`.zst` under a key are exactly what current policy stores. The behaviour is deliberately not changed:
+refusing to un-store what a previous run stored would make the store impossible to narrow and would put
+the ledger permanently at odds with policy, which is the defect law S exists to end. What was missing
+was the *cause*, and it is supplied at two levels:
+
+```json
+"caps_lifted": true          // ScratchManifest; serde(default), emitted only when true
+```
+
+and, in the run report of the narrowing run, `scratch_orphans_cap_declined` (how many of the removals a
+cap accounts for, as against a glob edit, which sends an operator to a different file) and
+`scratch_keys_caps_reimposed` (how many of those keys were last archived with the caps lifted). The
+human summary states both and names the remedy, because the operator who wanted those bytes is
+otherwise reading a bare count that is indistinguishable from a defect.
+
+`caps_lifted` is additive in the same shape as `present` and `capture_failed`: `#[serde(default)]`, and
+serialized only when true, so a manifest written before the field parses unchanged and a capped run's
+manifest is byte-identical to one from before it existed. Reading absent as `false` is the conservative
+side — claiming a lift that never happened would attribute a later narrowing to a run that never ran.
 
 **Scratch path identity is byte-valued, and one module owns it.** `src/scratch.rs` owns `ScratchRel`
 — the identity of one scratch file relative to its session dir — and every layer goes through it: the
@@ -2114,7 +2269,7 @@ Because the codex store is **empty today**, steps 2–4 collapse into one cutove
 
 ```
 yomi archive [--all | --session <uuid> | PATH] [--include transcript,subagents,tool-results,history,mcp,scratch,all]
-             [--no-scan] [--quarantine-on-secret] [--dry-run]
+             [--full] [--no-scan] [--quarantine-on-secret] [--dry-run]     # --full: every family, [scratch] caps lifted (§3)
 yomi gc      [--targets transcripts,scratch,mcp,empty-dirs,paste,snapshots] [--commit] [--min-age D]   # dry-run default
 yomi search  <query> [filters…]
 yomi index   [--reindex] [--session <uuid>]
