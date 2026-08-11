@@ -36,8 +36,9 @@ they are numbered on from #6 because they refine decision #4 rather than replace
     *refusal to grow* — no eviction of what is already archived, since eviction would delete the only
     copy of something. Issue #59. §2.
 11. **Default `gc` stays age-based.** `clear` is three levels behind two flags: default (age policy),
-    `--full` (everything in the captured set, regardless of age), `--wipe` (the whole tree). Queued as
-    PR C1/C2; not part of the `--full` archive PR. §5.
+    `--full` (everything in the captured set, regardless of age), `--wipe` (the whole tree). `--full`
+    shipped as PR C1 (§5, "`clear`'s three levels"); `--wipe` is PR C2. Neither is part of the `--full`
+    archive PR. §5.
 12. **`--full` does not widen `tmp_root`.** It archives more of `/tmp/claude-<uid>/` and nothing
     outside it. It is **not** a flag for the uid-owned entries sitting directly in `/tmp` (the
     `yomi-*` test directories of issue #48) — those are a janitor's problem, not an archive's. §3.
@@ -1558,7 +1559,8 @@ Any check fails → **skip**, mark `unverified` in status. Never delete on doubt
 ### `gc.log` — every candidate leaves a record
 
 `~/.yomi/gc.log` is append-only JSONL, mode 600, and carries four record kinds: `delete`, `skip`
-(a gate refused), `protect` (live/too-young/retain-window), and `delete_failed` (the gates passed but
+(a gate refused), `protect` (live / too-young / retain-window, plus `--full`'s `Captured` and
+`NotFullyArchived`), and `delete_failed` (the gates passed but
 the physical removal errored). The audit trail is the point of the whole layer, so **one candidate
 failing must never truncate it**:
 
@@ -2070,6 +2072,95 @@ describes.**
 - `gc --commit` holds the dual-anchor single-writer lock (§4) for the whole run and refuses (exit 3)
   on contention. `gc` without `--commit` and `gc --discover-all-users` are read-only and take no lock.
 
+### `clear`'s three levels — default, `--full`, `--wipe`
+
+Decision #11. One verb, three predicates, two flags. The default is unchanged by the flags' existence:
+
+| Level | What it claims | Ledger |
+|---|---|---|
+| `gc` | archived **and** aged — every retain window and the `min_age` floor in force | required |
+| `gc --full` | what the gates already prove is archived, at any age above the floor below — and, for a scratch tree, only when its manifest records `caps_lifted` and its captured set is empty | required |
+| `gc --wipe` (PR C2) | the whole tree | not required |
+
+**`--full` is a level, not a target filter.** It relaxes the age policy for *every* family: each retain
+window drops to zero and the floor becomes the relaxed one, so an archived transcript past that floor is
+in scope exactly as a scratch tree is. Nothing about the archive-verify-then-delete law moves — a
+transcript still needs its catalog row, its live sha and its re-verified store copy. The scratch
+predicate below is an **additional** gate on top of that relaxation, and it exists because the scratch
+delete unit is a whole tree (decision #13): per-file, "is this archived?" is already the answer; per-tree
+it is not.
+
+**The `--full` predicate.** `mf.caps_lifted && mf.entries.iter().all(|e| !(e.present && e.stored))`.
+
+`present` is a condition of the captured-set test, not an oversight. Archive **retains** an entry whose
+live file has vanished (`present: false`) together with its `.zst`, because that artifact is then the
+only copy (§3, decision #4). Such an entry describes a file that has *already left the tree*, so
+deleting the live tree loses nothing it names — and letting it veto would put a tree permanently beyond
+`--full`'s reach in exchange for protecting nothing, since a retained entry is never reconciled away.
+
+The first conjunct is `caps_lifted` and **not** `!over_total_cap`, which looks like the same statement:
+
+- `!over_total_cap` would make the feature inert at birth. Under today's whole-tree cap accounting the
+  one tree on this host `--full` exists for (`2ec0a278…`, raw 468MB / captured 0.00MB) is over the cap,
+  so the conjunct would leave zero candidates and leave the flag waiting on PR E (decision #9).
+- `caps_lifted: true` implies cap evaluation never happened, so `over_total_cap` is structurally false
+  — the chosen conjunct is the **stricter** and more direct one.
+- It says the thing that matters: this ledger was written by a run that *had the chance* to store
+  everything policy admits. That makes `gc --full` the pair of `archive --full` **by construction**
+  rather than by coincidence, and it distinguishes a captured set emptied by a cap from one emptied by
+  the globs without a second conjunct.
+- Self-healing: a manifest from before the field reads `false` (serde `default`) and is refused; one
+  `archive --all --full` run makes the tree a candidate.
+
+**A tree with no verifiable ledger is refused, and that is the feature.** `Unverified{NoCatalogRow}`
+stands under `--full` exactly as by default. "The captured set is empty" and "nothing ever tried to
+capture this" are different statements: the first says what deleting the tree destroys, the second says
+nobody has looked. **The unknown is not the empty set** — and this is the mechanism that keeps
+"archive, then clear" a pair, so on a fresh host `gc --full --commit` reclaims nothing until
+`yomi archive --all --full` has run. It is reported rather than left silent: the plan names how many
+trees are in that state and which command settles it, since otherwise an operator sees only
+"0 deletable" and a flag that looks broken. The same line is emitted for the `NotFullyArchived` count,
+whose remedy is the same command.
+
+**Two new `ProtectReason` variants**, both reaching `gc.log`, and both `Protected` rather than
+`Unverified` — nothing about these trees is unproven; the gates passed and the policy declined to act:
+
+| Reason | State | Remedy |
+|---|---|---|
+| `Captured` | the captured set is not empty, so the tree holds content the store already has, and removing it is outside what `--full` claims — this level reclaims only trees whose contents were never stored. **Not a loss:** the `.zst` copies remain either way; what stops is the verb | `--wipe`, or let the age policy take it |
+| `NotFullyArchived` | this ledger was not written by a caps-lifted run, so what the tree holds is not established under `--full` policy | `yomi archive --all --full` |
+
+`Captured` is tested first, and the order carries a claim: when both hold, `Captured` is the established
+fact and `NotFullyArchived` would send the operator to a command that *cannot* make a tree with captured
+content a `--full` candidate. A remedy that does not work is worse than the coarser reason.
+
+**The floor does not go to zero.** `--full` and `--wipe` drop every family's retain window to zero and
+relax the `min_age` floor to `cfg.active_window` (default 1h) — **never below it**. `--min-age` still
+only raises whichever floor is in force. A zero floor would leave the tree of the session running the
+command guarded by the uuid liveness set alone, and that set has three silent paths to empty (no
+`sessions/<pid>.json`, one that will not parse, a `sessionId` that does not match the directory name)
+while the lock leg meant to back it up is already dead on this host — `locks/` holds `2.1.226.lock`, a
+version name and not a uuid (issue #37). An mtime floor depends on no oracle at all, and it is exactly
+what makes `--full` safe to run from inside a Claude Code session: that session's own tree is written
+continuously, so its newest mtime is seconds old.
+
+**`--discover-all-users` conflicts with `--full`** at parse time. Discovery returns before a target is
+parsed and never deletes, and `candidates()` refuses any root this euid does not own, so the pair can
+only mislead about what the run did. A parse error is the cheapest correct answer and cannot drift from
+the code.
+
+**Every plan and every report carries a byte split**, in `--json` and in the human form, at both the
+plan and the commit emitter: `archived` (bytes this run proved are in the store) and `unarchived` (bytes
+with no archived copy it could verify). A total says how much a run reclaims; only the split says how
+much of it exists nowhere else afterwards. It is stated over a scratch ledger's **present** entries, for
+the same reason the captured-set test is: a retained entry's bytes are neither reclaimed nor lost, so
+they belong on neither side, and `archived + unarchived` is therefore not required to equal the
+candidate's total. On the catalog-backed path the split turns on gate 3 rather than on the candidate's
+kind — a source refused at gates 1-3 has no verified copy, and reporting its bytes as archived is the
+one claim a split exists to make honestly. Under `--full` the archived side is structurally zero, since
+the verb only takes trees with an empty captured set; the field is nonetheless computed for both verbs so
+`--wipe` cannot grow a second implementation of it.
+
 ### Policy (config)
 
 ```toml
@@ -2088,7 +2179,7 @@ require_indexed  = false   # P3: true ⇒ GC consults index_state; skips only un
 
 - **history.jsonl** — single live append-only file. Archive **slices** by timestamp watermark; source truncation is OFF by default (`history_compact=false`) — rewriting a file CC may be appending to is unsafe. Archive-only, never wipe, unless user opts in.
 - **Empty-dir shells** (`session-env/`, `tasks/` — 65 empty dirs, recon). Pure janitor: `yomi gc --targets empty-dirs` removes empty dirs not owned by a live session. Zero data → no archive needed.
-- **`/tmp/claude-1007/**`** scratch — GC removes scratch dirs whose session is not-live AND archived-or-manifested AND older than `scratch_retain`. Reclaims the 134M clone.
+- **`/tmp/claude-1007/**`** scratch — GC removes scratch dirs whose session is not-live AND archived-or-manifested AND older than `scratch_retain`. Reclaims the 134M clone. `--full` relaxes the age half of that rule and nothing else (above).
 - **paste-cache / shell-snapshots** — archive (scan applies) then age-GC.
 
 ### Dry-run is the default
@@ -2270,7 +2361,8 @@ Because the codex store is **empty today**, steps 2–4 collapse into one cutove
 ```
 yomi archive [--all | --session <uuid> | PATH] [--include transcript,subagents,tool-results,history,mcp,scratch,all]
              [--full] [--no-scan] [--quarantine-on-secret] [--dry-run]     # --full: every family, [scratch] caps lifted (§3)
-yomi gc      [--targets transcripts,scratch,mcp,empty-dirs,paste,snapshots] [--commit] [--min-age D]   # dry-run default
+yomi gc      [--targets transcripts,scratch,mcp,empty-dirs,paste,snapshots] [--commit] [--min-age D]
+             [--full]                                                      # dry-run default; --full: caps-lifted ledger + empty captured set (§5)
 yomi search  <query> [filters…]
 yomi index   [--reindex] [--session <uuid>]
 yomi rescan  [--commit] [--session <uuid>] [--fix-perms]                                                # dry-run default; retroactive re-redaction

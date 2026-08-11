@@ -3,7 +3,7 @@ use crate::blacklist::Blacklist;
 use crate::catalog;
 use crate::config::{Env, parse_duration};
 use crate::gc::live::ProcLiveness;
-use crate::gc::{self, CommitReport, Plan, Target, Verdict};
+use crate::gc::{self, CommitReport, Plan, ScratchMode, Target, Verdict};
 use crate::lock::WriteLock;
 use crate::source::{self, SourceRoots};
 use anyhow::Result;
@@ -21,8 +21,20 @@ pub struct GcArgs {
     /// Raise the hard min-age floor for this run (never lowers config min_age).
     #[arg(long)]
     pub min_age: Option<String>,
-    /// Cross-user READ-ONLY discovery of ephemeral shapes (never deletes).
+    /// Reclaim what is already archived, ignoring retain windows: every family's
+    /// window drops to zero and the min-age floor relaxes to [gc] active_window,
+    /// never below it. A scratch tree additionally needs a caps-lifted ledger with
+    /// an empty captured set.
     #[arg(long)]
+    pub full: bool,
+    /// Cross-user READ-ONLY discovery of ephemeral shapes (never deletes).
+    /// Cannot be combined with --full.
+    //
+    // Refused at parse time: discovery returns before a target is even parsed, and
+    // `candidates()` refuses any root this euid does not own, so the pair can only
+    // mislead about what the run did. A parse error is the cheapest correct answer
+    // and cannot drift from the code.
+    #[arg(long, conflicts_with_all = ["full"])]
     pub discover_all_users: bool,
     /// Correct a too-loose store root to 700 instead of refusing.
     #[arg(long)]
@@ -52,6 +64,11 @@ pub fn run(env: &Env, args: &GcArgs, json: bool) -> Result<i32> {
         Some(s) => Some(parse_duration(s).ok_or_else(|| anyhow::anyhow!("bad --min-age: {s}"))?),
         None => None,
     };
+    let mode = if args.full {
+        ScratchMode::Full
+    } else {
+        ScratchMode::Aged
+    };
 
     if args.commit {
         if let Err(e) = env.ensure_layout(args.fix_perms) {
@@ -66,14 +83,14 @@ pub fn run(env: &Env, args: &GcArgs, json: bool) -> Result<i32> {
             }
         };
         let cat = catalog::open_env(env)?;
-        let plan = gc::plan(env, cfg, &targets, &cat, &bl, &live, min_over)?;
-        let report = gc::commit(env, cfg, &plan, &cat, &bl, &live, min_over)?;
+        let plan = gc::plan(env, cfg, &targets, &cat, &bl, &live, min_over, mode)?;
+        let report = gc::commit(env, cfg, &plan, &cat, &bl, &live, min_over, mode)?;
         emit_commit(&plan, &report, json);
         let partial = plan.unverified + report.flipped_unverified > 0;
         Ok(if partial { EXIT_PARTIAL } else { EXIT_OK })
     } else {
         let cat = catalog::open_env_read(env)?.catalog;
-        let plan = gc::plan(env, cfg, &targets, &cat, &bl, &live, min_over)?;
+        let plan = gc::plan(env, cfg, &targets, &cat, &bl, &live, min_over, mode)?;
         emit_plan(&plan, json);
         Ok(EXIT_OK)
     }
@@ -148,6 +165,8 @@ fn emit_plan(plan: &Plan, json: bool) {
                     "source": it.candidate.source.to_string_lossy(),
                     "target": it.candidate.target.as_str(),
                     "verdict": verdict, "reason": reason, "bytes": it.bytes,
+                    "archived_bytes": it.split.archived,
+                    "unarchived_bytes": it.split.unarchived,
                 })
             })
             .collect();
@@ -157,6 +176,10 @@ fn emit_plan(plan: &Plan, json: bool) {
             "protected": plan.protected,
             "unverified": plan.unverified,
             "reclaimable_bytes": plan.reclaimable_bytes,
+            "reclaimable_archived_bytes": plan.reclaimable_archived_bytes,
+            "reclaimable_unarchived_bytes": plan.reclaimable_unarchived_bytes,
+            "scratch_no_ledger": plan.scratch_no_ledger,
+            "scratch_not_fully_archived": plan.scratch_not_fully_archived,
             "items": items,
         });
         println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
@@ -166,6 +189,12 @@ fn emit_plan(plan: &Plan, json: bool) {
         "[dry-run] plan: {} deletable ({} bytes reclaimable), {} protected, {} unverified.",
         plan.deletable, plan.reclaimable_bytes, plan.protected, plan.unverified
     );
+    emit_split(
+        "reclaimable",
+        plan.reclaimable_archived_bytes,
+        plan.reclaimable_unarchived_bytes,
+    );
+    emit_full_advice(plan);
     for it in &plan.items {
         match &it.verdict {
             Verdict::Delete { .. } => println!(
@@ -194,10 +223,14 @@ fn emit_commit(plan: &Plan, report: &CommitReport, json: bool) {
             "committed": true,
             "deleted": report.deleted,
             "reclaimed_bytes": report.reclaimed_bytes,
+            "reclaimed_archived_bytes": report.reclaimed_archived_bytes,
+            "reclaimed_unarchived_bytes": report.reclaimed_unarchived_bytes,
             "protected": plan.protected,
             "unverified": plan.unverified,
             "flipped_unverified": report.flipped_unverified,
             "flipped_protected": report.flipped_protected,
+            "scratch_no_ledger": plan.scratch_no_ledger,
+            "scratch_not_fully_archived": plan.scratch_not_fully_archived,
         });
         println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
         return;
@@ -206,10 +239,48 @@ fn emit_commit(plan: &Plan, report: &CommitReport, json: bool) {
         "Deleted {} items ({} bytes reclaimed); {} protected, {} unverified.",
         report.deleted, report.reclaimed_bytes, plan.protected, plan.unverified
     );
+    emit_split(
+        "reclaimed",
+        report.reclaimed_archived_bytes,
+        report.reclaimed_unarchived_bytes,
+    );
+    emit_full_advice(plan);
     if report.flipped_unverified > 0 {
         println!(
             "{} planned deletes were skipped at commit (drifted to unverified).",
             report.flipped_unverified
+        );
+    }
+}
+
+/// How much of what this run takes exists somewhere else afterwards. A total on
+/// its own cannot say that, and it is the difference between reclaiming build
+/// output and reclaiming the only copy of something.
+fn emit_split(label: &str, archived: u64, unarchived: u64) {
+    println!("Of the {label} bytes: {archived} archived, {unarchived} with no archived copy.");
+}
+
+/// What an operator must run before `--full` has anything to take. Without it a
+/// fresh host sees "0 deletable" and nothing naming the cause — the flag looks
+/// broken where in fact no tree has ever been offered to it.
+fn emit_full_advice(plan: &Plan) {
+    if plan.mode != ScratchMode::Full {
+        return;
+    }
+    if plan.scratch_no_ledger > 0 {
+        println!(
+            "{} scratch tree(s) are not covered by a ledger this run could verify, so --full \
+             leaves them alone. Run `yomi archive --all --full` first: a tree yomi never \
+             captured is not a tree whose captured set is empty.",
+            plan.scratch_no_ledger
+        );
+    }
+    if plan.scratch_not_fully_archived > 0 {
+        println!(
+            "{} scratch tree(s) were last archived with the [scratch] caps in force, so what \
+             they hold is not established under --full. Run `yomi archive --all --full` to \
+             settle it.",
+            plan.scratch_not_fully_archived
         );
     }
 }

@@ -8,7 +8,7 @@ use crate::blacklist::{Blacklist, GuardOutcome};
 use crate::catalog::Catalog;
 use crate::config::Env;
 use crate::gc::live;
-use crate::gc::{PassedChecks, ProtectReason, SkipReason, Verdict, policy};
+use crate::gc::{ByteSplit, PassedChecks, ProtectReason, ScratchMode, SkipReason, Verdict, policy};
 use crate::scratch::{
     IdentityVerdict, ScratchEntry, ScratchManifest, ScratchRel, StoreDir, read_manifest,
 };
@@ -21,8 +21,14 @@ use std::time::{Duration, SystemTime};
 use walkdir::WalkDir;
 
 /// Evaluate a catalog-backed source (transcript/mcp/paste/snapshot) through all
-/// five gates. Returns `(verdict, live_bytes)`. Only every gate passing yields
-/// `Delete`; any doubt yields `Unverified` or `Protected`.
+/// five gates. Returns `(verdict, live_bytes, split)`. Only every gate passing
+/// yields `Delete`; any doubt yields `Unverified` or `Protected`.
+///
+/// The split turns on gate 3 rather than on the candidate's kind. A file that
+/// reaches the age gate has a store copy this run re-verified, so its bytes are
+/// archived; a file refused at gates 1-3 has none — no row, a row for other bytes,
+/// or a store copy that did not verify — and reporting those bytes as archived
+/// would be the one claim a byte split exists to make honestly.
 #[allow(clippy::too_many_arguments)]
 pub fn evaluate_file(
     cat: &Catalog,
@@ -35,7 +41,7 @@ pub fn evaluate_file(
     retain: Duration,
     active_window: Duration,
     require_indexed: bool,
-) -> Result<(Verdict, u64)> {
+) -> Result<(Verdict, u64, ByteSplit)> {
     // Gate 0: blacklist, pre-decision. Pins the opened inode.
     let (mut file, md) = match bl.open_guarded(source)? {
         GuardOutcome::Denied => {
@@ -44,6 +50,7 @@ pub fn evaluate_file(
                     reason: SkipReason::Blacklisted,
                 },
                 0,
+                ByteSplit::default(),
             ));
         }
         GuardOutcome::Unreadable => {
@@ -52,11 +59,14 @@ pub fn evaluate_file(
                     reason: SkipReason::OpenFailed,
                 },
                 0,
+                ByteSplit::default(),
             ));
         }
         GuardOutcome::Opened(f, md) => (f, md),
     };
     let bytes = md.len();
+    let unarchived = ByteSplit::all_unarchived(bytes);
+    let archived = ByteSplit::all_archived(bytes);
 
     // Gate 1: catalog lookup by canonical source path.
     let key = canonical_key(source);
@@ -68,6 +78,7 @@ pub fn evaluate_file(
                     reason: SkipReason::NoCatalogRow,
                 },
                 bytes,
+                unarchived,
             ));
         }
     };
@@ -80,6 +91,7 @@ pub fn evaluate_file(
                 reason: SkipReason::ShaMismatch,
             },
             bytes,
+            unarchived,
         ));
     }
 
@@ -95,6 +107,7 @@ pub fn evaluate_file(
                 reason: SkipReason::EmptyContentSha,
             },
             bytes,
+            unarchived,
         ));
     }
     if !verify_stored(
@@ -108,6 +121,7 @@ pub fn evaluate_file(
                 reason: SkipReason::StoreReverifyFailed,
             },
             bytes,
+            unarchived,
         ));
     }
 
@@ -125,6 +139,7 @@ pub fn evaluate_file(
                         reason: SkipReason::NotIndexed,
                     },
                     bytes,
+                    archived,
                 ));
             }
         }
@@ -138,7 +153,7 @@ pub fn evaluate_file(
         } else {
             ProtectReason::RetainWindow
         };
-        return Ok((Verdict::Protected { reason }, bytes));
+        return Ok((Verdict::Protected { reason }, bytes, archived));
     }
     if live::is_protected(active, &md, session_uuid, active_window, min_age) {
         return Ok((
@@ -146,6 +161,7 @@ pub fn evaluate_file(
                 reason: ProtectReason::SessionLive,
             },
             bytes,
+            archived,
         ));
     }
 
@@ -163,6 +179,7 @@ pub fn evaluate_file(
             checks,
         },
         bytes,
+        archived,
     ))
 }
 
@@ -174,6 +191,13 @@ pub fn evaluate_file(
 /// session is non-live and the newest mtime clears both the floor and
 /// `scratch_retain`, is the tree deletable. A manifest predating the per-entry
 /// hash fields cannot be verified, so its tree is skipped (safe side).
+///
+/// Under [`ScratchMode::Full`] the age half of that rule relaxes to the floor in
+/// `min_age` (never zero — see [`policy::relaxed_min_age_floor`]) and one gate is
+/// **added**: [`full_protection`]. Nothing is removed. Every coverage check still
+/// runs, and a tree with no readable ledger is refused exactly as it is by default
+/// — "the captured set is empty" and "nothing ever tried to capture this" are
+/// different statements, and only the first one licenses a delete.
 #[allow(clippy::too_many_arguments)]
 pub fn evaluate_scratch(
     env: &Env,
@@ -185,8 +209,12 @@ pub fn evaluate_scratch(
     min_age: Duration,
     retain: Duration,
     active_window: Duration,
-) -> Result<(Verdict, u64)> {
+    mode: ScratchMode,
+) -> Result<(Verdict, u64, ByteSplit)> {
     let (bytes, newest) = tree_size_and_newest(session_dir);
+    // Until a ledger has been read, nothing says any of these bytes are in the
+    // store — which is exactly what `unarchived` claims, no more.
+    let no_ledger = ByteSplit::all_unarchived(bytes);
 
     // Before anything is read through it. A store path that is not a real
     // directory may point anywhere, and every fact this gate would draw from it —
@@ -206,6 +234,7 @@ pub fn evaluate_scratch(
                 reason: SkipReason::ForeignStoreDir,
             },
             bytes,
+            no_ledger,
         ));
     }
     let manifest_path = store_dir.join("manifest.json");
@@ -217,9 +246,11 @@ pub fn evaluate_scratch(
                     reason: SkipReason::NoCatalogRow,
                 },
                 bytes,
+                no_ledger,
             ));
         }
     };
+    let split = byte_split(&mf);
     // Immediately after the manifest is read and before any coverage judgment.
     // A store key is not injective, so this ledger may describe a *different*
     // session directory that happens to map to the same key — and coverage
@@ -234,10 +265,21 @@ pub fn evaluate_scratch(
             IdentityVerdict::Collision => SkipReason::StoreKeyCollision,
             _ => SkipReason::UndecodableIdentity,
         };
-        return Ok((Verdict::Unverified { reason }, bytes));
+        return Ok((Verdict::Unverified { reason }, bytes, split));
     }
     if let Some(reason) = verify_scratch_tree(bl, session_dir, &store_dir, &mf) {
-        return Ok((Verdict::Unverified { reason }, bytes));
+        return Ok((Verdict::Unverified { reason }, bytes, split));
+    }
+
+    // After every verification check and before the age gate. After, because
+    // "verification precedes policy" is the order the default path already runs in
+    // and a reason's precedence must not depend on the flag. Before the age gate,
+    // because these two states are permanent conditions of the tree while
+    // `TooYoung` is a transient one, and the permanent answer is the useful one.
+    if mode == ScratchMode::Full
+        && let Some(reason) = full_protection(&mf)
+    {
+        return Ok((Verdict::Protected { reason }, bytes, split));
     }
 
     let age = newest
@@ -249,7 +291,7 @@ pub fn evaluate_scratch(
         } else {
             ProtectReason::RetainWindow
         };
-        return Ok((Verdict::Protected { reason }, bytes));
+        return Ok((Verdict::Protected { reason }, bytes, split));
     }
     if let Some(u) = session_uuid
         && active.contains(u)
@@ -259,6 +301,7 @@ pub fn evaluate_scratch(
                 reason: ProtectReason::SessionLive,
             },
             bytes,
+            split,
         ));
     }
     if let Some(t) = newest
@@ -269,6 +312,7 @@ pub fn evaluate_scratch(
                 reason: ProtectReason::SessionLive,
             },
             bytes,
+            split,
         ));
     }
 
@@ -286,7 +330,70 @@ pub fn evaluate_scratch(
             checks,
         },
         bytes,
+        split,
     ))
+}
+
+/// Whether the store holds a copy of nothing still in the live tree — no entry is
+/// both `stored` and `present`.
+///
+/// **`present` is a condition, not an oversight.** `prior_tail` retains an entry
+/// whose live file is gone (`present: false`) and keeps its `.zst`, because that
+/// artifact is the only remaining copy. Such an entry describes a file that has
+/// **already left the tree**, so deleting the tree loses nothing it names. Letting
+/// it veto would put a tree permanently beyond `--full`'s reach in exchange for
+/// protecting nothing.
+fn captured_set_empty(mf: &ScratchManifest) -> bool {
+    mf.entries.iter().all(|e| !(e.present && e.stored))
+}
+
+/// The two states `--full` holds a tree in, or `None` when the verb claims it.
+///
+/// **`Captured` is tested first**, and the order carries a claim: when both hold —
+/// a capped run that stored something — `Captured` is the fact that is established
+/// and `NotFullyArchived` is not, and `NotFullyArchived` would send the operator to
+/// `archive --all --full`, which cannot make a tree with captured content a `--full`
+/// candidate. A remedy that does not work is worse than the coarser reason.
+///
+/// **`caps_lifted` rather than `!over_total_cap`.** The two look interchangeable —
+/// a caps-lifted run cannot be over a cap it never applied — and are not. Requiring
+/// `!over_total_cap` would make the feature inert at birth: the one tree on this
+/// host `--full` exists for (raw 468MB, captured 0.00MB) is over the cap under
+/// today's whole-tree accounting, so the conjunct would leave zero candidates and
+/// would leave `--full` waiting on PR E. `caps_lifted` also says the thing that
+/// matters — this ledger was written by a run that *had the chance* to store
+/// everything policy admits — which is what makes `gc --full` the pair of
+/// `archive --full` by construction rather than by coincidence. A manifest from
+/// before the field reads `false` and is refused; one `archive --all --full` run
+/// repairs that.
+fn full_protection(mf: &ScratchManifest) -> Option<ProtectReason> {
+    if !captured_set_empty(mf) {
+        return Some(ProtectReason::Captured);
+    }
+    if !mf.caps_lifted {
+        return Some(ProtectReason::NotFullyArchived);
+    }
+    None
+}
+
+/// Split a tree's ledger into the live bytes that have a stored copy and the live
+/// bytes that have none.
+///
+/// Stated over **present** entries for the same reason [`captured_set_empty`] tests
+/// `present`: a retained entry's file is already gone from the tree, so its bytes
+/// are neither reclaimed nor lost by the delete and belong on neither side. Its
+/// `bytes` counted as `unarchived` would inflate the one figure an operator reads
+/// as "this much exists nowhere else after the run".
+fn byte_split(mf: &ScratchManifest) -> ByteSplit {
+    let mut split = ByteSplit::default();
+    for e in mf.entries.iter().filter(|e| e.present) {
+        if e.stored {
+            split.archived += e.bytes;
+        } else {
+            split.unarchived += e.bytes;
+        }
+    }
+    split
 }
 
 /// An empty-dir shell carries zero data, so it bypasses the archive gates but
@@ -296,7 +403,7 @@ pub fn evaluate_empty_dir(
     active: &HashSet<String>,
     min_age: Duration,
     active_window: Duration,
-) -> Result<(Verdict, u64)> {
+) -> Result<(Verdict, u64, ByteSplit)> {
     let md = match std::fs::metadata(dir) {
         Ok(m) => m,
         Err(_) => {
@@ -305,6 +412,7 @@ pub fn evaluate_empty_dir(
                     reason: SkipReason::OpenFailed,
                 },
                 0,
+                ByteSplit::default(),
             ));
         }
     };
@@ -317,6 +425,7 @@ pub fn evaluate_empty_dir(
                 reason: ProtectReason::RetainWindow,
             },
             0,
+            ByteSplit::default(),
         ));
     }
     let age = policy::age_of(&md);
@@ -326,6 +435,7 @@ pub fn evaluate_empty_dir(
                 reason: ProtectReason::TooYoung,
             },
             0,
+            ByteSplit::default(),
         ));
     }
     if live::is_protected(active, &md, None, active_window, min_age) {
@@ -334,6 +444,7 @@ pub fn evaluate_empty_dir(
                 reason: ProtectReason::SessionLive,
             },
             0,
+            ByteSplit::default(),
         ));
     }
     let checks = PassedChecks {
@@ -350,6 +461,7 @@ pub fn evaluate_empty_dir(
             checks,
         },
         0,
+        ByteSplit::default(),
     ))
 }
 

@@ -16,7 +16,7 @@ use yomi::blacklist::Blacklist;
 use yomi::catalog;
 use yomi::config::Env;
 use yomi::gc::live::ProcLiveness;
-use yomi::gc::{self, Target, Verdict};
+use yomi::gc::{self, ScratchMode, Target, Verdict};
 use yomi::source::SourceRoots;
 
 const BIN: &str = env!("CARGO_BIN_EXE_yomi");
@@ -187,7 +187,17 @@ fn p4t_containment_is_not_rechecked_between_plan_and_commit() {
     let roots = SourceRoots::resolve().unwrap();
     let live = ProcLiveness::resolve(&roots, cfg.active_window.0);
 
-    let plan = gc::plan(&env, &cfg, &[Target::Transcripts], &cat, &bl, &live, None).unwrap();
+    let plan = gc::plan(
+        &env,
+        &cfg,
+        &[Target::Transcripts],
+        &cat,
+        &bl,
+        &live,
+        None,
+        ScratchMode::Aged,
+    )
+    .unwrap();
     assert_eq!(deletable(&plan), 1, "fixture produced no delete plan");
 
     // --- the window ---
@@ -195,7 +205,7 @@ fn p4t_containment_is_not_rechecked_between_plan_and_commit() {
     std::fs::remove_dir_all(&projects_root).unwrap();
     std::os::unix::fs::symlink(&outside, &projects_root).unwrap();
 
-    let report = gc::commit(&env, &cfg, &plan, &cat, &bl, &live, None).unwrap();
+    let report = gc::commit(&env, &cfg, &plan, &cat, &bl, &live, None, ScratchMode::Aged).unwrap();
 
     assert!(
         twin.exists(),
@@ -256,7 +266,17 @@ fn p4t_scratch_tree_swapped_for_symlink_after_plan() {
     let roots = SourceRoots::resolve().unwrap();
     let live = ProcLiveness::resolve(&roots, cfg.active_window.0);
 
-    let plan = gc::plan(&env, &cfg, &[Target::Scratch], &cat, &bl, &live, None).unwrap();
+    let plan = gc::plan(
+        &env,
+        &cfg,
+        &[Target::Scratch],
+        &cat,
+        &bl,
+        &live,
+        None,
+        ScratchMode::Aged,
+    )
+    .unwrap();
     assert_eq!(
         deletable(&plan),
         1,
@@ -267,7 +287,7 @@ fn p4t_scratch_tree_swapped_for_symlink_after_plan() {
     std::fs::remove_dir_all(&sess).unwrap();
     std::os::unix::fs::symlink(&outside, &sess).unwrap();
 
-    let _ = gc::commit(&env, &cfg, &plan, &cat, &bl, &live, None).unwrap();
+    let _ = gc::commit(&env, &cfg, &plan, &cat, &bl, &live, None, ScratchMode::Aged).unwrap();
     assert!(
         outside.join("scratchpad/notes.md").exists(),
         "the scratch janitor deleted {} through a symlink planted after the plan",
@@ -295,7 +315,17 @@ fn p4t_content_drift_between_plan_and_commit_is_caught() {
     let roots = SourceRoots::resolve().unwrap();
     let live = ProcLiveness::resolve(&roots, cfg.active_window.0);
 
-    let plan = gc::plan(&env, &cfg, &[Target::Transcripts], &cat, &bl, &live, None).unwrap();
+    let plan = gc::plan(
+        &env,
+        &cfg,
+        &[Target::Transcripts],
+        &cat,
+        &bl,
+        &live,
+        None,
+        ScratchMode::Aged,
+    )
+    .unwrap();
     assert_eq!(deletable(&plan), 1);
 
     // --- the window: new, unarchived content lands in the source ---
@@ -305,7 +335,7 @@ fn p4t_content_drift_between_plan_and_commit_is_caught() {
     std::fs::write(fx.transcript(u), &body).unwrap();
     set_mtime_days(&fx.transcript(u), 200);
 
-    let report = gc::commit(&env, &cfg, &plan, &cat, &bl, &live, None).unwrap();
+    let report = gc::commit(&env, &cfg, &plan, &cat, &bl, &live, None, ScratchMode::Aged).unwrap();
     assert_eq!(report.deleted, 0, "drifted source was deleted");
     assert_eq!(report.flipped_unverified, 1);
     assert!(fx.transcript(u).exists());
@@ -336,7 +366,17 @@ fn p4t_credential_hardlink_planted_after_plan_is_refused() {
     let roots = SourceRoots::resolve().unwrap();
     let live = ProcLiveness::resolve(&roots, cfg.active_window.0);
 
-    let plan = gc::plan(&env, &cfg, &[Target::Transcripts], &cat, &bl, &live, None).unwrap();
+    let plan = gc::plan(
+        &env,
+        &cfg,
+        &[Target::Transcripts],
+        &cat,
+        &bl,
+        &live,
+        None,
+        ScratchMode::Aged,
+    )
+    .unwrap();
     assert_eq!(deletable(&plan), 1);
 
     // --- the window: the candidate name now points at the credential inode ---
@@ -345,7 +385,7 @@ fn p4t_credential_hardlink_planted_after_plan_is_refused() {
     std::fs::remove_file(fx.transcript(u)).unwrap();
     std::fs::hard_link(&cred, fx.transcript(u)).unwrap();
 
-    let report = gc::commit(&env, &cfg, &plan, &cat, &bl, &live, None).unwrap();
+    let report = gc::commit(&env, &cfg, &plan, &cat, &bl, &live, None, ScratchMode::Aged).unwrap();
     assert_eq!(report.deleted, 0, "a credential hardlink was unlinked");
     assert!(cred.exists(), "the credential inode lost a link");
     assert!(
@@ -372,7 +412,17 @@ fn p4t_session_going_live_between_plan_and_commit_protects() {
     let roots = SourceRoots::resolve().unwrap();
 
     let live = ProcLiveness::resolve(&roots, cfg.active_window.0);
-    let plan = gc::plan(&env, &cfg, &[Target::Transcripts], &cat, &bl, &live, None).unwrap();
+    let plan = gc::plan(
+        &env,
+        &cfg,
+        &[Target::Transcripts],
+        &cat,
+        &bl,
+        &live,
+        None,
+        ScratchMode::Aged,
+    )
+    .unwrap();
     assert_eq!(deletable(&plan), 1);
 
     // --- the window: the session comes back to life ---
@@ -387,7 +437,17 @@ fn p4t_session_going_live_between_plan_and_commit_protects() {
 
     // `commit` takes its own liveness snapshot from the oracle it is handed.
     let live2 = ProcLiveness::resolve(&roots, cfg.active_window.0);
-    let report = gc::commit(&env, &cfg, &plan, &cat, &bl, &live2, None).unwrap();
+    let report = gc::commit(
+        &env,
+        &cfg,
+        &plan,
+        &cat,
+        &bl,
+        &live2,
+        None,
+        ScratchMode::Aged,
+    )
+    .unwrap();
     assert_eq!(
         report.deleted, 0,
         "a session that went live between plan and commit was wiped"
