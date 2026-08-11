@@ -208,9 +208,18 @@ mod scratch {
                 .into();
         }
         if mf.over_total_cap {
+            // The measured quantity comes from the ledger and the cap from the
+            // config, because only one of the two was ever written down. Saying
+            // which bytes were summed matters here: the cap counts what the globs
+            // admit, so an operator looking at a tree whose bulk is `target/` is
+            // otherwise sent to measure the wrong thing.
+            let measured = match mf.admitted_bytes {
+                Some(n) => format!("{n} bytes of admitted content in this tree"),
+                None => "this tree's admitted content".to_string(),
+            };
             return format!(
-                "the whole tree exceeded [scratch] total_cap ({} bytes), so it was \
-                 manifested without storing anything",
+                "{measured} exceeded [scratch] total_cap ({} bytes as it stands \
+                 now), so the whole tree was manifested without storing anything",
                 env.config.scratch.total_cap.0
             );
         }
@@ -367,14 +376,23 @@ mod scratch {
                 "key": store.key(),
                 "captured_at": mf.captured_at,
                 "total_bytes": mf.total_bytes,
+                "admitted_bytes": mf.admitted_bytes,
                 "over_total_cap": mf.over_total_cap,
                 "entries": mf.entries.iter().map(entry_json).collect::<Vec<_>>(),
             });
             println!("{}", serde_json::to_string_pretty(&v)?);
             return Ok(());
         }
+        // Both totals, because the flag is a verdict on the second one: a tree
+        // reading "4,466,661,813 bytes  [over total_cap]" invites the conclusion
+        // that a 64MB cap is hopeless for it, when the figure the cap compared may
+        // have been a few MB of notes.
+        let admitted = match mf.admitted_bytes {
+            Some(n) => format!("  {n} admitted"),
+            None => String::new(),
+        };
         println!(
-            "scratch {}  captured {}  {} bytes{}",
+            "scratch {}  captured {}  {} bytes{admitted}{}",
             store.key(),
             mf.captured_at,
             mf.total_bytes,

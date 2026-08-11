@@ -236,7 +236,13 @@ impl Default for ScratchConfig {
             .map(|s| s.to_string())
             .collect(),
             file_cap: ByteSize(5 * 1024 * 1024),
-            total_cap: ByteSize(20 * 1024 * 1024),
+            // 64 MiB, and the number moved with the quantity it is compared
+            // against: `total_cap` now measures the bytes the globs admit
+            // (decision #9), where 20MB was chosen against whole-tree totals. The
+            // largest admitted tree measured on this host is 21.7 MB (design §0),
+            // and the cost of exceeding this cap is the whole tree's contents, so
+            // the margin is a step rather than a few percent.
+            total_cap: ByteSize(64 * 1024 * 1024),
         }
     }
 }
@@ -520,7 +526,7 @@ mod tests {
     fn defaults_match_design() {
         let c = Config::default();
         assert_eq!(c.scratch.file_cap.0, 5 * 1024 * 1024);
-        assert_eq!(c.scratch.total_cap.0, 20 * 1024 * 1024);
+        assert_eq!(c.scratch.total_cap.0, 64 * 1024 * 1024);
         assert!(c.scratch.allow.contains(&"*.md".to_string()));
     }
 

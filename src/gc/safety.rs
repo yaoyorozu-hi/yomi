@@ -357,15 +357,18 @@ fn captured_set_empty(mf: &ScratchManifest) -> bool {
 ///
 /// **`caps_lifted` rather than `!over_total_cap`.** The two look interchangeable —
 /// a caps-lifted run cannot be over a cap it never applied — and are not. Requiring
-/// `!over_total_cap` would make the feature inert at birth: the one tree on this
-/// host `--full` exists for (raw 468MB, captured 0.00MB) is over the cap under
-/// today's whole-tree accounting, so the conjunct would leave zero candidates and
-/// would leave `--full` waiting on PR E. `caps_lifted` also says the thing that
-/// matters — this ledger was written by a run that *had the chance* to store
-/// everything policy admits — which is what makes `gc --full` the pair of
-/// `archive --full` by construction rather than by coincidence. A manifest from
-/// before the field reads `false` and is refused; one `archive --all --full` run
-/// repairs that.
+/// `!over_total_cap` would have made the feature inert at birth: under the
+/// whole-tree accounting in force when this shipped, the one tree on this host
+/// `--full` exists for (raw 468MB, captured 0.00MB) was over the cap, so the
+/// conjunct would have left zero candidates. Decision #9 has since moved the cap
+/// onto admitted bytes, which retires that instance without retiring the
+/// objection: a tree still goes over the cap on its admitted set, and gating on
+/// `!over_total_cap` would withhold `--full` from exactly the trees whose captured
+/// set a cap emptied. `caps_lifted` also says the thing that matters — this ledger
+/// was written by a run that *had the chance* to store everything policy admits —
+/// which is what makes `gc --full` the pair of `archive --full` by construction
+/// rather than by coincidence. A manifest from before the field reads `false` and
+/// is refused; one `archive --all --full` run repairs that.
 fn full_protection(mf: &ScratchManifest) -> Option<ProtectReason> {
     if !captured_set_empty(mf) {
         return Some(ProtectReason::Captured);
