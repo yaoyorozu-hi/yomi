@@ -30,6 +30,15 @@ pub struct ArchiveArgs {
     /// scratch` lifts the caps for scratch alone.
     #[arg(long)]
     pub full: bool,
+    /// Re-store every scratch capture instead of reusing the ones whose source
+    /// is unchanged. One run only; nothing is recorded, so the next run dedups
+    /// again. This is the way to re-redact scratch store copies after an upgrade
+    /// hardens the secret detectors — the scan policy a manifest records covers
+    /// config and flags, not the scanner's own rules, and `rescan` does not reach
+    /// scratch. Independent of --full, which lifts the [scratch] caps and nothing
+    /// else.
+    #[arg(long)]
+    pub rearchive: bool,
     /// Skip the secret scan (store raw). Not recommended.
     #[arg(long)]
     pub no_scan: bool,
@@ -95,6 +104,7 @@ pub fn run(env: &Env, args: &ArchiveArgs, json: bool) -> Result<i32> {
         scan_enabled: !args.no_scan,
         quarantine_all: args.quarantine_on_secret,
         caps_lifted: args.full,
+        rearchive: args.rearchive,
         dry_run: args.dry_run,
     };
 

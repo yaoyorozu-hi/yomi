@@ -76,6 +76,31 @@ pub struct Archiver<'a> {
     /// both tree totals — `total_bytes` and `admitted_bytes` — are still recorded:
     /// lifting a cap is not a reason to stop knowing what it would have declined.
     pub caps_lifted: bool,
+    /// `--rearchive`: reuse no scratch capture this run, however unchanged its
+    /// source is. Every `stored` entry is scanned, compressed and written afresh.
+    ///
+    /// **The operator's remedy for a hardened scanner, and the reason the scan
+    /// policy digest does not try to be one.** `scan_policy_sha256` covers what
+    /// config and flags decide; it deliberately does not cover the detector rules
+    /// or `scan/content.rs`'s normalization, because a digest over one of those
+    /// modules would claim a completeness it does not have and a digest over the
+    /// crate version would re-store every tree on every release. Neither is a
+    /// reason to leave an operator with *no* path: `rescan` re-redacts the store
+    /// against a hardened scanner but reaches only catalog rows, and scratch has
+    /// none (#43), so after an upgrade that tightens a detector this flag is the
+    /// only thing that re-examines an existing scratch store copy.
+    ///
+    /// **Nothing records that a run was forced, and nothing needs to.** A forced
+    /// run produces exactly the ledger a policy-changed run produces — every
+    /// entry stored fresh under the recorded policy — and no later decision asks
+    /// whether a capture was reused or rewritten. `caps_lifted` exists because a
+    /// cap decision that never happened is otherwise indistinguishable from one
+    /// that declined nothing; there is no such ambiguity here.
+    ///
+    /// **Independent of `caps_lifted`.** `--full` lifts the `[scratch]` caps and
+    /// adds nothing else (decision #8); this decides whether a capture is reused.
+    /// The two are orthogonal and compose in all four combinations.
+    pub rearchive: bool,
     pub dry_run: bool,
 }
 
@@ -567,6 +592,17 @@ impl<'a> Archiver<'a> {
             }
         }
 
+        // The policy this run's captures are made under: compared against the
+        // prior ledger's to decide whether an unchanged file may be skipped, and
+        // recorded in the ledger this run writes. Computed once per key.
+        let scan_policy = self.scan_policy_sha256();
+        // Whether the prior ledger describes captures made under it. An empty
+        // recorded policy — every manifest written before the field — is not it,
+        // which is what makes the first run after this change a full re-store.
+        let policy_unchanged = prior
+            .as_ref()
+            .is_some_and(|mf| mf.scan_policy_sha256 == scan_policy);
+
         // What an earlier run captured for each identity. A capture that fails
         // this run must not discard it: those bytes are the last copy.
         let prior_by_rel: std::collections::HashMap<ScratchRel, &ScratchEntry> = prior
@@ -605,6 +641,25 @@ impl<'a> Archiver<'a> {
                     continue;
                 };
                 let dest = store_dir.join(rel.store_rel());
+                // Hashed once, here: the dedup test needs it, and so does every
+                // path that does not skip, since a stored entry records it.
+                let src_sha = sha256_hex(&bytes);
+                // The read has happened and the bytes are in hand: everything
+                // after this point — the secret scan over every byte, the
+                // compression, the store write — is what an unchanged file does
+                // not need. On this host that is 30.87 MB re-scanned and 3,580
+                // frames rewritten per run, for a tree nothing touched.
+                if self.reuse_prior_capture(
+                    entry,
+                    rel,
+                    &src_sha,
+                    &prior_by_rel,
+                    &dest,
+                    policy_unchanged,
+                )? {
+                    report.artifacts_skipped += 1;
+                    continue;
+                }
                 let scan = self.scan_bytes(&bytes, false);
                 self.tally(report, &scan);
                 if scan.needs_quarantine {
@@ -632,7 +687,7 @@ impl<'a> Archiver<'a> {
                 }
                 self.store_write(&dest, &compress_frame(&scan.redacted)?)?;
                 report.bytes_stored += std::fs::metadata(&dest)?.len();
-                entry.source_sha256 = Some(sha256_hex(&bytes));
+                entry.source_sha256 = Some(src_sha);
                 entry.content_sha256 = Some(sha256_hex(&scan.redacted));
             }
         }
@@ -691,6 +746,7 @@ impl<'a> Archiver<'a> {
                 admitted_bytes: Some(admitted),
                 over_total_cap: over_total,
                 caps_lifted: self.caps_lifted,
+                scan_policy_sha256: scan_policy,
                 entries,
             };
             let mfp = store_dir.join("manifest.json");
@@ -771,6 +827,177 @@ impl<'a> Archiver<'a> {
             out.needs_quarantine = true;
         }
         out
+    }
+
+    /// The identity of the scan policy [`Archiver::scan_bytes`] applies, recorded
+    /// in a scratch manifest as `scan_policy_sha256`.
+    ///
+    /// **It must cover every input that can change what is stored, and it covers
+    /// exactly the inputs `scan_bytes` reads.** Adding an input to that function
+    /// without adding it here is what makes a stale store copy permanent: a skip
+    /// keyed on the source hash alone cannot see a policy change, because none of
+    /// these inputs is part of the source bytes.
+    ///
+    /// * `scan_enabled` — `--no-scan` stores the raw bytes and quarantines
+    ///   nothing;
+    /// * `quarantine_all` — `--quarantine-on-secret` moves MED findings into the
+    ///   quarantine set, so an original is written where none was;
+    /// * the effective `[scan] allow` set — a suppressed finding is an unredacted
+    ///   span in the stored copy.
+    ///
+    /// Nothing else reaches `scan_bytes`: its `is_jsonl` argument is a constant
+    /// `false` on the scratch path (a scratch file has no role), and
+    /// `ScanOpts::trust_existing_tags` is `rescan`'s knob, never archive's.
+    ///
+    /// **The detector rule set is deliberately not in here**, and its absence is
+    /// not an oversight: a change to `scan/rules.rs` (or to `scan/content.rs`'s
+    /// normalization) is a change of *implementation*, not of policy, and
+    /// re-redacting a store against a hardened scanner is `rescan`'s job — the
+    /// same standing every session artifact already has, since `capture` has
+    /// skipped unchanged whole-file sources by hash since it existed. Scratch is
+    /// not yet a `rescan` target; that gap is stated in §3 rather than papered
+    /// over with a digest that could only cover one of the several modules
+    /// involved.
+    ///
+    /// Length-prefixed and domain-separated, so the encoding is injective even
+    /// for an allow entry containing a newline, and so this digest can never
+    /// coincide with a content hash. Under `--no-scan` the other two inputs are
+    /// never consulted and are left out, which keeps the digest a function of the
+    /// *effective* policy: editing `[scan] allow` while scanning is off changes
+    /// nothing about the store and re-stores nothing.
+    fn scan_policy_sha256(&self) -> String {
+        let mut lines = vec![
+            "yomi-scan-policy-v1".to_string(),
+            format!("scan_enabled={}", self.scan_enabled),
+        ];
+        if self.scan_enabled {
+            lines.push(format!("quarantine_all={}", self.quarantine_all));
+            lines.extend(
+                self.allow
+                    .entries()
+                    .iter()
+                    .map(|e| format!("allow={}:{e}", e.len())),
+            );
+        }
+        sha256_hex(lines.join("\n").as_bytes())
+    }
+
+    /// Reuse the capture a previous run made of this identity, instead of
+    /// scanning, compressing and writing the identical bytes again. Returns
+    /// whether it did; the caller counts an `artifacts_skipped` and moves on.
+    ///
+    /// **Called after the source has been read, never instead of reading it.**
+    /// The cheaper shape — skip the read too when `(size, mtime)` match — is
+    /// refused: a false "unchanged" leaves the store holding bytes that
+    /// `source_sha256` does not describe, and the GC gate then re-hashes the live
+    /// file, disagrees, and reports `ShaMismatch`. That is *safe* (nothing is
+    /// deleted) and it is still the one thing scratch may never do, because the
+    /// ledger would be lying about what the archive holds. So the file is always
+    /// read and always hashed; what is skipped is the scan, the compression and
+    /// the write — which is where the cost is, since the store write and the regex
+    /// pass over every byte dominate a warm-cache read.
+    ///
+    /// **The invariant, stated because the conditions only make sense as its
+    /// support:** *every entry a skip leans on was stored or skipped by the run
+    /// whose ledger records the policy.* A fresh store satisfies it by
+    /// construction; a skip satisfies it because condition 1 held for the ledger
+    /// it came from, which is what makes the rule inductive rather than a spot
+    /// check. Retention and salvage are the two ways an entry can carry a capture
+    /// *older* than its ledger, and conditions 3 and 4 are what exclude them —
+    /// drop either and the invariant is gone, whatever the other conditions say.
+    ///
+    /// **Every condition below is load-bearing.**
+    ///
+    /// 0. **`--rearchive` was not asked for** — an operator's explicit
+    ///    instruction to re-store outranks every reuse this predicate would
+    ///    otherwise allow. See [`Archiver::rearchive`];
+    /// 1. **the recorded scan policy is the one in force** (`policy_unchanged`) —
+    ///    `--no-scan`, `--quarantine-on-secret` and `[scan] allow` all change what
+    ///    is stored and none of them changes `source_sha256`, so this is what
+    ///    stops a tightened policy from being defeated by a hash match. See
+    ///    [`Archiver::scan_policy_sha256`];
+    /// 2. **`stored`** — a prior entry policy declined carries no artifact to
+    ///    reuse;
+    /// 3. **`present`** — a *retained* entry (its live file was gone when the
+    ///    prior run walked) was captured by some run older than that ledger, so
+    ///    the policy the ledger records says nothing about it. A file that
+    ///    vanished across a policy change and came back byte-identical would
+    ///    otherwise keep its pre-change store copy forever. Cost of excluding it:
+    ///    a returning file is re-stored once, and skipped from the run after;
+    /// 4. **not `capture_failed`** — the same door, one step over: a salvaged
+    ///    entry carries hashes from an arbitrarily old capture with `present:
+    ///    true`, so `present` alone does not close it;
+    /// 5. **both hashes present** — `source_sha256` without `content_sha256` is an
+    ///    entry the GC gate cannot verify at all (`StoreReverifyFailed`), and only
+    ///    a re-store can fill the missing field. Skipping on the source hash alone
+    ///    would make an unverifiable store permanent; requiring both makes this
+    ///    the self-heal path for every manifest written before D2/R1;
+    /// 6. **`source_sha256` equals `src_sha`** — the actual dedup test, against the
+    ///    hash of the bytes just read rather than against a stat;
+    /// 7. **the `.zst` is a regular file** — the claim being carried forward is
+    ///    about an artifact on disk, grounded the same way [`salvage`] grounds
+    ///    its own carried claim, and not in the prior ledger's word for it;
+    /// 8. **a quarantined entry's original is still at its mirrored path** — the
+    ///    carried `quarantined: true` asserts that an original exists, and the
+    ///    only thing that can rewrite a deleted one is a re-store. Skipping past
+    ///    it would leave law Q's Q1 accusing on every run with nothing able to
+    ///    repair it.
+    ///
+    /// What is carried across is exactly the three fields a fresh capture would
+    /// have written: both hashes, and `quarantined`. Dropping that last one would
+    /// have the ledger deny an unredacted original that is still on disk, which
+    /// law Q reads as a stray — the same reason [`salvage`] carries it.
+    ///
+    /// **Path-keyed only.** Two identities holding the same content are two
+    /// captures; `content_sha256` is a verification field, not a content address.
+    fn reuse_prior_capture(
+        &self,
+        entry: &mut ScratchEntry,
+        rel: &ScratchRel,
+        src_sha: &str,
+        prior_by_rel: &std::collections::HashMap<ScratchRel, &ScratchEntry>,
+        dest: &Path,
+        policy_unchanged: bool,
+    ) -> Result<bool> {
+        if self.rearchive || !policy_unchanged {
+            return Ok(false);
+        }
+        let Some(p) = prior_by_rel.get(rel) else {
+            return Ok(false);
+        };
+        if !p.stored || !p.present || p.capture_failed {
+            return Ok(false);
+        }
+        let (Some(prior_sha), Some(_)) = (&p.source_sha256, &p.content_sha256) else {
+            return Ok(false);
+        };
+        if prior_sha != src_sha {
+            return Ok(false);
+        }
+        if !crate::scratch::is_stored_artifact(dest) {
+            return Ok(false);
+        }
+        if p.quarantined && !self.quarantined_original_exists(dest)? {
+            return Ok(false);
+        }
+        entry.source_sha256.clone_from(&p.source_sha256);
+        entry.content_sha256.clone_from(&p.content_sha256);
+        entry.quarantined = p.quarantined;
+        Ok(true)
+    }
+
+    /// Whether the unredacted original of the artifact stored at `dest` is still
+    /// at its mirrored path under `quarantine/`.
+    ///
+    /// A `stat`, and only the **current** derivation. The legacy paths law Q falls
+    /// back to are deliberately not consulted: an original found only at a
+    /// superseded path is one every run before this change re-wrote at the current
+    /// path, so accepting it here would be the one way this change could newly
+    /// strand a store's originals in the legacy layout.
+    fn quarantined_original_exists(&self, dest: &Path) -> Result<bool> {
+        let rel = crate::scan::quarantine::quarantine_rel(self.store_rel(dest)?);
+        let path = self.env.quarantine_dir().join(rel);
+        Ok(std::fs::symlink_metadata(&path).is_ok_and(|md| md.is_file()))
     }
 
     /// Capture an appendable or whole-file artifact. Scanning always runs over

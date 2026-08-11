@@ -610,6 +610,22 @@ pub struct ScratchManifest {
     /// from before the field existed.
     #[serde(default, skip_serializing_if = "is_false")]
     pub caps_lifted: bool,
+    /// sha256 of the effective scan policy that produced this manifest's
+    /// captures: `scan_enabled` (`--no-scan`), `quarantine_all`
+    /// (`--quarantine-on-secret`) and the sorted effective `[scan] allow` set.
+    ///
+    /// **The dedup predicate's security half.** All three change what is stored —
+    /// raw instead of redacted, a different quarantine set, a different redaction
+    /// — and **none of them changes `source_sha256`**, so a skip that compared
+    /// only the source hash would keep an unredacted or wrongly-redacted store
+    /// copy after the policy was tightened, and no later run would ever repair it.
+    /// A tree whose recorded policy is not the one in force is re-stored in full.
+    ///
+    /// `default` is the empty string, which no computed digest equals, so a
+    /// manifest written before this field forces exactly one full re-store and
+    /// self-upgrades from then on.
+    #[serde(default)]
+    pub scan_policy_sha256: String,
     pub entries: Vec<ScratchEntry>,
 }
 
@@ -1996,6 +2012,7 @@ mod tests {
             admitted_bytes: None,
             over_total_cap: false,
             caps_lifted: false,
+            scan_policy_sha256: String::new(),
             entries: Vec::new(),
         };
         assert_eq!(
@@ -2147,6 +2164,7 @@ mod tests {
             admitted_bytes: None,
             over_total_cap: false,
             caps_lifted: false,
+            scan_policy_sha256: String::new(),
             entries: Vec::new(),
         };
         assert_eq!(

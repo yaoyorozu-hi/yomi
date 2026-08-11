@@ -43,6 +43,30 @@ impl Allowlist {
     pub(crate) fn allows(&self, secret: &str, tag: &str) -> bool {
         self.sha8.iter().any(|s| s == tag) || self.regexes.iter().any(|r| r.is_match(secret))
     }
+
+    /// Every entry this allowlist actually suppresses on — the `sha8` tags and the
+    /// regex sources — in a stable order.
+    ///
+    /// The *effective* set, not the configured one: an entry that failed to
+    /// compile as a regex was dropped by [`Allowlist::compile`] and is absent
+    /// here, and a `sha8` tag appears lowercased. That is the honest input to a
+    /// scan-policy digest, which has to describe what the scanner will do rather
+    /// than what the config says.
+    ///
+    /// **Sorted, because the digest built from this must not depend on order.**
+    /// A match on any entry suppresses, so the config's order decides nothing; an
+    /// order-sensitive identity would make swapping two `[scan] allow` lines
+    /// re-store every artifact in the store.
+    pub fn entries(&self) -> Vec<&str> {
+        let mut out: Vec<&str> = self
+            .sha8
+            .iter()
+            .map(String::as_str)
+            .chain(self.regexes.iter().map(Regex::as_str))
+            .collect();
+        out.sort_unstable();
+        out
+    }
 }
 
 /// Opening token of a redaction placeholder (`‹REDACTED:`). Public so the
@@ -199,6 +223,29 @@ mod tests {
         assert!(!out.needs_quarantine);
         assert_eq!(out.findings.len(), 1);
         assert_eq!(out.findings[0].action, FindingAction::Allowed);
+    }
+
+    /// The identity a scratch manifest's `scan_policy_sha256` is built from:
+    /// order-independent, both entry kinds included, and only what actually
+    /// suppresses. An order-sensitive identity would re-store every scratch
+    /// artifact whenever two `[scan] allow` lines were swapped.
+    #[test]
+    fn entries_are_the_effective_set_in_a_stable_order() {
+        let one = Allowlist::compile(&[
+            "zzz-[0-9]+".to_string(),
+            "DEADBEEF".to_string(),
+            "aaa-[0-9]+".to_string(),
+            // Never compiles, so it suppresses nothing and must not appear.
+            "(unclosed".to_string(),
+        ]);
+        assert_eq!(one.entries(), ["aaa-[0-9]+", "deadbeef", "zzz-[0-9]+"]);
+
+        let two = Allowlist::compile(&[
+            "aaa-[0-9]+".to_string(),
+            "zzz-[0-9]+".to_string(),
+            "deadbeef".to_string(),
+        ]);
+        assert_eq!(one.entries(), two.entries(), "order changed the identity");
     }
 
     #[test]
