@@ -147,6 +147,39 @@ mod tests {
         );
     }
 
+    /// `--wipe` shares the relaxed floor with `--full`, and shares the override law
+    /// too. It is the level with the strongest claim on the floor: it matches no
+    /// manifest, so the newest mtime is the *only* evidence left that a tree is not
+    /// in use, and the uuid set that would otherwise stand beside it has three silent
+    /// paths to empty.
+    #[test]
+    fn wipe_keeps_the_relaxed_floor_and_cannot_be_taken_below_it() {
+        let cfg = GcConfig {
+            min_age: DurationSetting(Duration::from_secs(7 * 86_400)),
+            active_window: DurationSetting(Duration::from_secs(3_600)),
+            ..GcConfig::default()
+        };
+        assert_eq!(
+            effective_min_age(&cfg, None, ScratchMode::Wipe),
+            Duration::from_secs(3_600)
+        );
+        for low in [Duration::from_secs(60), Duration::ZERO] {
+            assert_eq!(
+                effective_min_age(&cfg, Some(low), ScratchMode::Wipe),
+                Duration::from_secs(3_600),
+                "--min-age {low:?} lowered the floor under --wipe"
+            );
+        }
+        assert_eq!(
+            effective_min_age(
+                &cfg,
+                Some(Duration::from_secs(3 * 86_400)),
+                ScratchMode::Wipe
+            ),
+            Duration::from_secs(3 * 86_400)
+        );
+    }
+
     /// `--full` zeroes every family's retain window; the aged policy keeps them.
     #[test]
     fn full_zeroes_every_retain_window() {
