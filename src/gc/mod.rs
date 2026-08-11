@@ -88,9 +88,20 @@ pub enum ScratchMode {
     /// whole-tree delete is not a per-file one: a ledger recording `caps_lifted`
     /// and an empty captured set.
     Full,
-    /// `gc --wipe`: the whole tree, no ledger required. **Declared, not
-    /// implemented** — the behaviour is PR C2's. Nothing constructs this variant
-    /// yet; it is here so C2 adds a coverage bypass rather than an enum.
+    /// `gc --wipe`: every tree in scope, whatever it holds and whether or not any
+    /// ledger covers it.
+    ///
+    /// It bypasses **exactly one** thing: the scratch coverage pass
+    /// (`safety::coverage`). No fact read from the store authorizes the delete, so no
+    /// fact read from the store can refuse it — the authorization is the flag, and
+    /// `ForeignStoreDir`, `StoreKeyCollision`, `UndecodableIdentity` and the scratch
+    /// `NoCatalogRow` therefore cannot occur at this level. Everything else stands:
+    /// the relaxed `min_age` floor (never zero), both liveness legs, containment,
+    /// root ownership, the blacklist scan inside `safety::remove_tree_guarded`,
+    /// `--commit`, the commit-time re-evaluation, `gc.log` — and every one of the
+    /// `File` gates, which stay because they are *satisfiable*: one `yomi archive`
+    /// run makes a transcript deletable, so there is nothing a bypass would buy
+    /// beyond losing the transcript (§5).
     Wipe,
 }
 
@@ -271,6 +282,10 @@ pub struct Plan {
     /// The level this plan was computed under, so an emitter describes the plan it
     /// was handed rather than re-reading the flag that produced it.
     pub mode: ScratchMode,
+    /// The families this run asked for, carried for the same reason `mode` is: the
+    /// `gc.log` run header states what a run intended, and "what it intended" is the
+    /// requested target list, not the subset that happened to yield a candidate.
+    pub targets: Vec<Target>,
     /// Scratch trees no ledger this run could verify covers — `NoCatalogRow`, which
     /// on the scratch path means an absent manifest, one that will not parse, or a
     /// live file the manifest does not mention (§5 D-S7 keeps them under one
@@ -282,6 +297,22 @@ pub struct Plan {
     /// Scratch trees held at `NotFullyArchived`. Same remedy, different state, so
     /// it is its own count rather than folded into the one above.
     pub scratch_not_fully_archived: usize,
+}
+
+impl Plan {
+    /// Scratch trees this plan would delete. Derived rather than stored so it cannot
+    /// disagree with `items`, and counted apart from `deletable` because the tree is
+    /// the delete unit a whole-tree level is about (decision #13) while `deletable`
+    /// also counts single files.
+    pub fn deletable_trees(&self) -> usize {
+        self.items
+            .iter()
+            .filter(|it| {
+                it.candidate.kind == CandidateKind::ScratchTree
+                    && matches!(it.verdict, Verdict::Delete { .. })
+            })
+            .count()
+    }
 }
 
 #[derive(Default)]
@@ -566,6 +597,7 @@ pub fn plan(
         unverified,
         deletable,
         mode,
+        targets: targets.to_vec(),
         scratch_no_ledger,
         scratch_not_fully_archived,
     })
@@ -591,6 +623,9 @@ pub fn commit(
     // the same level, so a `--full` plan is not re-judged under the aged policy.
     let min_age = policy::effective_min_age(cfg, min_age_override, mode);
     let mut log = GcLog::open(env)?;
+    if mode == ScratchMode::Wipe {
+        log.run_header(plan, min_age)?;
+    }
     let mut report = CommitReport::default();
 
     for item in &plan.items {
@@ -704,6 +739,34 @@ impl GcLog {
             .open(&path)?;
         Env::chmod_600(&path)?;
         Ok(GcLog { file })
+    }
+
+    /// One line stating what a `--wipe` run intended, written **before the first
+    /// unlink**.
+    ///
+    /// Decision #6 keeps `--commit` as the only gate for `--wipe`, on the grounds
+    /// that the real defence against an uninformed run is information rather than a
+    /// second gate — this line is half of that information (the other half goes to
+    /// stdout). Every other record in this log is per-candidate, so "who wiped what,
+    /// and how much of it had no copy" otherwise costs a sum over the whole file.
+    ///
+    /// Written even when the plan claims nothing, because "a wipe ran and took
+    /// nothing" answers the same question. Scoped to `--wipe`: for the other two
+    /// levels the header would answer a different question — where one run's records
+    /// end and the next begin — which is worth doing and is not this one's.
+    fn run_header(&mut self, plan: &Plan, min_age: Duration) -> Result<()> {
+        let targets: Vec<&str> = plan.targets.iter().map(Target::as_str).collect();
+        self.write(&serde_json::json!({
+            "ts": now_iso(),
+            "action": "run",
+            "verb": "wipe",
+            "targets": targets,
+            "planned_trees": plan.deletable_trees(),
+            "planned_deletes": plan.deletable,
+            "archived_bytes": plan.reclaimable_archived_bytes,
+            "unarchived_bytes": plan.reclaimable_unarchived_bytes,
+            "min_age_secs": min_age.as_secs(),
+        }))
     }
 
     fn delete(

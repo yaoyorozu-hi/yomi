@@ -198,6 +198,14 @@ pub fn evaluate_file(
 /// runs, and a tree with no readable ledger is refused exactly as it is by default
 /// — "the captured set is empty" and "nothing ever tried to capture this" are
 /// different statements, and only the first one licenses a delete.
+///
+/// Under [`ScratchMode::Wipe`] the coverage pass ([`coverage`]) does not run, and
+/// that is the **whole** of what the level bypasses: no fact read from the store
+/// authorizes the delete, so no fact read from the store can refuse it either —
+/// the authorization is the flag. What remains is everything below the pass, and
+/// it is the same code for all three levels because it is written once:
+/// [`age_and_liveness`] here, containment and root ownership in `gc`, and the
+/// blacklist scan in [`remove_tree_guarded`] at the unlink.
 #[allow(clippy::too_many_arguments)]
 pub fn evaluate_scratch(
     env: &Env,
@@ -212,6 +220,55 @@ pub fn evaluate_scratch(
     mode: ScratchMode,
 ) -> Result<(Verdict, u64, ByteSplit)> {
     let (bytes, newest) = tree_size_and_newest(session_dir);
+    let root = crate::scratch::store_root(&env.archive_dir());
+    let store_dir = root.join(key);
+
+    let split = match mode {
+        ScratchMode::Wipe => wipe_split(bytes, &root, &store_dir, session_dir),
+        ScratchMode::Aged | ScratchMode::Full => {
+            match coverage(bl, &root, &store_dir, session_dir, bytes, mode) {
+                Coverage::Refused(verdict, split) => return Ok((verdict, bytes, split)),
+                Coverage::Covered(split) => split,
+            }
+        }
+    };
+
+    Ok(age_and_liveness(
+        bytes,
+        split,
+        newest,
+        session_uuid,
+        active,
+        min_age,
+        retain,
+        active_window,
+    ))
+}
+
+/// What the manifest-coverage pass concluded. `Refused` carries the split to report
+/// beside its verdict: a refusal still states what the tree holds.
+enum Coverage {
+    Covered(ByteSplit),
+    Refused(Verdict, ByteSplit),
+}
+
+/// The four checks that decide whether the store's evidence describes *this* tree
+/// well enough to authorize deleting it — the store directory's classification, the
+/// ledger read, the recorded identity, and the full live-tree walk — plus `--full`'s
+/// one added protection.
+///
+/// **This function is exactly what `--wipe` does not run**, which is why the four
+/// live together rather than inline in [`evaluate_scratch`]: the set that a level
+/// bypasses should be nameable, and a check added here is added to the set on
+/// purpose rather than by drifting into it.
+fn coverage(
+    bl: &Blacklist,
+    root: &Path,
+    store_dir: &Path,
+    session_dir: &Path,
+    bytes: u64,
+    mode: ScratchMode,
+) -> Coverage {
     // Until a ledger has been read, nothing says any of these bytes are in the
     // store — which is exactly what `unarchived` claims, no more.
     let no_ledger = ByteSplit::all_unarchived(bytes);
@@ -224,31 +281,24 @@ pub fn evaluate_scratch(
     //
     // Both levels, because a key resolved through a foreign root is foreign even
     // when the key directory itself classifies `Own`.
-    let root = crate::scratch::store_root(&env.archive_dir());
-    let store_dir = root.join(key);
-    if crate::scratch::classify_store_dir(&root) == StoreDir::Foreign
-        || crate::scratch::classify_store_dir(&store_dir) == StoreDir::Foreign
+    if crate::scratch::classify_store_dir(root) == StoreDir::Foreign
+        || crate::scratch::classify_store_dir(store_dir) == StoreDir::Foreign
     {
-        return Ok((
+        return Coverage::Refused(
             Verdict::Unverified {
                 reason: SkipReason::ForeignStoreDir,
             },
-            bytes,
             no_ledger,
-        ));
+        );
     }
     let manifest_path = store_dir.join("manifest.json");
-    let mf = match read_manifest(&manifest_path) {
-        Some(m) => m,
-        None => {
-            return Ok((
-                Verdict::Unverified {
-                    reason: SkipReason::NoCatalogRow,
-                },
-                bytes,
-                no_ledger,
-            ));
-        }
+    let Some(mf) = read_manifest(&manifest_path) else {
+        return Coverage::Refused(
+            Verdict::Unverified {
+                reason: SkipReason::NoCatalogRow,
+            },
+            no_ledger,
+        );
     };
     let split = byte_split(&mf);
     // Immediately after the manifest is read and before any coverage judgment.
@@ -265,10 +315,10 @@ pub fn evaluate_scratch(
             IdentityVerdict::Collision => SkipReason::StoreKeyCollision,
             _ => SkipReason::UndecodableIdentity,
         };
-        return Ok((Verdict::Unverified { reason }, bytes, split));
+        return Coverage::Refused(Verdict::Unverified { reason }, split);
     }
-    if let Some(reason) = verify_scratch_tree(bl, session_dir, &store_dir, &mf) {
-        return Ok((Verdict::Unverified { reason }, bytes, split));
+    if let Some(reason) = verify_scratch_tree(bl, session_dir, store_dir, &mf) {
+        return Coverage::Refused(Verdict::Unverified { reason }, split);
     }
 
     // After every verification check and before the age gate. After, because
@@ -279,9 +329,26 @@ pub fn evaluate_scratch(
     if mode == ScratchMode::Full
         && let Some(reason) = full_protection(&mf)
     {
-        return Ok((Verdict::Protected { reason }, bytes, split));
+        return Coverage::Refused(Verdict::Protected { reason }, split);
     }
+    Coverage::Covered(split)
+}
 
+/// The age floor and both liveness legs, in one place so no level can quietly lose
+/// one of them: a tree that clears the floor, is not named by the active uuid set
+/// and whose newest file mtime is older than `active_window` is deletable, and
+/// nothing else is.
+#[allow(clippy::too_many_arguments)]
+fn age_and_liveness(
+    bytes: u64,
+    split: ByteSplit,
+    newest: Option<SystemTime>,
+    session_uuid: Option<&str>,
+    active: &HashSet<String>,
+    min_age: Duration,
+    retain: Duration,
+    active_window: Duration,
+) -> (Verdict, u64, ByteSplit) {
     let age = newest
         .map(|t| SystemTime::now().duration_since(t).unwrap_or_default())
         .unwrap_or_default();
@@ -291,29 +358,29 @@ pub fn evaluate_scratch(
         } else {
             ProtectReason::RetainWindow
         };
-        return Ok((Verdict::Protected { reason }, bytes, split));
+        return (Verdict::Protected { reason }, bytes, split);
     }
     if let Some(u) = session_uuid
         && active.contains(u)
     {
-        return Ok((
+        return (
             Verdict::Protected {
                 reason: ProtectReason::SessionLive,
             },
             bytes,
             split,
-        ));
+        );
     }
     if let Some(t) = newest
         && SystemTime::now().duration_since(t).unwrap_or_default() < active_window
     {
-        return Ok((
+        return (
             Verdict::Protected {
                 reason: ProtectReason::SessionLive,
             },
             bytes,
             split,
-        ));
+        );
     }
 
     let checks = PassedChecks {
@@ -324,14 +391,14 @@ pub fn evaluate_scratch(
         age_secs: age.as_secs(),
         session_live: false,
     };
-    Ok((
+    (
         Verdict::Delete {
             archive_id: None,
             checks,
         },
         bytes,
         split,
-    ))
+    )
 }
 
 /// Whether the store holds a copy of nothing still in the live tree — no entry is
@@ -397,6 +464,60 @@ fn byte_split(mf: &ScratchManifest) -> ByteSplit {
         }
     }
     split
+}
+
+/// The split to report for a `--wipe` candidate, and the only thing that level reads
+/// the store for. **Reporting only**: nothing read here can refuse the tree, and
+/// nothing read here admits it either.
+///
+/// Two properties the ledger on its own would not give:
+///
+/// * **What is not proved archived is counted unarchived.** [`byte_split`] supplies
+///   the one positive claim — one implementation of it for all three levels — and
+///   every other live byte goes to `unarchived`, including files written since the
+///   last capture, which no ledger names. Under [`coverage`] such files cannot exist
+///   (check 1 refuses the tree), so this subtraction is `--wipe`'s alone, and it is
+///   what stops "these bytes exist in no other copy" from understating on the one
+///   level that can destroy them.
+/// * **`archived + unarchived == bytes` exactly**, so the two figures an operator
+///   reads before a whole-tree delete account for every live byte in it.
+///
+/// The archived side is the ledger's **assertion**, not this run's proof: `--wipe`
+/// re-hashes nothing, so a stored entry whose live file has since been rewritten
+/// still counts as archived (and a shrunken one is clamped to the tree's live size
+/// rather than reported as more than it holds). Under the other two levels the same
+/// figure is backed by [`verify_scratch_tree`]. That difference is the price of a
+/// level that consults no ledger, and §5 states it.
+fn wipe_split(bytes: u64, root: &Path, store_dir: &Path, session_dir: &Path) -> ByteSplit {
+    let archived = ledger_archived_bytes(root, store_dir, session_dir).min(bytes);
+    ByteSplit {
+        archived,
+        unarchived: bytes - archived,
+    }
+}
+
+/// Bytes a readable ledger for *this* tree records as both stored and present — 0
+/// when no such ledger can be had, for any reason.
+///
+/// The store classification and the recorded identity are still consulted, and not
+/// as authorization, which `--wipe` takes from no store: a manifest reached through
+/// a path yomi does not own, or written for a different session directory, describes
+/// *someone else's* bytes, and reporting those as this tree's archived copy is the
+/// one claim a byte split exists to make honestly. Absent, illegible and foreign all
+/// answer the same way — nothing is proved, so nothing is claimed.
+fn ledger_archived_bytes(root: &Path, store_dir: &Path, session_dir: &Path) -> u64 {
+    if crate::scratch::classify_store_dir(root) == StoreDir::Foreign
+        || crate::scratch::classify_store_dir(store_dir) == StoreDir::Foreign
+    {
+        return 0;
+    }
+    let Some(mf) = read_manifest(&store_dir.join("manifest.json")) else {
+        return 0;
+    };
+    if crate::scratch::identity_verdict(&mf, session_dir) != IdentityVerdict::Proceed {
+        return 0;
+    }
+    byte_split(&mf).archived
 }
 
 /// An empty-dir shell carries zero data, so it bypasses the archive gates but

@@ -27,14 +27,26 @@ pub struct GcArgs {
     /// an empty captured set.
     #[arg(long)]
     pub full: bool,
-    /// Cross-user READ-ONLY discovery of ephemeral shapes (never deletes).
+    /// Reclaim every scratch tree in scope whatever it holds: the age policy relaxes
+    /// exactly as under --full, and no ledger is consulted to authorize the delete.
+    /// Transcripts and the other catalog-backed families keep all five archive gates.
     /// Cannot be combined with --full.
+    //
+    // Refused at parse time rather than resolved to the wider level. The two flags
+    // name two predicates, and honouring only one of a pair the operator typed is
+    // the failure mode this CLI already refuses elsewhere (§8, `read --scratch`). The
+    // asymmetry decides it: an operator who believes `--full` narrows what `--wipe`
+    // takes has, under a wipe-wins rule, just deleted every captured tree in scope.
+    #[arg(long, conflicts_with_all = ["full"])]
+    pub wipe: bool,
+    /// Cross-user READ-ONLY discovery of ephemeral shapes (never deletes).
+    /// Cannot be combined with --full or --wipe.
     //
     // Refused at parse time: discovery returns before a target is even parsed, and
     // `candidates()` refuses any root this euid does not own, so the pair can only
     // mislead about what the run did. A parse error is the cheapest correct answer
     // and cannot drift from the code.
-    #[arg(long, conflicts_with_all = ["full"])]
+    #[arg(long, conflicts_with_all = ["full", "wipe"])]
     pub discover_all_users: bool,
     /// Correct a too-loose store root to 700 instead of refusing.
     #[arg(long)]
@@ -64,7 +76,9 @@ pub fn run(env: &Env, args: &GcArgs, json: bool) -> Result<i32> {
         Some(s) => Some(parse_duration(s).ok_or_else(|| anyhow::anyhow!("bad --min-age: {s}"))?),
         None => None,
     };
-    let mode = if args.full {
+    let mode = if args.wipe {
+        ScratchMode::Wipe
+    } else if args.full {
         ScratchMode::Full
     } else {
         ScratchMode::Aged
@@ -84,6 +98,7 @@ pub fn run(env: &Env, args: &GcArgs, json: bool) -> Result<i32> {
         };
         let cat = catalog::open_env(env)?;
         let plan = gc::plan(env, cfg, &targets, &cat, &bl, &live, min_over, mode)?;
+        announce_wipe(&plan, json);
         let report = gc::commit(env, cfg, &plan, &cat, &bl, &live, min_over, mode)?;
         emit_commit(&plan, &report, json);
         let partial = plan.unverified + report.flipped_unverified > 0;
@@ -195,6 +210,7 @@ fn emit_plan(plan: &Plan, json: bool) {
         plan.reclaimable_unarchived_bytes,
     );
     emit_full_advice(plan);
+    emit_wipe_notice(plan);
     for it in &plan.items {
         match &it.verdict {
             Verdict::Delete { .. } => println!(
@@ -282,6 +298,52 @@ fn emit_full_advice(plan: &Plan) {
              settle it.",
             plan.scratch_not_fully_archived
         );
+    }
+}
+
+/// What `--wipe` claims, said where a dry run can still stop it. `--full`'s advice
+/// names a command that widens what the verb may take; there is no such command here,
+/// so this names the consequence instead — the unarchived figure on the line above is
+/// what will exist in no copy afterwards.
+fn emit_wipe_notice(plan: &Plan) {
+    if plan.mode != ScratchMode::Wipe || plan.deletable == 0 {
+        return;
+    }
+    println!(
+        "--wipe consults no ledger: {} scratch tree(s) are in scope whatever they hold, and the \
+         {} bytes with no archived copy exist nowhere else once this runs.",
+        plan.deletable_trees(),
+        plan.reclaimable_unarchived_bytes
+    );
+}
+
+/// What a `--wipe --commit` is about to destroy, printed **before the first unlink**.
+///
+/// Decision #6 keeps `--commit` as the only gate — a second one would make this the
+/// single verb in the binary with its own confirmation idiom, and an interactive
+/// prompt would break the non-interactive use this CLI is built for. What stands in
+/// for it is information: this line plus the `gc.log` run header, so a run killed
+/// halfway still leaves its numbers in the operator's scrollback and in the log.
+///
+/// Under `--json` it goes to stderr. A human line on stdout would make the report
+/// unparseable, and the report is the one thing a caller must be able to read.
+fn announce_wipe(plan: &Plan, json: bool) {
+    if plan.mode != ScratchMode::Wipe || plan.deletable == 0 {
+        return;
+    }
+    let line = format!(
+        "wipe: deleting {} scratch tree(s), {} candidate(s) in total, {} bytes — {} archived, \
+         {} with no archived copy anywhere.",
+        plan.deletable_trees(),
+        plan.deletable,
+        plan.reclaimable_bytes,
+        plan.reclaimable_archived_bytes,
+        plan.reclaimable_unarchived_bytes,
+    );
+    if json {
+        eprintln!("{line}");
+    } else {
+        println!("{line}");
     }
 }
 

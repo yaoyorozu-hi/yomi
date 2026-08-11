@@ -37,8 +37,9 @@ they are numbered on from #6 because they refine decision #4 rather than replace
     copy of something. Issue #59. §2.
 11. **Default `gc` stays age-based.** `clear` is three levels behind two flags: default (age policy),
     `--full` (everything in the captured set, regardless of age), `--wipe` (the whole tree). `--full`
-    shipped as PR C1 (§5, "`clear`'s three levels"); `--wipe` is PR C2. Neither is part of the `--full`
-    archive PR. §5.
+    shipped as PR C1 and `--wipe` as PR C2 (§5, "`clear`'s three levels"); neither is part of the `--full`
+    archive PR. `--wipe` came second on purpose: with the safe option already in the binary, an operator
+    is never pushed to reach for the destructive one. §5.
 12. **`--full` does not widen `tmp_root`.** It archives more of `/tmp/claude-<uid>/` and nothing
     outside it. It is **not** a flag for the uid-owned entries sitting directly in `/tmp` (the
     `yomi-*` test directories of issue #48) — those are a janitor's problem, not an archive's. §3.
@@ -2251,7 +2252,7 @@ Decision #11. One verb, three predicates, two flags. The default is unchanged by
 |---|---|---|
 | `gc` | archived **and** aged — every retain window and the `min_age` floor in force | required |
 | `gc --full` | what the gates already prove is archived, at any age above the floor below — and, for a scratch tree, only when its manifest records `caps_lifted` and its captured set is empty | required |
-| `gc --wipe` (PR C2) | the whole tree | not required |
+| `gc --wipe` | the whole tree, whatever it holds and whether or not anything covers it | not consulted |
 
 **`--full` is a level, not a target filter.** It relaxes the age policy for *every* family: each retain
 window drops to zero and the floor becomes the relaxed one, so an archived transcript past that floor is
@@ -2333,7 +2334,138 @@ candidate's total. On the catalog-backed path the split turns on gate 3 rather t
 kind — a source refused at gates 1-3 has no verified copy, and reporting its bytes as archived is the
 one claim a split exists to make honestly. Under `--full` the archived side is structurally zero, since
 the verb only takes trees with an empty captured set; the field is nonetheless computed for both verbs so
-`--wipe` cannot grow a second implementation of it.
+the positive claim — "these bytes are in the store" — has one implementation (`byte_split`) for all three
+levels. What `--wipe` adds to it is a subtraction, not a second walk; the rule is stated below.
+
+#### `--wipe` — one bypass, and everything else in force
+
+**What it bypasses is exactly one thing: a `ScratchTree` candidate's manifest coverage.** The four
+checks that make it up — the store directory's classification, `read_manifest`, `identity_verdict`,
+`verify_scratch_tree` — are not read as authorization at this level. They live together in one function
+(`safety::coverage`) so that the bypassed set is *nameable*: a check added there is added to the set on
+purpose rather than by drifting into it.
+
+It follows that `NoCatalogRow`, `StoreKeyCollision`, `UndecodableIdentity` and `ForeignStoreDir` **cannot
+occur** under `--wipe`. That is less a bypass than a consequence: no fact read from the store authorizes
+the delete, so no fact read from the store can refuse it. **The authorization is the flag.**
+
+**The `File` gates are untouched, and this is the most important line in the section.** The scratch
+gate's problem is that it demands coverage of data archive *deliberately declines to store* — a demand
+no run can satisfy, which is why a level that ignores it has to exist. A `File` gate demands coverage of
+data archive *does* store, and one `yomi archive` run always satisfies it. **There is no motive to bypass
+a satisfiable gate, and bypassing it would be the one path in this binary that loses a transcript
+irrecoverably.** So the bypass is scoped to `CandidateKind::ScratchTree`: a transcript with no catalog
+row, a stale sha, or an unverified store copy survives `gc --wipe --commit` exactly as it survives
+`gc`. `EmptyDir` candidates never had an archive gate and are unchanged.
+
+Because the `File` path is untouched, `--wipe` needs no special default target set: `--targets` means
+what it always meant, and the default is still every family.
+
+**Nothing below the coverage pass moves.** Each of these is the same code all three levels run, which is
+why none of them can be lost for one of them: `root_owned_by_euid(primary_root)` (the cross-user hard
+guard), `under_allowed` containment after canonicalization, the blacklist pre-scan inside
+`remove_tree_guarded`, both liveness legs (uuid ∈ active set, newest mtime inside `active_window`), the
+`min_age` floor, `--commit`, the commit-time re-evaluation, and the `gc.log` record per candidate.
+
+One of those is, at this level, a second copy of another: the relaxed floor *is* `cfg.active_window`, so a
+tree that clears the floor has also cleared the newest-mtime window and `TooYoung` is always the reason
+reported. The mtime leg stays because it is the same code the default level runs, where the floor sits far
+above the window and the two are independent.
+
+The blacklist scan needed **no new code**, and that is worth recording: `perform_delete` takes a scratch
+tree only when `remove_tree_guarded` returns `Removed`, so a tree holding a credential hardlink returns
+`Blacklisted` → `Ok(false)` → one `flipped_unverified` and a `gc.log` skip under
+`InodeDriftOrBlacklist`. **`--wipe` therefore cannot unlink a credential through a hardlink either**, and
+the run reports itself partial rather than silently skipping. Pinned by test.
+
+**The floor stays at `cfg.active_window`, and the argument for it is *stronger* here than under
+`--full`.** `--wipe` matches no manifest, so the newest mtime is the only remaining evidence that a tree
+is not in use. Of the two liveness signals, the uuid set has three silent paths to empty and the lock leg
+meant to back it up is already dead on this host (issue #37); an mtime floor consults no oracle at all.
+Collapsing it to zero would leave the uuid set alone — and it is exactly this floor that makes `--wipe`
+safe to run from *inside* a Claude Code session, whose scratchpad is written continuously.
+
+The objection "a wipe with a floor is not a wipe" is **rejected**: the floor excludes only the tree of
+the session that issued the command. Deleting one's own caller's scratchpad mid-run is not a more
+complete wipe, it is a footgun with no upside; the tree is in scope an hour later, and `--min-age` raises
+the floor for anyone who wants more (never lowers it, by the same law as everywhere else).
+
+Consistent with that, `--wipe` shares `--full`'s treatment of the retain windows: every family's window
+drops to zero, since the level is stated over what a tree holds and not over when it was written.
+
+**No second confirmation gate. `--commit` is the gate.** `gc --wipe --commit` is already a deliberate
+three-token form and not a default, and every destructive path in yomi uses that one idiom — a second
+gate on this verb alone would make it the single exception in the binary, so an operator would look for
+the same protection elsewhere and not find it. An interactive prompt would break the non-interactive,
+agent-driven use this CLI is built for and would need a `--yes` escape, which is `--commit` with more
+tokens. **The real defence against an uninformed `--wipe --commit` is information, not a gate**, so two
+things carry it instead:
+
+- **a run header in `gc.log`**, written before the first unlink:
+  `{"ts":…,"action":"run","verb":"wipe","targets":[…],"planned_trees":N,"planned_deletes":D,`
+  `"archived_bytes":A,"unarchived_bytes":U,"min_age_secs":S}`. Every other record in that log is
+  per-candidate, so "who wiped what, and how much of it had no copy" otherwise costs a sum over the whole
+  file. Written even when the plan claims nothing. Scoped to `--wipe`: for the other two levels a header
+  would answer a different and separate question — where one run's records end and the next begin.
+- **a stdout line before the first unlink**, so a run killed halfway still leaves its numbers in the
+  operator's scrollback as well as in the log. It is emitted from the plan, between plan and commit, so
+  it cannot be a rendering of what happened. Under `--json` it goes to stderr, because the report must
+  stay parseable.
+
+**The byte split under `--wipe`: what is not proved archived is counted unarchived.**
+
+| Tree's state | Split |
+|---|---|
+| ledger present and readable for *this* tree | `archived` = bytes of entries that are both `present` and `stored` (`byte_split`, unchanged) |
+| no ledger, an unreadable one, one reached through a store path yomi does not own, or one whose recorded identity names another session | `archived` = 0 |
+
+and in every case `unarchived` = the tree's live size − `archived`. Two consequences are deliberate:
+
+- **`archived + unarchived` equals the tree's live size exactly**, so the two figures an operator reads
+  before a whole-tree delete account for every live byte in it. Under the coverage pass this identity does
+  not hold (a retained entry belongs to neither side) and does not need to.
+- **Files written since the last capture count as unarchived.** No ledger names them; under the coverage
+  pass they cannot exist at all (`verify_scratch_tree` check 1 refuses such a tree), so counting them is
+  `--wipe`'s own problem. Leaving them out would make the one figure an operator reads as "this exists in
+  no other copy" *understate* on the one level that can destroy it.
+
+**`--wipe` reads the manifest for the report and never for the verdict**, and the verdict depends on
+nothing it finds there. The store classification and the identity check still run inside that read — not
+as authorization, which this level takes from no store, but because a manifest reached through a foreign
+path or written for another session directory describes *someone else's* bytes, and reporting those as
+this tree's archived copy is the one claim a byte split exists to make honestly. The archived side is the
+ledger's **assertion**, not this run's proof: `--wipe` re-hashes nothing, so a stored entry whose live
+file has since been rewritten still counts as archived (and a shrunken one is clamped to the live size
+rather than reported as more than the tree holds). Under the other two levels the same figure is backed by
+`verify_scratch_tree`. That is the price of a level that consults no ledger, and it is stated rather than
+hidden.
+
+**The new scale this puts in front of an operator.** On this host roughly **99.3%** of the bytes `--wipe`
+would reclaim have no archived copy (≈30.9MB archived against ≈4.13GB not). §3 already accepted that in
+words — "nothing about it is lost except bytes we deliberately declined to hoard" — under ratified
+decision #4; what was missing was the *number*, and a verb that deletes uncovered trees is the first one
+for which the number is the whole story.
+
+**`--wipe --full` is a parse error**, not a resolution to the wider level. The two flags name two
+predicates, and honouring one of a pair the operator typed is the failure mode §8 refuses for
+`read --scratch`. The asymmetry settles it: under a wipe-wins rule, an operator who believed `--full`
+narrowed the run has just deleted every captured tree in scope. `--wipe --discover-all-users` is likewise
+refused, for the reason `--full` already is.
+
+**`--wipe` does not reach `~/.yomi`, and will not.** Four reasons:
+
+1. `gc`'s candidates are defined over the three **source** roots. The store is a destination, not a
+   source; admitting it would force `under_allowed` to accept `env.home`, widening the containment guard
+   from "sources only" to "sources + store" — and **every candidate generator written afterwards would
+   inherit that widening**.
+2. **PR #31 just finished doing the opposite**: it put the store on the blacklist so that `archive` cannot
+   ingest itself. Letting `gc` delete the store would rejoin the two directions.
+3. `quarantine/` holds unredacted secrets in plaintext at mode 700. Deleting the store means deleting
+   those, which is a deletion to handle deliberately under its own verb.
+4. The decision that produced `--wipe` was about the trees under `/tmp`.
+
+**Open item, not implemented here:** `yomi purge --store [--quarantine-only] --commit` as the verb that
+does reach the store, with its own gates and its own confirmation. It is deliberately a different verb.
 
 ### Policy (config)
 
@@ -2353,7 +2485,8 @@ require_indexed  = false   # P3: true ⇒ GC consults index_state; skips only un
 
 - **history.jsonl** — single live append-only file. Archive **slices** by timestamp watermark; source truncation is OFF by default (`history_compact=false`) — rewriting a file CC may be appending to is unsafe. Archive-only, never wipe, unless user opts in.
 - **Empty-dir shells** (`session-env/`, `tasks/` — 65 empty dirs, recon). Pure janitor: `yomi gc --targets empty-dirs` removes empty dirs not owned by a live session. Zero data → no archive needed.
-- **`/tmp/claude-1007/**`** scratch — GC removes scratch dirs whose session is not-live AND archived-or-manifested AND older than `scratch_retain`. Reclaims the 134M clone. `--full` relaxes the age half of that rule and nothing else (above).
+- **`/tmp/claude-1007/**`** scratch — GC removes scratch dirs whose session is not-live AND archived-or-manifested AND older than `scratch_retain`. Reclaims the 134M clone. `--full` relaxes the age half of that rule and nothing else; `--wipe` drops the
+  archived-or-manifested half as well, and keeps the floor and both liveness legs (above).
 - **paste-cache / shell-snapshots** — archive (scan applies) then age-GC.
 
 ### Dry-run is the default
@@ -2538,7 +2671,8 @@ yomi archive [--all | --session <uuid> | PATH] [--include transcript,subagents,t
                                                                           # --full: every family, [scratch] caps lifted (§3)
                                                                           # --rearchive: reuse no scratch capture this run (§3)
 yomi gc      [--targets transcripts,scratch,mcp,empty-dirs,paste,snapshots] [--commit] [--min-age D]
-             [--full]                                                      # dry-run default; --full: caps-lifted ledger + empty captured set (§5)
+             [--full | --wipe]                                             # dry-run default; --full: caps-lifted ledger + empty captured set (§5)
+                                                                          # --wipe: every tree, no ledger consulted; File gates unchanged (§5)
 yomi search  <query> [filters…]
 yomi index   [--reindex] [--session <uuid>]
 yomi rescan  [--commit] [--session <uuid>] [--fix-perms]                                                # dry-run default; retroactive re-redaction
