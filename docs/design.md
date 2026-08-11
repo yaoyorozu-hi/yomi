@@ -348,6 +348,7 @@ because the flag's name invites more:
 | `tmp_root` | `--full` archives more *of* `/tmp/claude-<uid>/` and nothing outside it. Decision #12: the uid-owned entries directly under `/tmp` (issue #48's `yomi-*` test dirs) are a janitor's problem, not an archive's |
 | what counts as a session tree | the enumerator takes `<tmp_root>/<X>/<Y>/` as a unit **whatever `Y` looks like** — it does not require a uuid shape, and `--full` does not relax anything here because there is nothing to relax. That breadth is load-bearing rather than lax: the enumerator's unit must equal the deleter's unit, or a live file the writer never manifested refuses its tree forever (§5) |
 | the source-root ownership refusal | a `tmp_root` this euid does not own archives no scratch, under `--full` exactly as without it. "Full" is not an authority over another user's files |
+| the dedup skip | a `--full` run still reuses an unchanged capture, and a capped run still reuses one a `--full` run made. "Store more" and "store it again" are different instructions, and the second one is `--rearchive` — see the dedup section below |
 
 Both tree totals are still accumulated under `--full`, and `total_bytes` and `admitted_bytes` still
 recorded: lifting a cap is not a reason to stop measuring what it would have decided. `admitted_bytes`
@@ -377,6 +378,149 @@ otherwise reading a bare count that is indistinguishable from a defect.
 serialized only when true, so a manifest written before the field parses unchanged and a capped run's
 manifest is byte-identical to one from before it existed. Reading absent as `false` is the conservative
 side — claiming a lift that never happened would attribute a later narrowing to a run that never ran.
+
+The third ledger field beside them is `scan_policy_sha256`, which the dedup predicate rests on:
+
+```json
+"scan_policy_sha256": "<64 hex>"   // ScratchManifest; serde(default) = "", always emitted
+```
+
+It is the sha256 of the **effective scan policy** the captures in this manifest were made under —
+`scan_enabled` (`--no-scan`), `quarantine_all` (`--quarantine-on-secret`) and the sorted effective
+`[scan] allow` set — and it is a *security* field, not provenance decoration. Its default is the empty
+string, which no digest equals, so a manifest written before it forces exactly one full re-store and
+self-upgrades. What it does **not** cover is the scanner's own rules, which is why `archive
+--rearchive` exists. See the section below for both.
+
+#### Scratch dedup — what a skip requires, and why the cheap version is wrong
+
+`archive_scratch` had no skip path. `capture` has had `Plan::Skip` for whole-file roles since it
+existed (source `sha` unchanged → no-op, §2), and the scratch store pass had no equivalent: every
+`stored: true` entry was re-read, re-scanned, re-compressed and re-written on every run. Measured on
+this host, per run, over a tree nothing had touched: **30.87 MB through the secret scanner and 3,580
+`.zst` frames rewritten**. That is the defect the user's original request named — "do not re-copy the
+whole structure on every archive → session → archive cycle".
+
+**The predicate. Every condition is load-bearing; none of them may be dropped as an optimisation.**
+Evaluated per entry inside the store pass, *after* the source has been read:
+
+| | Condition | What it stops |
+|---|---|---|
+| 0 | `--rearchive` was not asked for | an operator's explicit instruction to re-store being overridden by a reuse — see below |
+| 1 | the prior manifest's `scan_policy_sha256` equals this run's | a tightened scan policy being defeated by a source-hash match — see below |
+| 2 | the prior entry is `stored` | there is no artifact to reuse otherwise |
+| 3 | the prior entry is `present` | a **retained** entry was captured by a run older than the ledger carrying it, so that ledger's recorded policy says nothing about its store copy |
+| 4 | the prior entry is not `capture_failed` | a **salvaged** entry carries hashes from an arbitrarily old capture while staying `present: true` — the same door as 3, one step over |
+| 5 | the prior entry has **both** `source_sha256` and `content_sha256` | an entry with only the first is unverifiable to the GC gate (`StoreReverifyFailed`) and only a re-store can fill the second |
+| 6 | `source_sha256` equals the sha256 of the bytes **this run just read** | the dedup test itself |
+| 7 | the entry's `.zst` is a regular file on disk | a claim carried on the prior ledger's word for an artifact that is gone |
+| 8 | if the prior entry is `quarantined`, its original is at its mirrored path | a carried `quarantined: true` asserting an original that an operator has removed, which law Q's Q1 would then report forever with nothing able to repair it |
+
+On a skip, exactly the three fields a fresh capture would have written are carried across:
+`source_sha256`, `content_sha256` and `quarantined`. The last is not optional — dropping it has the
+ledger deny an unredacted original that is still on disk, which law Q reads as a stray, and it is the
+same rule `salvage` follows for the same reason (§4).
+
+**The conditions are support for one invariant, and reading them as a list is how a later change breaks
+it.** State the invariant first:
+
+> **Every entry a skip leans on was stored or skipped by the run whose ledger records the policy.**
+
+A fresh store satisfies it by construction. A skip satisfies it because condition 1 held for the ledger
+the entry came from, which is what makes the rule **inductive** rather than a spot check on one run —
+and the induction is the only thing that lets a *manifest-level* policy field speak for an entry that
+several runs have carried. Retention and salvage are the two ways an entry can carry a capture **older**
+than its ledger, so conditions 3 and 4 are what exclude them; drop either one and the invariant is gone
+whatever the rest of the table says. Concretely, without them a file that vanished (or merely became
+unreadable) across a policy change and later came back byte-identical keeps its pre-change store copy
+forever — the policy field defeated through the retention door. The cost of excluding them is one
+re-store of a returning or recovered file, after which it skips like anything else.
+
+Conditions 5, 7 and 8 support a second, weaker rule: **a skip never carries a claim the store cannot
+back.** Each of the three states they exclude is one that only a re-store can leave — a missing
+`content_sha256` the GC gate cannot verify, an artifact that is gone, an original an operator removed —
+so skipping past any of them makes an unrepairable state permanent, which is the shape of every defect
+this section records.
+
+**Why the scan policy is in the predicate: this is a security property, not a performance knob.**
+`--no-scan` stores raw bytes, `--quarantine-on-secret` changes which originals are preserved, and a
+`[scan] allow` edit changes what is redacted — and **none of the three changes `source_sha256`**. A
+skip keyed on the source hash alone therefore keeps an unredacted or wrongly-redacted store copy after
+the policy has been tightened, and *no later run ever repairs it*, because every later run makes the
+same comparison and skips again. The digest is what turns a policy change into one full re-store per
+tree. It is order-stable (the allow set is sorted) because a digest that moved with `HashMap` order or
+with the order of two config lines would miss every skip on every run — dedup switched off, with
+nothing to see. It is length-prefixed and domain-separated so the encoding is injective, and under
+`--no-scan` the other two inputs are omitted, since with scanning off they are not consulted and the
+effective policy is a single point.
+
+**The `[scratch]` caps are deliberately *not* in the digest.** They decide *whether* a file is stored,
+not what its stored bytes are, and the ledger already records their verdict per entry (`stored`,
+`not_stored`, `over_total_cap`, `caps_lifted`). A `--full` capture is therefore reusable by a later
+capped run for every file that run still admits; the files it no longer admits are dropped by
+reconciliation under store law S, which is the narrowing behaviour already specified above.
+
+**No mtime/size fast-path. Not now, and not as a later optimisation.** Skipping the *read* when
+`(size, mtime)` match is cheaper still, and it is refused: a false "unchanged" leaves the store holding
+bytes that the ledger's `source_sha256` does not describe. The GC gate would then re-hash the live file,
+disagree and report `ShaMismatch` — so nothing is deleted and the failure is *safe* — but the ledger
+would be **lying about what the archive holds**, which is the one thing every law in this section
+refuses. So the file is always read and always hashed; what a skip avoids is the scan, the compression
+and the store write, which is where the cost is. What remains on this host is a 30.87 MB read per run,
+warm in page cache, whose cost is the sha256 rather than the regex set.
+
+**What a skip does not cover, and why each is cost rather than a correctness gap.**
+
+- **manifest missing** → no prior ledger, so the whole tree is re-stored. The artifacts are still
+  claimed by the new manifest, so nothing is reconciled away.
+- **manifest unreadable** → unchanged behaviour: the key is left entirely untouched, nothing archived
+  and nothing removed (§3). Worth stating here because it is not self-repairing — a damaged manifest
+  stays damaged across re-runs and an operator has to remove it.
+- **store key changed** → a new store dir with no prior ledger, so a full re-store; the old key's store
+  dir becomes an orphan nothing enumerates. Unchanged by dedup.
+- **`--dry-run`** forecasts no skips at all. The store pass does not run, so no source is opened and no
+  hash exists to compare — the same accepted limitation dry-run has for `capture_failed`.
+- **a hardened scanner** — a new detector in `scan/rules.rs`, or a change to `scan/content.rs`'s
+  normalization — is not in the digest and no condition above can see it. **`archive --rearchive` is the
+  remedy, and it is the only one.** This is the entry in this list that needed an operator-facing answer
+  rather than a note, because what it leaves behind is not work done twice but a stored redaction weaker
+  than current policy. The block below names the remedy and says why the digest does not try to be one.
+
+**The scanner's own rules are not in the digest, and `--rearchive` is what makes that safe.** The
+digest covers what config and flags decide. Two candidates for widening it were considered and both
+refused:
+
+- **a digest over `scan/rules.rs`** — it would cover the detector set and nothing else, while *looking*
+  like a complete scan identity. `scan/content.rs`'s normalization, its JSONL gate and its
+  hidden-secret detection all change the stored bytes too, so a reader who found "the scan is hashed"
+  would be relying on a guarantee that covers one of several modules. **A partial digest is worse than
+  no digest**, because it is the only one of the two that misleads.
+- **a digest over the crate version** — complete, and it re-stores every tree on every release: on this
+  host 30.87 MB re-scanned and 3,580 frames rewritten each time a version bump lands, whether or not it
+  touched the scanner. That spends the whole of dedup once per release for a change that usually is not
+  one.
+
+**The cost of refusing both is stated rather than hidden: after an upgrade that tightens a detector,
+nothing re-examines an existing scratch store copy on its own.** For a session artifact the answer is
+`rescan` (§6), which re-scans stored content against the hardened scanner — but `rescan` walks catalog
+rows, and **scratch has none** (#43), so for scratch there is no path at all rather than a different
+command. That gap predates this change; dedup is what makes it load-bearing, since before it every
+archive run happened to re-redact every scratch store copy as a side effect of re-storing it. Extending
+`rescan` to the scratch manifests is the repair and is a separate arc.
+
+Until it lands, the path is **`yomi archive --rearchive`**: one run in which no capture is reused, so
+every `stored` entry is scanned, compressed and written afresh under the current scanner and the current
+policy. It is deliberately small — one condition at the top of the predicate — and deliberately
+per-run: nothing records that a run was forced, because a forced run produces exactly the ledger a
+policy-changed run produces and no later decision asks whether a capture was reused. (`caps_lifted`
+exists because a cap decision that never happened is otherwise indistinguishable from one that declined
+nothing; there is no such ambiguity here.) It is **independent of `--full`**, which lifts the `[scratch]`
+caps and adds nothing else (decision #8), and the four combinations compose exactly as written.
+
+**Path-keyed only.** Two identities holding identical content are two captures, and
+`ScratchEntry.content_sha256` is a verification field, not a content address. Content-keyed dedup
+(one stored artifact for N identical files) presupposes scratch having a record outside its own
+manifest — the catalog work in #43 — and is a different arc.
 
 **Scratch path identity is byte-valued, and one module owns it.** `src/scratch.rs` owns `ScratchRel`
 — the identity of one scratch file relative to its session dir — and every layer goes through it: the
@@ -937,6 +1081,12 @@ would import stale claims about files whose policy or content has since moved, a
 *mask* the orphan drift above by keeping a `stored: true` entry alive for a `.zst` that no longer
 belongs. The asymmetry is deliberate and stays. Retention of vanished-file entries is the one narrow
 merge, and it is justified by "do not destroy the last copy", not by provenance.
+
+**Dedup is not a merge, and does not weaken this.** The live pass still builds every entry from the
+walk under current policy; a skip copies three capture fields onto an entry that already exists — and
+only after the source has been read and proven byte-identical to what those fields describe, under the
+predicate above. A stale claim cannot survive it: an entry policy no longer stores is never a skip
+candidate, and its `.zst` is reconciled away exactly as before.
 
 ### Scratch — known defects and their specified repairs
 
@@ -2384,7 +2534,9 @@ Because the codex store is **empty today**, steps 2–4 collapse into one cutove
 
 ```
 yomi archive [--all | --session <uuid> | PATH] [--include transcript,subagents,tool-results,history,mcp,scratch,all]
-             [--full] [--no-scan] [--quarantine-on-secret] [--dry-run]     # --full: every family, [scratch] caps lifted (§3)
+             [--full] [--rearchive] [--no-scan] [--quarantine-on-secret] [--dry-run]
+                                                                          # --full: every family, [scratch] caps lifted (§3)
+                                                                          # --rearchive: reuse no scratch capture this run (§3)
 yomi gc      [--targets transcripts,scratch,mcp,empty-dirs,paste,snapshots] [--commit] [--min-age D]
              [--full]                                                      # dry-run default; --full: caps-lifted ledger + empty captured set (§5)
 yomi search  <query> [filters…]

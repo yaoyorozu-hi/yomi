@@ -146,6 +146,15 @@ fn count(v: &serde_json::Value, key: &str) -> u64 {
 /// quarantined `leak.md`, so `findings`/`quarantined` climbed by one per pass and
 /// each pass added a directory level. Both are asserted: the counts (the signal an
 /// operator would see) and the file set (the bytes that would accumulate).
+///
+/// **Pass 2's expected counts are zero, not one, since scratch dedup landed.**
+/// The planted file is unchanged, so the second pass reuses its capture and never
+/// scans it — the count an operator reads is now "1 unchanged, 0 findings" rather
+/// than a re-scan that finds the same secret again. The ceiling this test cares
+/// about is unchanged and is now tighter: anything above zero means content was
+/// scanned that the dedup predicate did not recognise, which is either
+/// self-ingestion or a dedup regression. `artifacts_skipped` is asserted beside
+/// the zeros so they cannot be satisfied by the file simply going unarchived.
 #[test]
 fn a_store_inside_the_walked_tree_is_not_ingested() {
     let fx = Fx::new("two-pass");
@@ -177,15 +186,22 @@ fn a_store_inside_the_walked_tree_is_not_ingested() {
     let after_second = fx.store_paths();
 
     assert_eq!(
-        count(&second, "findings"),
+        count(&second, "artifacts_skipped"),
         1,
-        "pass 2 found more than the one planted secret — it read its own store: \
-         {second}"
+        "pass 2 did not reuse the capture of the one unchanged planted file, so \
+         the zeros below would prove nothing: {second}"
+    );
+    assert_eq!(
+        count(&second, "findings"),
+        0,
+        "pass 2 scanned content: either it read its own store, or the unchanged \
+         planted file was re-captured instead of skipped: {second}"
     );
     assert_eq!(
         count(&second, "quarantined"),
-        1,
-        "pass 2 quarantined more than the one planted secret: {second}"
+        0,
+        "pass 2 wrote an original to quarantine/: either it ingested the one pass \
+         1 wrote, or it re-captured the unchanged planted file: {second}"
     );
     let added: Vec<&PathBuf> = after_second.difference(&after_first).collect();
     assert!(
@@ -223,6 +239,9 @@ fn a_store_inside_the_walked_tree_is_not_ingested() {
 /// Six passes, because the defect was *unbounded* rather than a single extra
 /// copy: each pass fed the next one a deeper tree. The counts must be flat, and
 /// the store must stop growing after the first pass.
+///
+/// Flat at zero from pass 2 on: the planted file is unchanged, so every later pass
+/// reuses its capture. See the note on the two-pass test above.
 #[test]
 fn repeated_passes_do_not_grow_the_store() {
     let fx = Fx::new("six-pass");
@@ -232,11 +251,18 @@ fn repeated_passes_do_not_grow_the_store() {
     for pass in 2..=6 {
         let r = fx.pass();
         assert_eq!(
-            count(&r, "findings"),
+            count(&r, "artifacts_skipped"),
             1,
-            "pass {pass}: findings grew — self-ingestion is back: {r}"
+            "pass {pass}: the unchanged planted file was not skipped, so the \
+             zeros below prove nothing: {r}"
         );
-        assert_eq!(count(&r, "quarantined"), 1, "pass {pass}: {r}");
+        assert_eq!(
+            count(&r, "findings"),
+            0,
+            "pass {pass}: content was scanned — self-ingestion is back, or the \
+             unchanged file was re-captured: {r}"
+        );
+        assert_eq!(count(&r, "quarantined"), 0, "pass {pass}: {r}");
         assert_eq!(
             fx.store_paths(),
             settled,
