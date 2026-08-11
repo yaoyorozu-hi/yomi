@@ -166,8 +166,8 @@ fn a_store_inside_the_walked_tree_is_not_ingested() {
     assert_eq!(count(&first, "quarantined"), 1);
     // The store's own bookkeeping is already inside the tree by the time the walk
     // runs, so the refusal is observable on the very first pass. This is what
-    // proves the *denylist* stopped the read, not the 20MB `total_cap` that
-    // happens to keep the real host's trees manifest-only.
+    // proves the *denylist* stopped the read, not a `total_cap` that happens to
+    // keep a large tree manifest-only.
     assert!(
         count(&first, "blacklisted_skipped") > 0,
         "pass 1 walked the store without refusing any of it: {first}"

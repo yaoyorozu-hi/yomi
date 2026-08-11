@@ -568,8 +568,28 @@ pub struct ScratchManifest {
     pub uuid_hex: String,
     #[serde(default)]
     pub captured_at: String,
+    /// Every live candidate's bytes, whatever policy said about them — the tree's
+    /// footprint, and what a reclaim of it removes.
     #[serde(default)]
     pub total_bytes: u64,
+    /// The subset of `total_bytes` policy admits: the sum of `bytes` over live
+    /// entries carrying no `not_stored` cause. **This is the quantity `total_cap`
+    /// is compared against** (decision #9), so it is what `over_total_cap` is a
+    /// verdict on, and it is recorded beside the flag because the verdict is
+    /// otherwise unauditable — the cap in force when a reader arrives is not the
+    /// cap that produced it, and summing the entries again would re-derive the
+    /// measurement from a policy that has since moved.
+    ///
+    /// Under `--full` it is the set that *was* stored rather than what a capped
+    /// run would have admitted: no `file_cap` decision is taken, so none is
+    /// measured. The field describes the run that wrote the ledger.
+    ///
+    /// `Option`, not a defaulted `0`: a manifest written before this field records
+    /// a raw total in `total_bytes` and no admitted total at all, and `0` there
+    /// would be a measurement nobody took — read as "this tree admits nothing",
+    /// which is a claim about a tree that may admit all of it.
+    #[serde(default)]
+    pub admitted_bytes: Option<u64>,
     #[serde(default)]
     pub over_total_cap: bool,
     /// The `[scratch]` caps were lifted for the run that wrote this ledger
@@ -1973,6 +1993,7 @@ mod tests {
             uuid_hex: crate::util::hex(b"-b"),
             captured_at: String::new(),
             total_bytes: 0,
+            admitted_bytes: None,
             over_total_cap: false,
             caps_lifted: false,
             entries: Vec::new(),
@@ -2123,6 +2144,7 @@ mod tests {
             uuid_hex: crate::util::hex(uuid),
             captured_at: String::new(),
             total_bytes: 0,
+            admitted_bytes: None,
             over_total_cap: false,
             caps_lifted: false,
             entries: Vec::new(),

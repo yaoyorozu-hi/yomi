@@ -30,8 +30,8 @@ they are numbered on from #6 because they refine decision #4 rather than replace
    including the files the globs already refused, so the build output and `.git` trees the globs exist
    to exclude are what puts a tree over the cap — and it then stores nothing at all, including the few
    MB it would have stored. Measured on this host: 30.9MB admitted, 9.3MB effectively stored (§0).
-   Queued as its own change (PR E), together with raising the default to 64MB; **not implemented by the
-   `--full` PR**. §3.
+   **Implemented in PR E** — its own change, not the `--full` PR's — together with raising the default
+   to 64MB. §3.
 10. **`~/.yomi` has no size ceiling by default.** Opt-in by config/env when one is wanted, and it is a
     *refusal to grow* — no eviction of what is already archived, since eviction would delete the only
     copy of something. Issue #59. §2.
@@ -77,7 +77,11 @@ on-disk.
   *(2026-08-10, `luola`, apparent.)* Of that, one tree (`aa0a0ca5…`, 12,729 files, 21,677,097 B
   admitted) exceeds the 20MB `total_cap` and therefore stores **nothing**, so the effective stored set
   is **≈9,251,497 B (9.3 MB)**. The gap between 30.9MB admitted and 9.3MB stored is decision #9's
-  subject: the cap is compared against the whole tree rather than the admitted set.
+  subject: the cap was compared against the whole tree rather than the admitted set.
+  **These are pre-PR-E figures, and PR E closes that gap on this same measurement:** the cap now
+  compares 21,677,097 B against a 64MB default, no tree here is declined by `total_cap`, and the
+  admitted 30.9MB is the stored set. Three of the four trees were over the raw cap, one of them
+  (`2ec0a278…`) with a would-store set of **0 bytes** — a cap that suppressed nothing and raised a flag.
 - **What the bulk actually is:** BUILD 3,794,415,065 B / 11,027 files (84.98%), GIT 613,167,298 B /
   323 files (13.73%), everything else 57,816,060 B / 5,792 files (1.29%). *(2026-08-10, `luola`,
   apparent.)* The "134M repo clone" of the original text is gone; build output, not clones, is the
@@ -263,7 +267,7 @@ sizes + hashes), **store contents only for an allowlist under a size cap**:
 allow  = ["*.md","*.txt","*.json","*.output","*.log","*.csv","*.sh","*.py"]
 deny   = [".git/**","node_modules/**","target/**","**/*.{mp4,zip,tar,iso,bin}"]
 file_cap  = "5MB"    # any single file over cap → listed, not stored
-total_cap = "20MB"   # whole scratch over cap → manifest-only + flag
+total_cap = "64MB"   # admitted bytes over cap → whole tree manifest-only + flag
 ```
 
 Two things about the caps, both decided 2026-08-10:
@@ -272,21 +276,27 @@ Two things about the caps, both decided 2026-08-10:
   globs are unaffected). The run records `caps_lifted: true` in the manifest, because otherwise
   "no cap declined anything" and "no cap was applied" are indistinguishable in the ledger — see
   `--full` below. Decision #8.
-- **`total_cap` counts the wrong bytes today**, and the repair is queued rather than done here: it sums
-  *every* candidate rather than the ones the globs would store, so the build output and `.git` trees the
-  `deny` list already refuses are what carries a tree over the cap, after which it stores nothing at all
-  — which is exactly what happens on this host, where 21.7MB of one tree's admitted files are dropped by
-  a 20MB cap the tree only exceeds on bytes that were never going to be stored (§0). Decision #9, PR E;
-  the default also rises to 64MB there.
+- **`total_cap` counts would-store bytes** (decision #9, PR E). It sums the candidates the globs admit,
+  not every candidate: counting the whole tree let the build output and `.git` trees the `deny` list
+  already refuses carry a tree over the cap, after which it stored nothing at all — 21.7MB of one tree's
+  admitted files dropped by a 20MB cap the tree only exceeded on bytes that were never going to be
+  stored (§0). It bought nothing, either: `stored: false` entries take the GC gate's presence+size path
+  whichever rule wrote them, so raw accounting made no tree more reclaimable than admitted accounting
+  does. **The default moved with the quantity**, 20MB → 64MB: 20 was chosen against whole-tree totals,
+  and against admitted bytes the largest tree measured here (21.7MB) would still have stored nothing at
+  it. The manifest records both totals — `total_bytes` (the whole tree, the footprint a reclaim removes)
+  and `admitted_bytes` (what the cap compared) — because `over_total_cap` is a verdict on the second and
+  unauditable without it.
 
 The 134M cloned repo → excluded by `deny` + `total_cap`, but its existence is recorded in the scratch
 manifest. Nothing about it is lost except bytes we deliberately declined to hoard.
 
-**Over-cap is manifest-only, and the manifest says so.** When the tree total exceeds `total_cap`,
-nothing is stored and **every** entry is written `stored: false`, with `over_total_cap: true`
-recording why. That is what makes the tree reclaimable: a `stored: false` entry takes the GC gate's
-size-only path (check 4 — presence and size must still match the manifest), whereas a `stored: true`
-entry with no `.zst` and no hashes reads to the gate as a corrupt archive and refuses the whole tree.
+**Over-cap is manifest-only, and the manifest says so.** When a tree's admitted bytes exceed
+`total_cap`, nothing is stored and **every** entry is written `stored: false`, with
+`over_total_cap: true` recording why. That is what makes the tree reclaimable: a `stored: false` entry
+takes the GC gate's size-only path (check 4 — presence and size must still match the manifest), whereas
+a `stored: true` entry with no `.zst` and no hashes reads to the gate as a corrupt archive and refuses
+the whole tree.
 The writer used to emit exactly that contradiction, so the 134M clone the cap exists for was
 **permanently** unreclaimable — no number of archive/GC cycles helped, because re-archiving
 regenerated the identical manifest.
@@ -297,15 +307,21 @@ check 4. This is decision #4 taken to its conclusion — "whole scratch over cap
 flag", "nothing about it is lost except bytes we deliberately declined to hoard" — so the tree's
 *existence and shape* survive in the manifest while its *contents* do not. Second-order effect of the
 same rule: an allow-listed file that would have been stored individually is **not** stored, and is
-deleted with the rest, once the tree as a whole goes over the cap. The trade is per-tree, not
-per-file.
+deleted with the rest, once the tree goes over the cap. The trade is per-tree, not per-file.
+
+**The threshold is measured on admitted bytes** (decision #9), which is what makes that trade
+answerable: every byte counted toward it is a byte the run was going to store, so a tree that loses its
+contents to the cap is one whose *own archive-worthy content* is larger than the operator agreed to
+hoard. Under whole-tree accounting the same cliff was reached on bytes nobody proposed to keep.
 
 **Under `--full` the same consequence exists at a different scale, in the other direction.** With the
 caps lifted the store holds the whole allow-listed set of a tree the caps would have declined — on this
-host that is a 9.3MB stored set becoming a 30.9MB one (§0), and on a tree with a large allow-listed
-corpus it is unbounded by anything but the globs. That is the point of the flag, and it is why the cap
-lift is opt-in per run rather than a config default: the operator asking for it is present, and the
-next unattended run reverts to the caps. The reversion is itself lossy — see the narrowing note under
+host that was a 9.3MB stored set becoming a 30.9MB one (§0, measured before PR E; with the cap on
+admitted bytes and a 64MB default no tree here is declined by `total_cap`, so what `--full` adds on this
+host is now the `file_cap` set alone), and on a tree with a large allow-listed corpus it is unbounded by
+anything but the globs. That is the point of the flag, and it is why the cap lift is opt-in per run
+rather than a config default: the operator asking for it is present, and the next unattended run
+reverts to the caps. The reversion is itself lossy — see the narrowing note under
 `--full` — which is why the manifest records that the caps were lifted.
 
 #### `archive --full` — what it lifts, and what it must not
@@ -333,9 +349,11 @@ because the flag's name invites more:
 | what counts as a session tree | the enumerator takes `<tmp_root>/<X>/<Y>/` as a unit **whatever `Y` looks like** — it does not require a uuid shape, and `--full` does not relax anything here because there is nothing to relax. That breadth is load-bearing rather than lax: the enumerator's unit must equal the deleter's unit, or a live file the writer never manifested refuses its tree forever (§5) |
 | the source-root ownership refusal | a `tmp_root` this euid does not own archives no scratch, under `--full` exactly as without it. "Full" is not an authority over another user's files |
 
-`total` is still accumulated under `--full`, and `total_bytes` still recorded: lifting a cap is not a
-reason to stop measuring what it would have decided. `over_total_cap` is then always `false`, which is
-what makes the ledger field below necessary.
+Both tree totals are still accumulated under `--full`, and `total_bytes` and `admitted_bytes` still
+recorded: lifting a cap is not a reason to stop measuring what it would have decided. `admitted_bytes`
+then describes the set that *was* stored rather than what a capped run would have admitted — no
+`file_cap` decision is taken, so none is measured. `over_total_cap` is always `false`, which is what
+makes the ledger field below necessary.
 
 **The narrowing is the sharp edge, and it is named rather than prevented.** A `--full` run stores N
 artifacts; a later plain `--include scratch` run applies the caps, finds those artifacts unclaimed by
@@ -750,9 +768,11 @@ it first-hand. It does not follow `file_type`, so a symlinked slug or session di
 rather than walked out of `tmp_root`, and it sorts its output so a run's manifests, store writes and
 GC candidates do not depend on filesystem order.
 
-Consequence, stated because it is visible: `total_bytes` now counts the whole tree, so a tree that sat
-just under `total_cap` may go over it and become manifest-only. That is the cap measuring what will
-actually be deleted, which is what it was always meant to measure.
+Consequence, stated because it is visible: `total_bytes` counts the whole tree, so the footprint the
+manifest reports grew when the enumeration widened — and it is the right figure for that field, since it
+is what a reclaim of the tree deletes. **The cap did not grow with it:** since PR E `total_cap` is
+compared against `admitted_bytes` (decision #9), so widening the walk cannot carry a tree over the cap.
+Only a wider `allow` can.
 
 **The enumerator also owns the root's ownership.** `tmp_root` is checked against the effective uid
 *before* it is read, by the same `util::root_owned_by_euid` §5 uses to refuse wipe candidates, and a
@@ -903,8 +923,9 @@ files are still present while their `.zst` sit in the store, and nothing would e
 record. The cost is that such a tree also becomes a scratch GC candidate with no age signal — see the
 known defects below.
 
-**Over-cap, restated under S.** A tree over `total_cap` writes every *live* entry `stored: false`,
-stores no bytes, sets `over_total_cap: true`, and reconciliation removes those live entries' `.zst`.
+**Over-cap, restated under S.** A tree whose admitted bytes exceed `total_cap` writes every *live*
+entry `stored: false`, stores no bytes, sets `over_total_cap: true`, and reconciliation removes those
+live entries' `.zst`.
 Retained `present: false` entries are untouched. Decision #4 is honoured for the live tree; no
 archive-only copy is destroyed by a cap change.
 
@@ -2100,9 +2121,12 @@ deleting the live tree loses nothing it names — and letting it veto would put 
 
 The first conjunct is `caps_lifted` and **not** `!over_total_cap`, which looks like the same statement:
 
-- `!over_total_cap` would make the feature inert at birth. Under today's whole-tree cap accounting the
-  one tree on this host `--full` exists for (`2ec0a278…`, raw 468MB / captured 0.00MB) is over the cap,
-  so the conjunct would leave zero candidates and leave the flag waiting on PR E (decision #9).
+- `!over_total_cap` would have made the feature inert at birth. Under the whole-tree cap accounting in
+  force when `--full` shipped, the one tree on this host `--full` exists for (`2ec0a278…`, raw 468MB /
+  captured 0.00MB) was over the cap — on a would-store set of 0 bytes — so the conjunct would have left
+  zero candidates. PR E (decision #9) moved the cap onto admitted bytes, which retires that instance
+  without retiring the objection: a tree still goes over the cap on its admitted set, and gating on
+  `!over_total_cap` would withhold `--full` from exactly the trees whose captured set a cap emptied.
 - `caps_lifted: true` implies cap evaluation never happened, so `over_total_cap` is structurally false
   — the chosen conjunct is the **stricter** and more direct one.
 - It says the thing that matters: this ledger was written by a run that *had the chance* to store
@@ -2379,7 +2403,7 @@ most one), and an ambiguous or absent key is exit 2 with the reason. Behaviour:
 
 | Form | Output | Exit |
 |---|---|---|
-| `--scratch` | manifest listing: `rel`, `rel_hex`, `bytes`, `stored`, `present`, `capture_failed`, plus `captured_at` / `total_bytes` / `over_total_cap` for the tree. `--json` adds `source_sha256` / `content_sha256` | 0, or 2 if the key resolves to nothing |
+| `--scratch` | manifest listing: `rel`, `rel_hex`, `bytes`, `stored`, `present`, `capture_failed`, plus `captured_at` / `total_bytes` / `admitted_bytes` / `over_total_cap` for the tree (both totals, since the flag is a verdict on the second). `--json` adds `source_sha256` / `content_sha256` | 0, or 2 if the key resolves to nothing |
 | `--scratch --file <rel>` | the entry's decompressed stored bytes, **written raw** to stdout (`write_all`, not a lossy string conversion — a scratch file may be binary). `--json` emits `{rel, rel_hex, content_bytes, encoding, content}` where `encoding` is `"utf8"` (content verbatim) or `"hex"` (content hex-encoded) — same encoder as `path_hex`, so `--json` adds no dependency and never emits invalid UTF-8 inside a JSON string | 0 |
 | `--scratch --file <rel>`, entry `stored: false` | refusal naming *why* it was not stored — over-cap, deny-listed, over `file_cap`, or `capture_failed` (nothing was ever read) — never a bare "not found" | 2 |
 | `--scratch --file <rel>`, no matching entry | not found | 2 |

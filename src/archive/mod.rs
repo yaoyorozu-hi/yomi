@@ -73,8 +73,8 @@ pub struct Archiver<'a> {
     /// `NotStored::{NotAllowed, Denied}` are unaffected and a `.git` tree is no
     /// more archivable under `--full` than without it; only `NotStored::FileCap`
     /// and `over_total_cap` become unreachable. The sizes are still measured and
-    /// `total_bytes` is still recorded — lifting a cap is not a reason to stop
-    /// knowing what it would have declined.
+    /// both tree totals — `total_bytes` and `admitted_bytes` — are still recorded:
+    /// lifting a cap is not a reason to stop knowing what it would have declined.
     pub caps_lifted: bool,
     pub dry_run: bool,
 }
@@ -321,9 +321,9 @@ impl<'a> Archiver<'a> {
     /// (name, size, and — for stored files only — hashes); store only the files
     /// the `[scratch]` allow/deny globs admit under the size caps. Globs match the
     /// session-relative path with nested (`**/`) semantics, so a cloned repo's
-    /// `.git`/`node_modules` are excluded wherever they sit (W2). A tree over
-    /// `total_cap` is manifest-only: nothing is stored, and every live entry is
-    /// recorded `stored: false`.
+    /// `.git`/`node_modules` are excluded wherever they sit (W2). A tree whose
+    /// **admitted** bytes exceed `total_cap` is manifest-only: nothing is stored,
+    /// and every live entry is recorded `stored: false`.
     ///
     /// Two ledger duties beyond writing the manifest:
     ///
@@ -475,7 +475,13 @@ impl<'a> Archiver<'a> {
         // different edits. Empty under `--full`, where no cap declines anything.
         let mut cap_declined: std::collections::HashSet<ScratchRel> =
             std::collections::HashSet::new();
+        // Two tree totals, because two different questions are asked of them.
+        // `total` is every live candidate's bytes — the tree's footprint, which is
+        // what `total_bytes` records and what a reclaim will actually remove.
+        // `admitted` is the subset policy would store, and it is the one
+        // `total_cap` is compared against (decision #9).
         let mut total: u64 = 0;
+        let mut admitted: u64 = 0;
         for path in &candidates {
             if self.blacklist.is_blacklisted(path) {
                 report.blacklisted_skipped += 1;
@@ -505,7 +511,6 @@ impl<'a> Archiver<'a> {
                 continue;
             };
             let size = md.len();
-            total += size;
             let glob_key = rel.glob_subpath();
             let subpath: &str = &glob_key;
             // Record *which* rule declined, in the order `store = allow && !deny
@@ -525,6 +530,10 @@ impl<'a> Archiver<'a> {
             if not_stored == Some(NotStored::FileCap) {
                 cap_declined.insert(rel.clone());
             }
+            total += size;
+            if not_stored.is_none() {
+                admitted += size;
+            }
             entries.push(ScratchEntry::new(&rel, size, not_stored));
             kept.push((path.clone(), rel));
         }
@@ -537,10 +546,18 @@ impl<'a> Archiver<'a> {
         // 134M clone the cap exists for was never reclaimable). `over_total_cap`
         // already records why nothing was stored — design §3, decision #4.
         //
-        // `total` is accumulated either way: `--full` lifts the cap, not the
-        // measurement, and `total_bytes` is what a later reader needs to see what
-        // the cap would have decided.
-        let over_total = !self.caps_lifted && total > cfg.total_cap.0;
+        // **`admitted`, not `total`** (decision #9). Comparing the whole tree let
+        // the bytes the globs had already refused decide the fate of the bytes
+        // they admitted: one `target/` or `.git` beside a few MB of notes carried
+        // the tree over the cap, after which nothing was stored — and it bought
+        // nothing, because reclaimability does not depend on the cap. A
+        // `stored: false` entry takes the gate's presence+size path whether it was
+        // never admitted or declined here.
+        //
+        // Both totals are accumulated either way: `--full` lifts the cap, not the
+        // measurement, and a later reader needs the footprint *and* the quantity
+        // the cap is a verdict on.
+        let over_total = !self.caps_lifted && admitted > cfg.total_cap.0;
         if over_total {
             for (entry, (_, rel)) in entries.iter_mut().zip(kept.iter()) {
                 if entry.stored {
@@ -671,6 +688,7 @@ impl<'a> Archiver<'a> {
                 uuid_hex,
                 captured_at: now_iso(),
                 total_bytes: total,
+                admitted_bytes: Some(admitted),
                 over_total_cap: over_total,
                 caps_lifted: self.caps_lifted,
                 entries,
