@@ -625,9 +625,13 @@ already, so the enumerator carries no message of its own and one fact is not rep
 `archive --include scratch` warns and skips **only** that family — `transcript`, `subagents`,
 `tool-results`, `history`, `snapshots` and `paste` all come off `claude_home` and `cache_home` and have
 nothing to do with where `tmp_root` points, so ending the run would refuse the sources that were fine.
-The exit code stays 0, matching every other archive refusal as implemented; the exit-2 reporting this
-section specifies below is not yet built for any of them, and giving one refusal its own exit code
-ahead of the rest would make `archive` answer the same class of event two ways.
+The exit code stays 0, matching the archive refusals that skip something and let the run continue —
+this one, a foreign scratch store root, a per-key foreign store dir, an unreadable manifest. It does
+**not** match `EXIT_REFUSED`, which `--home` ownership and a failed write lock return *before* any
+source is read: those end the run rather than skipping one family of it. The exit-2 reporting this
+section specifies below is built for none of the four, and giving one of them its own exit code ahead
+of the rest would make `archive` answer the same class of event a third way. Reconciling the three
+answers — 0, `EXIT_REFUSED`, and the 2 specified below — is #62.
 
 **Store law (S) — the store dir and the manifest are one ledger.** For a scratch key `<K>`, S has
 **two halves, and they do not hold under the same conditions.** Stating them as one sentence — as an
