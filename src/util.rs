@@ -60,6 +60,29 @@ pub(crate) fn unhex(s: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
+/// True only if `root` exists and is owned by the effective uid. A genuinely
+/// absent root is benign (nothing to enumerate → proceed); a root owned by
+/// another uid is a cross-user hazard and must block whatever the caller was
+/// about to do with what is under it (須佐P2). Any *other* stat failure
+/// (EACCES/ELOOP/EIO — e.g. a poisoned `YOMI_TMP_ROOT` symlink into a foreign
+/// uid's mode-700 tree) is treated as not-owned and blocks: a root we cannot
+/// prove we own is never enumerated (fail-closed). Ownership is read through
+/// `metadata` (following symlinks), so a root symlinked at a foreign-owned tree
+/// is caught by the target's real owner.
+///
+/// Lives here rather than beside either caller because there is one such rule and
+/// it has two enforcement points — gc's candidate generation and archive's
+/// scratch enumeration. A second implementation of it is the drift the store's
+/// re-derived session dir already cost this codebase once.
+pub fn root_owned_by_euid(root: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let euid = rustix::process::geteuid().as_raw();
+    match std::fs::metadata(root) {
+        Ok(md) => md.uid() == euid,
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
 /// Resolve the user's home directory from `$HOME`.
 pub fn home_dir() -> Result<PathBuf> {
     std::env::var_os("HOME")

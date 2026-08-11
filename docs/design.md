@@ -598,6 +598,41 @@ Consequence, stated because it is visible: `total_bytes` now counts the whole tr
 just under `total_cap` may go over it and become manifest-only. That is the cap measuring what will
 actually be deleted, which is what it was always meant to measure.
 
+**The enumerator also owns the root's ownership.** `tmp_root` is checked against the effective uid
+*before* it is read, by the same `util::root_owned_by_euid` §5 uses to refuse wipe candidates, and a
+root that fails it makes the enumerator return `ScratchScan::ForeignRoot` rather than an empty list.
+The refusal sits in the enumerator so that every consumer inherits it — archive, gc, and whatever
+enumerates next — and it is a *variant* rather than an empty `Vec` so no consumer can inherit it by
+accident. An absent root passes: on most hosts `tmp_root` does not exist, and that is nothing to
+enumerate rather than a hazard.
+
+The hazard is not disclosure. `/tmp/claude-<uid>` is mode 700, so a cross-uid read fails EACCES and
+lands as a skipped source — "unreadable", which is what a foreign root must **not** be reported as. It
+is a **poisoned root**: `YOMI_TMP_ROOT` pointing at a foreign, or merely attacker-writable, tree makes
+every path under it archivable, and each lands in this user's store under a key derived from a foreign
+directory name, with the scanner collecting whatever secrets it finds into this user's `quarantine/`.
+Nothing downstream undoes that — the store key *is* the identity — and per-key
+`classify_store_dir` cannot catch it, because every key still classifies `Own`: the root is where the
+question belongs. The default source paths never reach `tmp_root`, so this is latent until a caller
+walks it.
+
+Two levels stay deliberately unchecked. Which names count as a session tree: `<X>/<Y>/` is a unit
+whatever `Y` looks like, because the enumerator's unit and the deleter's unit have to be the same one
+and requiring uuid-shaped names would leave the gate refusing trees it could not account for. And
+per-key store ownership, which is a question about the store rather than the source and stays with the
+writer. Each consumer words its own refusal: gc refuses every root it does not own one layer up
+already, so the enumerator carries no message of its own and one fact is not reported twice.
+`archive --include scratch` warns and skips **only** that family — `transcript`, `subagents`,
+`tool-results`, `history`, `snapshots` and `paste` all come off `claude_home` and `cache_home` and have
+nothing to do with where `tmp_root` points, so ending the run would refuse the sources that were fine.
+The exit code stays 0, matching the archive refusals that skip something and let the run continue —
+this one, a foreign scratch store root, a per-key foreign store dir, an unreadable manifest. It does
+**not** match `EXIT_REFUSED`, which `--home` ownership and a failed write lock return *before* any
+source is read: those end the run rather than skipping one family of it. The exit-2 reporting this
+section specifies below is built for none of the four, and giving one of them its own exit code ahead
+of the rest would make `archive` answer the same class of event a third way. Reconciling the three
+answers — 0, `EXIT_REFUSED`, and the 2 specified below — is #62.
+
 **Store law (S) — the store dir and the manifest are one ledger.** For a scratch key `<K>`, S has
 **two halves, and they do not hold under the same conditions.** Stating them as one sentence — as an
 earlier draft of this section did — is the single most likely way to get `yomi verify` wrong, so they
