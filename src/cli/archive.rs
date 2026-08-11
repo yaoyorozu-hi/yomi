@@ -130,8 +130,26 @@ pub fn run(env: &Env, args: &ArchiveArgs, json: bool) -> Result<i32> {
         }
     }
     if includes.contains(&Include::Scratch) {
-        for sc in single::scratch(&roots)? {
-            archiver.archive_scratch(&sc, &mut report)?;
+        match single::scratch(&roots)? {
+            single::ScratchScan::Trees(trees) => {
+                for sc in trees {
+                    archiver.archive_scratch(&sc, &mut report)?;
+                }
+            }
+            // Only this family stops. `transcript`/`subagents`/`tool-results`,
+            // `history`, `snapshots` and `paste` all come off `claude_home` and
+            // `cache_home` and have nothing to do with whatever `tmp_root` points
+            // at, so ending the run over one foreign root would refuse archiving
+            // the sources that were fine — a bigger loss than the one being
+            // avoided, and the reason this is a warn rather than a `bail!`.
+            single::ScratchScan::ForeignRoot => tracing::warn!(
+                root = %roots.tmp_root.display(),
+                "scratch source root is not owned by this user; archiving no scratch. \
+                 Nothing under it is this user's session data: archiving it would file \
+                 another user's files under this user's store keys, and scan any secrets \
+                 in them into this user's quarantine/. Point YOMI_TMP_ROOT at this \
+                 user's own scratch root, or drop `scratch` from --include."
+            ),
         }
     }
 

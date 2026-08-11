@@ -11,7 +11,7 @@ use crate::catalog::Catalog;
 use crate::config::{Env, GcConfig};
 use crate::source::claude::{self, Selector};
 use crate::source::{SourceRoots, single};
-use crate::util::now_iso;
+use crate::util::{now_iso, root_owned_by_euid};
 use anyhow::Result;
 use std::collections::HashSet;
 use std::io::Write;
@@ -248,7 +248,15 @@ fn candidates(roots: &SourceRoots, env: &Env, target: Target) -> Result<Vec<Cand
             }
         }
         Target::Scratch => {
-            for sc in single::scratch(roots)? {
+            // A foreign `tmp_root` yields no candidates, which is what the guard
+            // at the top of this function already decided — with gc's own wording
+            // — for every target. Silent here so one fact is not reported twice;
+            // reachable only if the root changed hands between the two calls, and
+            // an empty candidate list is the right answer then too.
+            let single::ScratchScan::Trees(trees) = single::scratch(roots)? else {
+                return Ok(out);
+            };
+            for sc in trees {
                 // The session uuid is the tree's own directory name
                 // (`tmp_root/<slug>/<uuid>`), read directly rather than parsed
                 // out of the store key — real project slugs contain `--`, so
@@ -352,23 +360,6 @@ fn primary_root(roots: &SourceRoots, target: Target) -> &Path {
         Target::Transcripts | Target::Paste | Target::Snapshots => &roots.claude_home,
         Target::Mcp => &roots.cache_home,
         Target::Scratch | Target::EmptyDirs => &roots.tmp_root,
-    }
-}
-
-/// True only if `root` exists and is owned by the effective uid. A genuinely
-/// absent root is benign (nothing to enumerate → proceed); a root owned by
-/// another uid is a cross-user hazard and must block candidate generation
-/// (須佐P2). Any *other* stat failure (EACCES/ELOOP/EIO — e.g. a poisoned
-/// `YOMI_TMP_ROOT` symlink into a foreign uid's mode-700 tree) is treated as
-/// not-owned and blocks: a root we cannot prove we own is never enumerated
-/// (fail-closed). Ownership is read through `metadata` (following symlinks), so
-/// a root symlinked at a foreign-owned tree is caught by the target's real owner.
-fn root_owned_by_euid(root: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    let euid = rustix::process::geteuid().as_raw();
-    match std::fs::metadata(root) {
-        Ok(md) => md.uid() == euid,
-        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
     }
 }
 
